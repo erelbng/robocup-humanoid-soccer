@@ -100,6 +100,9 @@ def train_flashsac_vec(
     learning_starts: int = 5_000,  # first gradient update after this many env-steps
     gradient_steps: int = 1,  # updates per env-step
     action_scale: Optional[float] = None,  # default: π (matches env clip)
+    video_frequency: int = 50,  # log a video clip every N trainer iterations
+    video_n_frames: int = 300,
+    video_fps: int = 30,
 ):
     """FlashSAC trainer for a Genesis-style vec env."""
     if config is None:
@@ -151,6 +154,15 @@ def train_flashsac_vec(
     # FlashSAC training horizon is wall-clock-bounded by total_timesteps too
     target_env_steps = int(config.total_timesteps)
 
+    # Video capture state — same scheme as PPO: trigger a clip every
+    # `video_frequency` iterations, fill it during normal rollout steps
+    # by rendering env 0, push to logger when full.
+    video_recording = False
+    video_frames: list = []
+    video_supported = hasattr(env, "render_frame")
+    if logger is None or video_frequency <= 0:
+        video_supported = False
+
     print(f"\n{'='*60}")
     print(f" [FlashSAC] phase={phase} stage={curriculum_stage or 'full'}")
     print(f"   n_envs={n_envs}  buffer={buffer_capacity:,}  "
@@ -161,6 +173,7 @@ def train_flashsac_vec(
     print(f"   warmup={warmup_steps}  learn_after={learning_starts}  "
           f"grad_steps/env_step={gradient_steps}")
     print(f"   total_env_steps target={target_env_steps:,}  device={device}")
+    print(f"   video: {'every ' + str(video_frequency) + ' iters, ' + str(video_n_frames) + ' frames' if video_supported else 'disabled'}")
     print(f"{'='*60}\n")
 
     # ── Roll the env ──
@@ -172,6 +185,15 @@ def train_flashsac_vec(
     save_interval = 100
 
     while total_env_steps < target_env_steps:
+        # Trigger a new video clip every `video_frequency` iterations.
+        # We do this BEFORE the env step so the first frame captures the
+        # state after the previous iter's reset/transition.
+        if (video_supported and not video_recording
+                and iteration > 0
+                and iteration % video_frequency == 0):
+            video_recording = True
+            video_frames = []
+
         # ── Step the env once across all sub-envs ──
         with torch.no_grad():
             if buffer.size < warmup_steps:
@@ -186,6 +208,22 @@ def train_flashsac_vec(
                 action = action_t.cpu().numpy()
 
         next_obs, reward, done, info = env.step(action)
+
+        # Capture a frame after the env step if recording
+        if video_recording:
+            frame = env.render_frame()
+            if frame is not None:
+                video_frames.append(frame)
+            if len(video_frames) >= video_n_frames:
+                try:
+                    logger.log_video("train/rollout", video_frames,
+                                     step=total_env_steps, fps=video_fps)
+                    print(f"[flashsac] logged {len(video_frames)}-frame video "
+                          f"at env_step {total_env_steps:,}")
+                except Exception as e:
+                    print(f"[flashsac] video log failed: {e}")
+                video_recording = False
+                video_frames = []
         # Genesis vec env auto-resets finished envs; next_obs[i] when
         # done[i]=1 is from the freshly-reset episode. The done flag
         # zeroes the bootstrap, so storing this transition is still

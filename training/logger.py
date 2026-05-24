@@ -40,6 +40,21 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
+def _moviepy_editor_available() -> bool:
+    """TensorBoard's add_video pipeline imports `moviepy.editor`. That
+    module exists in moviepy 1.x but was removed in moviepy 2.x — so on
+    any modern install, add_video silently fails to write any video
+    summary. Detect this at logger init so we can fall back to logging
+    thumbnails instead, and the TensorBoard panel always shows SOMETHING.
+    """
+    try:
+        import importlib
+        importlib.import_module("moviepy.editor")
+        return True
+    except Exception:
+        return False
+
+
 class TrainingLogger:
     """Combined TensorBoard + (optional) W&B logger.
 
@@ -80,6 +95,16 @@ class TrainingLogger:
                   f"(`tensorboard --logdir {self.log_dir.parent}`)")
         except ImportError:
             print("[logger] tensorboard not installed; only console logging")
+
+        # Check moviepy.editor availability up front. If unusable, we
+        # skip add_video (which would silently fail) and just log a
+        # thumbnail image — the MP4 still goes to disk regardless.
+        self._can_log_video = _moviepy_editor_available()
+        if self._tb is not None and not self._can_log_video:
+            print("[logger] moviepy.editor unavailable (moviepy 2.x removed it). "
+                  "Videos saved to disk; TB will show thumbnail strips only. "
+                  "Install moviepy 1.x (`pip install moviepy==1.0.3`) to embed "
+                  "playable videos in TB.")
 
         # ── W&B ────────────────────────────────────────────────────
         self._wandb = None
@@ -182,13 +207,21 @@ class TrainingLogger:
             path = None
             print(f"[logger] video write failed: {e}")
 
-        # TensorBoard wants (N, T, C, H, W) float
+        # TensorBoard wants (N, T, C, H, W) for add_video. If moviepy.editor
+        # is missing (moviepy 2.x), add_video silently emits no summary —
+        # fall back to a horizontal thumbnail strip + a sample frame so
+        # the TB panel still shows something useful.
         if self._tb is not None:
-            try:
-                t = arr.transpose(0, 3, 1, 2)[None, ...]   # (1, T, 3, H, W)
-                self._tb.add_video(name, t, global_step=step, fps=fps)
-            except Exception as e:
-                print(f"[logger] TB add_video failed: {e}")
+            if self._can_log_video:
+                try:
+                    t = arr.transpose(0, 3, 1, 2)[None, ...]  # (1, T, 3, H, W)
+                    self._tb.add_video(name, t, global_step=step, fps=fps)
+                except Exception as e:
+                    print(f"[logger] TB add_video failed: {e}; "
+                          f"falling back to thumbnail strip")
+                    self._log_video_thumbnails(name, arr, step)
+            else:
+                self._log_video_thumbnails(name, arr, step)
 
         # W&B accepts a path
         if (self._wandb is not None and self._wandb_run is not None
@@ -200,6 +233,35 @@ class TrainingLogger:
                 )
             except Exception as e:
                 print(f"[logger] W&B log_video failed: {e}")
+
+    def _log_video_thumbnails(self, name: str, arr: np.ndarray,
+                              step: int, num_thumbs: int = 8) -> None:
+        """Fallback when add_video isn't available: log a sampled strip
+        of frames as an `add_images` summary (TB displays them as a row).
+
+        `arr` is (T, H, W, 3) uint8. We pick `num_thumbs` evenly-spaced
+        frames so a long clip still fits at reasonable size.
+        """
+        if self._tb is None:
+            return
+        T = arr.shape[0]
+        if T == 0:
+            return
+        k = min(num_thumbs, T)
+        idx = np.linspace(0, T - 1, k).astype(int)
+        thumbs = arr[idx]                              # (k, H, W, 3)
+        # SummaryWriter.add_images expects (N, C, H, W) uint8/float
+        thumbs_chw = thumbs.transpose(0, 3, 1, 2)
+        try:
+            self._tb.add_images(f"{name}/thumbnails", thumbs_chw,
+                                global_step=step, dataformats="NCHW")
+            # Also log the middle frame as a single image (easier to
+            # scrub through over time in TB's image panel).
+            mid = arr[T // 2].transpose(2, 0, 1)       # (3, H, W)
+            self._tb.add_image(f"{name}/sample", mid, global_step=step,
+                               dataformats="CHW")
+        except Exception as e:
+            print(f"[logger] thumbnail log failed: {e}")
 
     # ── lifecycle ──────────────────────────────────────────────────
 

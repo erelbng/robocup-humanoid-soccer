@@ -69,7 +69,10 @@ def train_ppo_vec(env, policy, config, logger=None,
                   use_value_clipping: bool = True,
                   adaptive_lr: bool = True,
                   min_lr: float = 1e-5,
-                  max_lr: float = 1e-2):
+                  max_lr: float = 1e-2,
+                  video_frequency: int = 50,
+                  video_n_frames: int = 300,
+                  video_fps: int = 30):
     """PPO for vectorised Genesis env.
 
     Args:
@@ -106,12 +109,23 @@ def train_ppo_vec(env, policy, config, logger=None,
     total_steps = 0
     num_iterations = max(1, int(config.total_timesteps) // (n_steps * n_envs))
 
+    # Video capture state. We piggy-back on the rollout loop — when
+    # active, every env step in env 0 captures one frame. Once we have
+    # `video_n_frames` we push to the logger and stop until the next
+    # video_frequency-th iteration.
+    video_recording = False
+    video_frames: list = []
+    video_supported = hasattr(env, "render_frame")
+    if logger is None or video_frequency <= 0:
+        video_supported = False
+
     print(f"\n{'='*60}")
     print(f" [PPO] phase={phase} stage={curriculum_stage or 'full'}")
     print(f"   n_envs={n_envs}  n_steps={n_steps}  iters={num_iterations}")
     print(f"   total_steps target={config.total_timesteps:,}  device={device}")
     print(f"   desired_kl={desired_kl}  val_clip={use_value_clipping}"
           f"  adaptive_lr={adaptive_lr}")
+    print(f"   video: {'every ' + str(video_frequency) + ' iters, ' + str(video_n_frames) + ' frames' if video_supported else 'disabled'}")
     print(f"{'='*60}\n")
 
     obs = env.reset()
@@ -128,6 +142,14 @@ def train_ppo_vec(env, policy, config, logger=None,
     done_buf = torch.zeros(n_steps, n_envs, device=device)
 
     for iteration in range(num_iterations):
+        # Kick off a new video clip every `video_frequency` iterations.
+        # Skip iter 0 — first-iteration footage is uninformative noise.
+        if (video_supported and not video_recording
+                and iteration > 0
+                and iteration % video_frequency == 0):
+            video_recording = True
+            video_frames = []
+
         # ── Collect rollout ──
         with torch.no_grad():
             for step in range(n_steps):
@@ -160,6 +182,22 @@ def train_ppo_vec(env, policy, config, logger=None,
 
                 for k, v in info.get("reward_components", {}).items():
                     comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
+
+                # Capture a frame for video logging if active
+                if video_recording:
+                    frame = env.render_frame()
+                    if frame is not None:
+                        video_frames.append(frame)
+                    if len(video_frames) >= video_n_frames:
+                        try:
+                            logger.log_video("train/rollout", video_frames,
+                                             step=total_steps, fps=video_fps)
+                            print(f"[ppo] logged {len(video_frames)}-frame video "
+                                  f"at step {total_steps:,}")
+                        except Exception as e:
+                            print(f"[ppo] video log failed: {e}")
+                        video_recording = False
+                        video_frames = []
 
                 obs_norm.update(next_obs)
                 obs_t = torch.as_tensor(obs_norm.normalize(next_obs),

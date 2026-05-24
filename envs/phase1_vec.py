@@ -148,6 +148,21 @@ class K1DribbleShootVecEnv:
             gs.morphs.Sphere(radius=0.07, pos=(1.0, 0, 0.10), collision=True),
         )
 
+        # Camera (env 0). Genesis attaches cameras to env 0's local frame
+        # in multi-env scenes, so this view follows env 0's robot+ball.
+        # Cheap when not actively rendering; render() is only called when
+        # the trainer wants a video frame.
+        self.camera = None
+        try:
+            self.camera = self.scene.add_camera(
+                res=(640, 480),
+                pos=(0, -6, 4),
+                lookat=(0, 0, 0.5),
+                fov=50,
+            )
+        except Exception as e:
+            print(f"[vec] camera setup failed: {e}; videos will be unavailable")
+
         self.scene.build(n_envs=self.num_envs, env_spacing=self.env_spacing,
                          center_envs_at_origin=True)
         self._setup_joint_mapping()
@@ -384,6 +399,32 @@ class K1DribbleShootVecEnv:
         timeout = self.step_count >= self.cfg.max_episode_steps
         fallen = pos[:, 2] < 0.10
         return (timeout | fallen)
+
+    # ── Rendering ──────────────────────────────────────────────────
+
+    def render_frame(self) -> Optional[np.ndarray]:
+        """Capture one (H, W, 3) uint8 frame from env 0's perspective.
+
+        Returns None if the camera couldn't be built, or if Genesis errors
+        out (e.g. headless without an EGL context). The caller should be
+        prepared for None and just skip logging.
+        """
+        if self.camera is None:
+            return None
+        try:
+            render_out = self.camera.render()
+            # Genesis returns (rgb, depth, segmentation, normal) — we want rgb
+            rgb = render_out[0] if isinstance(render_out, tuple) else render_out
+            if hasattr(rgb, "cpu"):
+                rgb = rgb.cpu().numpy()
+            rgb = np.asarray(rgb)
+            # Strip alpha if present (Genesis sometimes returns RGBA)
+            if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                rgb = rgb[..., :3]
+            return rgb
+        except Exception as e:
+            print(f"[vec] render_frame error: {e}")
+            return None
 
     def close(self):
         self.scene = None
