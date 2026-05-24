@@ -147,9 +147,17 @@ def record_eval_video(env, policy, device, phase: str, step: int,
 def _train_phase(config, env_factory, phase_cfg, logger, phase: str,
                  algorithm: str, curriculum_stage: Optional[str],
                  resume_from: Optional[str] = None,
-                 init_actor=None):
+                 init_actor=None,
+                 device=None,
+                 algo_kwargs: Optional[dict] = None):
     """Build an env + policy, run one stage of training, return the
-    trained policy (or actor)."""
+    trained policy (or actor).
+
+    `device`: torch.device (forced if not None; trainers auto-detect otherwise).
+    `algo_kwargs`: per-algorithm overrides forwarded to the trainer (e.g.
+    buffer_capacity / batch_size for FlashSAC).
+    """
+    algo_kwargs = dict(algo_kwargs or {})
     env = env_factory(curriculum_stage)
 
     if algorithm == "ppo":
@@ -164,11 +172,13 @@ def _train_phase(config, env_factory, phase_cfg, logger, phase: str,
         if getattr(env, "num_envs", None):
             policy = train_ppo_vec(env, policy, phase_cfg, logger,
                                    phase, curriculum_stage,
-                                   checkpoint_dir=str(CHECKPOINTS_DIR))
+                                   checkpoint_dir=str(CHECKPOINTS_DIR),
+                                   device=device, **algo_kwargs)
         else:
             policy = train_ppo(env, policy, phase_cfg, logger,
                                phase, curriculum_stage,
-                               checkpoint_dir=str(CHECKPOINTS_DIR))
+                               checkpoint_dir=str(CHECKPOINTS_DIR),
+                               device=device, **algo_kwargs)
         env.close()
         return policy
 
@@ -182,7 +192,8 @@ def _train_phase(config, env_factory, phase_cfg, logger, phase: str,
             )
         actor = train_flashsac_vec(env, None, phase_cfg, logger, phase,
                                    curriculum_stage,
-                                   checkpoint_dir=str(CHECKPOINTS_DIR))
+                                   checkpoint_dir=str(CHECKPOINTS_DIR),
+                                   device=device, **algo_kwargs)
         env.close()
         return actor
 
@@ -191,7 +202,8 @@ def _train_phase(config, env_factory, phase_cfg, logger, phase: str,
 
 
 def train_phase1(config: ProjectConfig, resume_from: str = None,
-                 use_wandb: bool = False, algorithm: str = "ppo"):
+                 use_wandb: bool = False, algorithm: str = "ppo",
+                 device=None, algo_kwargs: Optional[dict] = None):
     """Phase 1 entry: curriculum-stage loop."""
     logger = setup_logger(config, "phase1", use_wandb=use_wandb,
                           algorithm=algorithm)
@@ -226,18 +238,21 @@ def train_phase1(config: ProjectConfig, resume_from: str = None,
                 "phase1", algorithm, stage,
                 resume_from=resume_from if stage == stages[0] else None,
                 init_actor=policy,
+                device=device, algo_kwargs=algo_kwargs,
             )
     else:
         policy = _train_phase(config, _env_factory, config.phase1, logger,
                               "phase1", algorithm, "full",
-                              resume_from=resume_from)
+                              resume_from=resume_from,
+                              device=device, algo_kwargs=algo_kwargs)
 
     logger.close()
     return policy
 
 
 def train_phase2(config: ProjectConfig, phase1_checkpoint: str = None,
-                 use_wandb: bool = False, algorithm: str = "ppo"):
+                 use_wandb: bool = False, algorithm: str = "ppo",
+                 device=None, algo_kwargs: Optional[dict] = None):
     """Phase 2 entry: 4v4 match training, optionally seeded from Phase 1."""
     from envs.phase2_match import K1SoccerMatchEnv
 
@@ -253,12 +268,56 @@ def train_phase2(config: ProjectConfig, phase1_checkpoint: str = None,
 
     policy = _train_phase(config, _env_factory, config.phase2, logger,
                           "phase2", algorithm, None,
-                          resume_from=phase1_checkpoint)
+                          resume_from=phase1_checkpoint,
+                          device=device, algo_kwargs=algo_kwargs)
     logger.close()
     return policy
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────
+
+
+# Hyperparameter presets applied when the user picks `--device`.
+# Anything the user passes explicitly on the CLI overrides the preset.
+_CPU_PRESET = {
+    "vec_num_envs": 64,
+    "flashsac": {"buffer_capacity": 200_000, "batch_size": 512,
+                 "gradient_steps": 1},
+    "ppo": {},   # PPO scales naturally with vec_num_envs
+}
+_GPU_PRESET = {
+    "vec_num_envs": 1024,
+    "flashsac": {"buffer_capacity": 1_000_000, "batch_size": 1024,
+                 "gradient_steps": 1},
+    "ppo": {},
+}
+
+
+def _resolve_device(device_flag: str):
+    """Resolve --device {auto,cpu,gpu} into a (torch.device, preset) pair.
+
+    `auto` detects CUDA. Explicit `gpu` warns and falls back to CPU if
+    CUDA isn't available — we don't want a silent runtime failure inside
+    Genesis hours into a queued job.
+    """
+    import torch
+    has_cuda = torch.cuda.is_available()
+    if device_flag == "auto":
+        kind = "gpu" if has_cuda else "cpu"
+    elif device_flag == "gpu":
+        if not has_cuda:
+            print("[device] --device gpu requested but CUDA isn't available; "
+                  "falling back to CPU. Set CUDA_VISIBLE_DEVICES or check "
+                  "your torch install if this is unexpected.")
+            kind = "cpu"
+        else:
+            kind = "gpu"
+    else:
+        kind = "cpu"
+
+    device = torch.device("cuda" if kind == "gpu" else "cpu")
+    preset = _GPU_PRESET if kind == "gpu" else _CPU_PRESET
+    return device, preset, kind
 
 
 def main():
@@ -271,6 +330,12 @@ def main():
     parser.add_argument(
         "--algorithm", choices=["ppo", "flashsac", "sac"], default="ppo",
         help="RL algorithm. 'sac' is an alias for 'flashsac'.",
+    )
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "gpu"], default="auto",
+        help="Hardware preset. 'auto' detects CUDA. Sets the torch device "
+             "and sensible defaults for vec_num_envs, replay buffer, and "
+             "batch size. CLI flags override the preset.",
     )
     parser.add_argument(
         "--resume", type=str, default=None,
@@ -302,8 +367,20 @@ def main():
 
     algorithm = "flashsac" if args.algorithm == "sac" else args.algorithm
 
+    # Resolve --device first — its preset becomes the baseline that any
+    # explicit CLI flag overrides.
+    device, preset, device_kind = _resolve_device(args.device)
+    algo_kwargs = dict(preset.get(algorithm, {}))
+    print(f"[device] resolved: kind={device_kind}  torch={device}  "
+          f"vec_num_envs={preset['vec_num_envs']}  "
+          f"algo_kwargs={algo_kwargs or '{}'}")
+
     config = ProjectConfig()
     config.seed = args.seed
+    # Apply device preset to the env config; --vec-num-envs below
+    # overrides this if the user passed it explicitly.
+    config.phase1.use_vec_env = True
+    config.phase1.vec_num_envs = preset["vec_num_envs"]
 
     use_wandb = bool(args.wandb or args.wandb_project)
     if args.wandb_project:
@@ -317,20 +394,20 @@ def main():
         config.phase1.use_vec_env = True
         config.phase1.vec_num_envs = args.vec_num_envs
 
-    # FlashSAC always needs a vec env; auto-enable with a sensible default.
+    # FlashSAC always needs a vec env (already enabled above by the device
+    # preset, but keep this as a defensive double-check).
     if algorithm == "flashsac" and not config.phase1.use_vec_env:
         print("[train] FlashSAC requires a vectorised env; "
-              "enabling with vec_num_envs=256")
+              f"enabling with vec_num_envs={preset['vec_num_envs']}")
         config.phase1.use_vec_env = True
-        if not args.vec_num_envs:
-            config.phase1.vec_num_envs = 256
 
     np.random.seed(config.seed)
 
     phase1_ckpt = args.phase1_ckpt
     if args.phase in ("1", "both"):
         train_phase1(config, resume_from=args.resume,
-                     use_wandb=use_wandb, algorithm=algorithm)
+                     use_wandb=use_wandb, algorithm=algorithm,
+                     device=device, algo_kwargs=algo_kwargs)
         if phase1_ckpt is None and os.path.exists(CHECKPOINTS_DIR):
             ckpts = sorted(Path(CHECKPOINTS_DIR).glob("phase1_*.pt"))
             if ckpts:
@@ -338,7 +415,8 @@ def main():
 
     if args.phase in ("2", "both"):
         train_phase2(config, phase1_checkpoint=phase1_ckpt,
-                     use_wandb=use_wandb, algorithm=algorithm)
+                     use_wandb=use_wandb, algorithm=algorithm,
+                     device=device, algo_kwargs=algo_kwargs)
 
 
 if __name__ == "__main__":

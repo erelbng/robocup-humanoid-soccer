@@ -107,11 +107,13 @@ def train_flashsac_vec(
     video_frequency: int = 50,  # log a video clip every N trainer iterations
     video_n_frames: int = 300,
     video_fps: int = 30,
+    device: Optional[torch.device] = None,
 ):
     """FlashSAC trainer for a Genesis-style vec env."""
     if config is None:
         raise ValueError("train_flashsac_vec requires a config")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_dim = int(config.obs_dim)
     act_dim = int(config.act_dim)

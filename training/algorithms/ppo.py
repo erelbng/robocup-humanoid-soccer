@@ -72,7 +72,8 @@ def train_ppo_vec(env, policy, config, logger=None,
                   max_lr: float = 1e-2,
                   video_frequency: int = 50,
                   video_n_frames: int = 300,
-                  video_fps: int = 30):
+                  video_fps: int = 30,
+                  device: Optional[torch.device] = None):
     """PPO for vectorised Genesis env.
 
     Args:
@@ -83,8 +84,10 @@ def train_ppo_vec(env, policy, config, logger=None,
         desired_kl: Target KL per iteration for adaptive LR + early stop.
         use_value_clipping: Apply PPO-style value clipping.
         adaptive_lr: rsl_rl-style LR adjustment based on KL.
+        device: torch device. If None, auto-detect CUDA.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if policy is None:
         policy = PPOActorCritic(config.obs_dim, config.act_dim)
@@ -384,12 +387,14 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
               curriculum_stage=None, checkpoint_dir: str = "checkpoints",
               desired_kl: float = 0.01,
               use_value_clipping: bool = True,
-              adaptive_lr: bool = True):
+              adaptive_lr: bool = True,
+              device: Optional[torch.device] = None):
     """Single-env PPO. Calls vec-loop logic with num_envs=1 wrapper-style."""
     # The vec version assumes batched obs. For single-env we re-implement
     # the loop locally to avoid forcing an env wrapper. This is the slow
     # debug path; for real training use the vec env (see train_ppo_vec).
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if policy is None:
         policy = PPOActorCritic(config.obs_dim, config.act_dim)
     policy = policy.to(device)
