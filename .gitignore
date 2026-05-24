@@ -1,0 +1,131 @@
+# ─── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+parts/
+sdist/
+var/
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
+
+# Type checkers / linters
+.mypy_cache/
+.pyre/
+.pytype/
+.dmypy.json
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# ─── Virtual environments ──────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# ─── Training outputs ──────────────────────────────────────────────
+# These directories are produced by training/eval and can be huge.
+# Keep the top-level directories around (with .gitkeep) but ignore
+# all generated artifacts.
+checkpoints/
+!checkpoints/.gitkeep
+logs/
+!logs/.gitkeep
+videos/
+!videos/.gitkeep
+wandb/
+runs/
+mlruns/
+outputs/
+
+# TensorBoard event files (in case anyone writes them outside logs/)
+events.out.tfevents.*
+*.tfevents.*
+
+# Saved policies / replay buffers
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.replay
+*.buffer
+
+# ─── Genesis simulator cache ───────────────────────────────────────
+# Genesis caches compiled kernels and decimated meshes per-machine.
+.genesis/
+*.gs_cache
+# Genesis stores per-build SDF / convex decomposition in a temp dir
+# inside the model dir; keep meshes themselves checked in.
+models/**/*.sdf
+models/**/*.coacd
+
+# ─── Generated / derived assets ────────────────────────────────────
+# The field generator regenerates these from configs/field_hsl_2026.json
+# at setup; treat the JSON as source of truth.
+models/field/field_robocup.xml
+models/field/field_genesis_builder.py
+models/field/field_info.json
+# Debug screenshots dumped by scripts/debug_*
+models/field/debug_*.png
+
+# Procedurally-generated ball texture (regenerate with
+# `python -m models.textures.make_ball_texture`)
+models/textures/ball.png
+
+# ─── Notebooks ─────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_meta
+# Keep notebook source; clear outputs before committing.
+
+# ─── Editors / IDEs ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# ─── Secrets & credentials ─────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# ─── Misc temp / scratch ───────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+core
+core.*
+*.pid
+*.lock
+*.swp
+
+# ─── Anthropic / Claude Code local config (per-user) ───────────────
+.claude/
+CLAUDE.local.md
+GEMINI.local.md

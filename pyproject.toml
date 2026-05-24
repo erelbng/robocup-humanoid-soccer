@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robocup-humanoid-soccer"
+version = "0.1.0"
+description = "RL training pipeline for humanoid robot soccer (RoboCup HSL) with Booster K1 robots"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "mujoco>=3.0.0",
+    "tensorboard>=2.15.0",
+    "imageio>=2.31.0",
+    "imageio-ffmpeg>=0.4.9",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+genesis = [
+    "genesis-world>=0.4.0",
+]
+wandb = [
+    "wandb>=0.16.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+robocup-train = "training.train:main"
+robocup-eval = "evaluation.evaluate:main"
+robocup-field = "models.field_generator:main"
+
+[tool.setuptools.packages.find]
+include = [
+    "configs*",
+    "envs*",
+    "evaluation*",
+    "gamecontroller*",
+    "models*",
+    "training*",
+    "utils*",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

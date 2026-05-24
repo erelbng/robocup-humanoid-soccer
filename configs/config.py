@@ -1,0 +1,260 @@
+"""
+Project-wide configuration for RoboCup Humanoid Soccer RL Training.
+"""
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+import os
+
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+# PROJECT_ROOT must point at the repo root, not this file's directory.
+# `os.path.dirname(__file__)` of `configs/config.py` is `configs/`, so we go
+# up one level. Every downstream asset path depends on this being correct;
+# the MuJoCo evaluator silently falls back to an empty robot-less scene if
+# FIELD_MJCF doesn't exist, which used to make "no robot visible" symptoms
+# appear out of nowhere.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIGS_DIR = os.path.join(PROJECT_ROOT, "configs")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+FIELD_DIR = os.path.join(MODELS_DIR, "field")
+ROBOT_DIR = os.path.join(MODELS_DIR, "robot")
+CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+VIDEOS_DIR = os.path.join(PROJECT_ROOT, "videos")
+
+FIELD_JSON = os.path.join(CONFIGS_DIR, "field_hsl_2026.json")
+FIELD_MJCF = os.path.join(FIELD_DIR, "field_robocup.xml")
+FIELD_INFO = os.path.join(FIELD_DIR, "field_info.json")
+
+# K1 robot assets (cloned from BoosterRobotics/booster_assets)
+K1_URDF = os.path.join(ROBOT_DIR, "K1", "K1_22dof.urdf")
+K1_MJCF = os.path.join(ROBOT_DIR, "K1", "K1_22dof.xml")
+
+
+# ─── Robot Config ────────────────────────────────────────────────────────────
+
+@dataclass
+class K1RobotConfig:
+    """Booster K1 robot configuration."""
+    name: str = "booster_k1"
+    num_dofs: int = 22
+    height: float = 0.95  # meters
+    mass: float = 20.0    # kg
+
+    # Joint names in order (from booster_assets)
+    joint_names: Tuple[str, ...] = (
+        "AAHead_yaw", "Head_pitch",
+        "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll",
+        "Left_Elbow_Pitch", "Left_Elbow_Yaw",
+        "ARight_Shoulder_Pitch", "Right_Shoulder_Roll",
+        "Right_Elbow_Pitch", "Right_Elbow_Yaw",
+        "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
+        "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
+        "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
+        "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll",
+    )
+
+    # Leg joint indices (for locomotion-focused training)
+    leg_joint_indices: Tuple[int, ...] = (10, 11, 12, 13, 14, 15,
+                                           16, 17, 18, 19, 20, 21)
+    arm_joint_indices: Tuple[int, ...] = (2, 3, 4, 5, 6, 7, 8, 9)
+    head_joint_indices: Tuple[int, ...] = (0, 1)
+
+    # Default standing pose (radians)
+    default_joint_pos: Tuple[float, ...] = (
+        0.0, 0.0,        # head
+        0.0, 0.0, 0.0, 0.0,  # left arm
+        0.0, 0.0, 0.0, 0.0,  # right arm
+        0.0, 0.0, 0.0,       # left hip
+        -0.4, 0.8, -0.4,     # left knee/ankle (slight bend)
+        0.0, 0.0, 0.0,       # right hip
+        -0.4, 0.8, -0.4,     # right knee/ankle
+    )
+
+    # PD gains
+    kp: float = 50.0
+    kd: float = 5.0
+
+
+# ─── Training Config ─────────────────────────────────────────────────────────
+
+@dataclass
+class RewardWeights:
+    """Configurable reward weights for the multi-objective reward function."""
+    # Phase 1: Single robot skills
+    forward_velocity: float = 2.0
+    tracking_ball: float = 1.5
+    ball_to_goal: float = 3.0
+    kick_reward: float = 10.0
+    dribble_control: float = 2.0
+    alive_bonus: float = 0.5
+    upright_bonus: float = 1.0
+    energy_penalty: float = -0.01
+    joint_limit_penalty: float = -1.0
+    fall_penalty: float = -10.0
+    action_smoothness: float = -0.1
+    foot_contact_reward: float = 0.5
+
+    # Phase 2: Match tactics (used in multi-agent fine-tuning)
+    team_ball_possession: float = 2.0
+    goal_scored: float = 50.0
+    goal_conceded: float = -50.0
+    positioning: float = 1.0
+    passing: float = 5.0
+    defensive_coverage: float = 1.5
+    offsides_penalty: float = -5.0
+    aggressiveness: float = 0.0  # tuneable: >0 = more aggressive play
+
+    def scale_aggressiveness(self, level: float):
+        """Scale reward weights based on aggressiveness 0.0 - 1.0."""
+        self.forward_velocity *= (1.0 + 0.5 * level)
+        self.kick_reward *= (1.0 + level)
+        self.ball_to_goal *= (1.0 + 0.5 * level)
+        self.defensive_coverage *= (1.0 - 0.5 * level)
+        self.aggressiveness = level
+
+
+@dataclass
+class Phase1Config:
+    """Single-robot dribble and shoot training config."""
+    env_name: str = "K1SoccerDribbleShoot"
+    num_envs: int = 4096
+    max_episode_steps: int = 1000
+    dt: float = 0.02  # 50Hz control
+    sim_dt: float = 0.002  # 500Hz physics
+    action_repeat: int = 10  # sim_dt * action_repeat = dt
+
+    # Observation space
+    # 78 base + 5 style command = 83 by default. The env enforces this
+    # automatically based on use_style_command.
+    obs_dim: int = 83
+    base_obs_dim: int = 78
+    act_dim: int = 22  # joint position targets for all 22 DOF
+
+    # Training
+    total_timesteps: int = 200_000_000
+    learning_rate: float = 3e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    entropy_coef: float = 0.005
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    batch_size: int = 32768
+    n_epochs: int = 5
+    n_steps: int = 64
+
+    # Curriculum
+    # Order matters: standup follows stand so the policy can recover
+    # before any forward-motion stage exposes it to falls.
+    use_curriculum: bool = True
+    curriculum_stages: Tuple[str, ...] = (
+        "stand",      # learn to stand and balance
+        "standup",    # recover to upright from a fallen pose
+        "walk",       # walk toward ball at commanded velocity
+        "dribble",    # dribble ball forward (style-conditioned)
+        "shoot",      # shoot at goal
+        "full",       # combined skills
+    )
+
+    # Style command (extra obs dims appended after the 78-dim base obs).
+    use_style_command: bool = True
+    style_command_dim: int = 5
+
+    # External perturbations (push robot)
+    use_perturbations: bool = True
+
+    # Motor / body / ball domain randomisation. Independent of
+    # randomize_friction / randomize_robot_pos (which are env-resets).
+    # Default ON because robust sim2real transfer is the priority.
+    use_domain_randomization: bool = True
+
+    # Vectorised training: when True (and CUDA is available), trainer
+    # builds Genesis with n_envs > 1 for parallel rollouts.
+    use_vec_env: bool = False
+    # Number of parallel envs when use_vec_env. The default is small so
+    # CPU machines don't OOM; bump to 1024+ on GPU.
+    vec_num_envs: int = 64
+
+    # Domain randomization
+    randomize_ball_pos: bool = True
+    randomize_robot_pos: bool = True
+    randomize_friction: bool = True
+    friction_range: Tuple[float, float] = (0.6, 1.2)
+
+    reward: RewardWeights = field(default_factory=RewardWeights)
+
+
+@dataclass
+class Phase2Config:
+    """Multi-robot match training config (fine-tuning)."""
+    env_name: str = "K1SoccerMatch"
+    num_envs: int = 256  # fewer envs due to multi-agent complexity
+    players_per_team: int = 4
+    max_episode_steps: int = 3000  # ~60 seconds at 50Hz
+    dt: float = 0.02
+    sim_dt: float = 0.002
+
+    # Observation space per agent
+    obs_dim: int = 156  # self + teammates + opponents + ball + field
+    act_dim: int = 22
+
+    # Training
+    total_timesteps: int = 100_000_000
+    learning_rate: float = 1e-4
+    gamma: float = 0.998
+    gae_lambda: float = 0.95
+    clip_range: float = 0.1
+    entropy_coef: float = 0.003
+    batch_size: int = 16384
+    n_epochs: int = 3
+    n_steps: int = 128
+
+    # Self-play
+    self_play: bool = True
+    opponent_update_freq: int = 50  # update opponent policy every N iterations
+    opponent_pool_size: int = 10
+
+    # GameController integration
+    use_game_controller: bool = True
+    half_duration: float = 300.0  # 5 minutes per half (sim time)
+
+    reward: RewardWeights = field(default_factory=lambda: RewardWeights(
+        aggressiveness=0.3
+    ))
+
+
+@dataclass
+class EvalConfig:
+    """Evaluation configuration (MuJoCo)."""
+    num_eval_episodes: int = 100
+    record_video: bool = True
+    video_fps: int = 30
+    eval_in_mujoco: bool = True  # evaluate in MuJoCo for sim2sim
+
+
+@dataclass
+class WandbConfig:
+    """Weights & Biases logging configuration."""
+    project: str = "robocup-humanoid-soccer"
+    entity: Optional[str] = None
+    log_frequency: int = 10
+    log_video: bool = True
+    video_frequency: int = 50  # log video every N iterations
+    log_model: bool = True
+    model_save_frequency: int = 100
+    tags: List[str] = field(default_factory=lambda: ["k1", "genesis", "robocup"])
+
+
+@dataclass
+class ProjectConfig:
+    """Top-level project configuration."""
+    robot: K1RobotConfig = field(default_factory=K1RobotConfig)
+    phase1: Phase1Config = field(default_factory=Phase1Config)
+    phase2: Phase2Config = field(default_factory=Phase2Config)
+    eval: EvalConfig = field(default_factory=EvalConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+    seed: int = 42
+    device: str = "cuda"
+    use_genesis: bool = True  # train in Genesis
+    use_mujoco_eval: bool = True  # evaluate in MuJoCo

@@ -1,0 +1,80 @@
+<!-- RoboCup HSL Match Scene: Field + Ball template -->
+<!-- Robots are added programmatically by the evaluation/training scripts -->
+<mujoco model="robocup_match_scene">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast">
+    <flag contact="enable"/>
+  </option>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.8 0.8 0.8"/>
+    <quality shadowsize="4096"/>
+    <global offwidth="1920" offheight="1080"/>
+  </visual>
+
+  <asset>
+    <texture name="field_green" type="2d" builtin="flat" rgb1="0.1 0.6 0.1" rgb2="0.1 0.55 0.1" width="512" height="512"/>
+    <material name="field_mat" texture="field_green" texrepeat="4 4" specular="0.1"/>
+    <material name="line_mat" rgba="1 1 1 1" specular="0.0"/>
+    <material name="goal_mat" rgba="1 1 1 1" specular="0.3" shininess="0.5"/>
+    <texture name="ball_tex" type="2d" builtin="checker" rgb1="1 1 1" rgb2="0.1 0.1 0.1" width="64" height="64"/>
+    <material name="ball_mat" texture="ball_tex" texrepeat="4 4"/>
+    <texture name="skybox" type="skybox" builtin="gradient" rgb1="0.4 0.6 0.9" rgb2="0.1 0.1 0.3" width="512" height="512"/>
+  </asset>
+
+  <default>
+    <geom condim="3" friction="1.0 0.005 0.0001"/>
+  </default>
+
+  <worldbody>
+    <light name="overhead" pos="0 0 8" dir="0 0 -1" diffuse="1 1 1" specular="0.3 0.3 0.3" cutoff="60" directional="true"/>
+    <light name="side" pos="6 0 5" dir="-1 0 -0.5" diffuse="0.5 0.5 0.5" directional="true"/>
+
+    <!-- Field carpet -->
+    <geom name="carpet" type="box" size="5.5 4.0 0.01" pos="0 0 -0.01" material="field_mat" conaffinity="1" contype="1"/>
+
+    <!-- Field lines -->
+    <geom name="touchline_pos" type="box" size="4.5 0.025 0.001" pos="0 3.0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="touchline_neg" type="box" size="4.5 0.025 0.001" pos="0 -3.0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="goalline_pos" type="box" size="0.025 3.0 0.001" pos="4.5 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="goalline_neg" type="box" size="0.025 3.0 0.001" pos="-4.5 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="center_line" type="box" size="0.025 3.0 0.001" pos="0 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_front_pos" type="box" size="0.025 1.5 0.001" pos="3.5 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_side_pos_t" type="box" size="0.5 0.025 0.001" pos="4.0 1.5 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_side_pos_b" type="box" size="0.5 0.025 0.001" pos="4.0 -1.5 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_front_neg" type="box" size="0.025 1.5 0.001" pos="-3.5 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_side_neg_t" type="box" size="0.5 0.025 0.001" pos="-4.0 1.5 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pa_side_neg_b" type="box" size="0.5 0.025 0.001" pos="-4.0 -1.5 0.001" material="line_mat" conaffinity="0" contype="0"/>
+
+    <!-- Penalty marks -->
+    <geom name="pen_mark_pos" type="cylinder" size="0.03 0.001" pos="3.0 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="pen_mark_neg" type="cylinder" size="0.03 0.001" pos="-3.0 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="center_mark" type="cylinder" size="0.03 0.001" pos="0 0 0.001" material="line_mat" conaffinity="0" contype="0"/>
+
+    <!-- Goals -->
+    <body name="goal_pos" pos="4.5 0 0">
+      <geom name="post_l_pos" type="cylinder" size="0.05 0.4" pos="0.3 1.3 0.4" material="goal_mat"/>
+      <geom name="post_r_pos" type="cylinder" size="0.05 0.4" pos="0.3 -1.3 0.4" material="goal_mat"/>
+      <geom name="crossbar_pos" type="cylinder" size="0.04 1.3" pos="0.3 0 0.8" material="goal_mat" euler="1.5708 0 0"/>
+      <geom name="net_back_pos" type="box" size="0.005 1.3 0.4" pos="0.6 0 0.4" rgba="0.8 0.8 0.8 0.3"/>
+    </body>
+    <body name="goal_neg" pos="-4.5 0 0">
+      <geom name="post_l_neg" type="cylinder" size="0.05 0.4" pos="-0.3 1.3 0.4" material="goal_mat"/>
+      <geom name="post_r_neg" type="cylinder" size="0.05 0.4" pos="-0.3 -1.3 0.4" material="goal_mat"/>
+      <geom name="crossbar_neg" type="cylinder" size="0.04 1.3" pos="-0.3 0 0.8" material="goal_mat" euler="1.5708 0 0"/>
+      <geom name="net_back_neg" type="box" size="0.005 1.3 0.4" pos="-0.6 0 0.4" rgba="0.8 0.8 0.8 0.3"/>
+    </body>
+
+    <!-- Ball -->
+    <body name="ball" pos="0 0 0.07">
+      <freejoint name="ball_joint"/>
+      <geom name="ball_geom" type="sphere" size="0.07" mass="0.35" material="ball_mat"
+            solref="-10000 -200" solimp="0.9 0.95 0.001" friction="0.8 0.005 0.0001"/>
+    </body>
+
+    <!-- Cameras -->
+    <camera name="top_down" pos="0 0 12" euler="0 0 0" fovy="50"/>
+    <camera name="side_view" pos="0 -8 3" euler="1.2 0 0" fovy="60"/>
+    <camera name="broadcast" pos="0 -7 4" euler="1.05 0 0" fovy="55"/>
+  </worldbody>
+</mujoco>
