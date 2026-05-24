@@ -184,11 +184,10 @@ class K1DribbleShootEnv:
             "K1_22dof.urdf",
         )
 
-        # The K1 trunk needs to start above its hip-to-foot height (~0.95m
-        # total). Spawning lower (e.g. 0.55m) puts the feet under the ground
-        # and the robot pops on the first step. We add a small clearance so
-        # the robot has room to settle.
-        spawn_z = 1.05
+        # The K1 trunk (pelvis root) settles at ~0.55m when standing in the
+        # default pose. Spawn 10cm above that so the feet land cleanly on
+        # the carpet (z=0) rather than free-falling 50cm from 1.05m.
+        spawn_z = 0.65
 
         if os.path.exists(urdf_path):
             self.robot = self.scene.add_entity(
@@ -378,7 +377,7 @@ class K1DribbleShootEnv:
             else:
                 rx = np.random.uniform(-0.5, 0.5) if self.cfg.randomize_robot_pos else 0.0
                 ry = np.random.uniform(-0.5, 0.5) if self.cfg.randomize_robot_pos else 0.0
-                self.robot.set_pos([rx, ry, 1.05])
+                self.robot.set_pos([rx, ry, 0.65])
                 self.robot.set_quat([1.0, 0.0, 0.0, 0.0])
                 self.robot.set_dofs_position(
                     list(self.robot_cfg.default_joint_pos),
@@ -393,7 +392,9 @@ class K1DribbleShootEnv:
         # No ball during stand / standup — keep it far away so it doesn't
         # interfere with balance training.
         if self.curriculum_stage in ("stand", "standup"):
-            bx, by, bz = 5.0, 5.0, 0.07
+            # Keep ball on the field (y=5 is outside the 8m-wide total field).
+            # Place it at the far end so it stays away from the robot.
+            bx, by, bz = 3.5, 0.0, 0.07
         elif self.cfg.randomize_ball_pos:
             bx = float(np.random.uniform(0.5, 3.0))
             by = float(np.random.uniform(-2.0, 2.0))
@@ -462,7 +463,7 @@ class K1DribbleShootEnv:
         obs = self._get_observation()
 
         # Compute reward
-        reward, components = self._compute_reward(action)
+        reward, components, extra_components = self._compute_reward(action)
         self.episode_reward += reward
 
         # Check termination
@@ -471,7 +472,7 @@ class K1DribbleShootEnv:
         info = {
             "step": self.step_count,
             "episode_reward": self.episode_reward,
-            "reward_components": components.to_dict(),
+            "reward_components": {**components.to_dict(), **extra_components},
             "curriculum_stage": self.curriculum_stage,
         }
 
@@ -558,7 +559,7 @@ class K1DribbleShootEnv:
 
         return obs
 
-    def _compute_reward(self, action: np.ndarray) -> Tuple[float, RewardComponents]:
+    def _compute_reward(self, action: np.ndarray) -> Tuple[float, RewardComponents, dict]:
         """Compute reward based on current curriculum stage."""
         try:
             robot_pos = (
@@ -602,7 +603,7 @@ class K1DribbleShootEnv:
                 else np.zeros(self.robot_cfg.num_dofs)
             )
         except Exception:
-            return 0.0, RewardComponents()
+            return 0.0, RewardComponents(), {}
 
         # Fall detection
         is_fallen = robot_pos[2] < 0.3
@@ -634,16 +635,15 @@ class K1DribbleShootEnv:
 
         # Standup stage: use dedicated standup reward
         if self.curriculum_stage == "standup":
-            r, comps = standup_mod.compute_standup_reward(
+            r, standup_parts = standup_mod.compute_standup_reward(
                 robot_quat=robot_quat,
                 robot_z=float(robot_pos[2]),
                 joint_vel=joint_vel,
                 actions=action,
                 prev_actions=self._prev_action,
             )
-            # Style-command rewards don't apply in standup
             self._prev_action = action.astype(np.float32)
-            return r, RewardComponents()  # log via info dict downstream
+            return r, RewardComponents(), standup_parts
 
         # Base curriculum reward
         if self.curriculum_stage in ("stand", "walk", "dribble", "shoot"):
@@ -652,6 +652,8 @@ class K1DribbleShootEnv:
             )
         else:
             r, comps = self.reward_fn.compute_phase1(**kwargs)
+
+        extra: dict = {}
 
         # Add style-command tracking rewards for walk/dribble/shoot/full
         commanded_vy = 0.0
@@ -688,12 +690,13 @@ class K1DribbleShootEnv:
                     commanded_vy=commanded_vy,
                 )
                 r += gait_r
+                extra.update(gait_parts)
             except Exception:
                 pass
 
         self._prev_action = action.astype(np.float32)
         self._prev_foot_contacts = foot_contacts.astype(np.float32)
-        return r, comps
+        return r, comps, extra
 
     def _get_feet_heights(self) -> np.ndarray:
         """Best-effort feet z lookup. Returns zeros if foot links not found."""

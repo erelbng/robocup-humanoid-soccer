@@ -9,6 +9,7 @@ Uses Genesis for training, logs to Weights & Biases.
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -247,6 +248,8 @@ def train_ppo_vec(env, policy, config, logger=None,
     ep_lengths = deque(maxlen=200)
     running_ep_r = np.zeros(n_envs, dtype=np.float32)
     running_ep_len = np.zeros(n_envs, dtype=np.int64)
+    # Rolling batch-mean component metrics (updated every step)
+    comp_queues: dict = {}
 
     total_steps = 0
     # Each iteration produces n_steps*n_envs samples
@@ -298,6 +301,10 @@ def train_ppo_vec(env, policy, config, logger=None,
                     ep_lengths.append(int(running_ep_len[i]))
                     running_ep_r[i] = 0.0
                     running_ep_len[i] = 0
+
+            # Batch-mean reward components from vec env info
+            for k, v in info.get("reward_components", {}).items():
+                comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
 
             obs_norm.update(next_obs)
             obs_t = torch.as_tensor(obs_norm.normalize(next_obs), device=device)
@@ -377,19 +384,43 @@ def train_ppo_vec(env, policy, config, logger=None,
                                          config.max_grad_norm)
                 optimizer.step()
 
+                with torch.no_grad():
+                    log_ratio = new_log_prob - mb_logp
+                    approx_kl = float(((log_ratio.exp() - 1) - log_ratio).mean())
+                    clip_frac = float((log_ratio.abs() > math.log(1 + config.clip_range)).float().mean())
+
+        # Explained variance
+        with torch.no_grad():
+            y_true = b_ret.cpu().numpy()
+            y_pred = val_buf.reshape(-1).cpu().numpy()
+            var_y = float(np.var(y_true))
+            explained_var = float(1.0 - np.var(y_true - y_pred) / (var_y + 1e-8))
+
         if iteration % 10 == 0:
             mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
             ml = float(np.mean(ep_lengths)) if ep_lengths else 0.0
+            sr = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
+            mean_robot_z = float(obs_buf[:, :, 2].mean().item())
             print(f"[{phase}|{curriculum_stage or 'full'}|vec] "
                   f"Iter {iteration:5d} | Steps {total_steps:12,d} | "
-                  f"R̄={mr:7.2f} | L̄={ml:6.1f} | "
-                  f"π_loss={policy_loss.item():.4f}")
-            log_metrics(logger, {
-                "mean_reward": mr, "mean_length": ml,
+                  f"R̄={mr:7.2f} (σ={sr:.2f}) | L̄={ml:6.1f} | "
+                  f"z̄={mean_robot_z:.3f} | "
+                  f"π={policy_loss.item():.4f} V={value_loss.item():.4f} "
+                  f"KL={approx_kl:.4f} ev={explained_var:.3f}")
+            metrics = {
+                "mean_reward": mr, "std_reward": sr, "mean_length": ml,
+                "mean_robot_z": mean_robot_z,
                 "policy_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
                 "entropy": -entropy_loss.item(),
-            }, total_steps)
+                "explained_variance": explained_var,
+                "approx_kl": approx_kl,
+                "clip_fraction": clip_frac,
+            }
+            for k, q in comp_queues.items():
+                if q:
+                    metrics[f"rewards/{k}"] = float(np.mean(q))
+            log_metrics(logger, metrics, total_steps)
 
         if iteration % 100 == 0 and iteration > 0:
             save_checkpoint(policy, optimizer, total_steps, phase,
@@ -443,6 +474,9 @@ def train_ppo(
     # Rolling stats
     ep_rewards = deque(maxlen=100)
     ep_lengths = deque(maxlen=100)
+    # Per-reward-component rolling queues (populated on episode end)
+    comp_queues: dict = {}
+    ep_components: dict = {}  # accumulates within the current episode
 
     # Rollout buffer
     n_steps = config.n_steps
@@ -451,7 +485,6 @@ def train_ppo(
 
     total_steps = 0
     num_iterations = config.total_timesteps // n_steps
-    effective_batch = n_steps
 
     print(f"\n{'='*60}")
     print(f" Phase: {phase} | Stage: {curriculum_stage or 'full'}")
@@ -498,9 +531,18 @@ def train_ppo(
             episode_length += 1
             total_steps += 1
 
+            # Accumulate per-component rewards for this episode
+            for k, v in info.get("reward_components", {}).items():
+                if k != "total":
+                    ep_components[k] = ep_components.get(k, 0.0) + float(v)
+
             if done:
                 ep_rewards.append(episode_reward)
                 ep_lengths.append(episode_length)
+                ep_len = max(1, episode_length)
+                for k, v in ep_components.items():
+                    comp_queues.setdefault(k, deque(maxlen=100)).append(v / ep_len)
+                ep_components = {}
                 episode_reward = 0.0
                 episode_length = 0
                 next_obs = env.reset()
@@ -540,6 +582,13 @@ def train_ppo(
         returns = advantages + val_buf
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Explained variance (before update — how well V̂ predicts returns)
+        with torch.no_grad():
+            y_true = returns.reshape(-1).cpu().numpy()
+            y_pred = val_buf.reshape(-1).cpu().numpy()
+            var_y = float(np.var(y_true))
+            explained_var = float(1.0 - np.var(y_true - y_pred) / (var_y + 1e-8))
+
         # Linear decay of action log_std so exploration shrinks over training
         with torch.no_grad():
             prog = iteration / max(1, num_iterations - 1)
@@ -548,6 +597,8 @@ def train_ppo(
             policy.actor_log_std.data.fill_(target_log_std)
 
         # ── PPO Update ──
+        approx_kl = 0.0
+        clip_frac = 0.0
         for epoch in range(config.n_epochs):
             # Mini-batch indices
             indices = torch.randperm(n_steps, device=device)
@@ -592,26 +643,45 @@ def train_ppo(
                 nn.utils.clip_grad_norm_(policy.parameters(), config.max_grad_norm)
                 optimizer.step()
 
+                with torch.no_grad():
+                    log_ratio = new_log_prob - mb_logp
+                    approx_kl = float(((log_ratio.exp() - 1) - log_ratio).mean())
+                    clip_frac = float((log_ratio.abs() > math.log(1 + config.clip_range)).float().mean())
+
         # ── Logging ──
         if iteration % 10 == 0 or len(ep_rewards) > 0:
+            mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
+            ml = float(np.mean(ep_lengths)) if ep_lengths else 0.0
+            sr = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
+            mean_robot_z = float(obs_buf[:, 2].mean().item())
             metrics = {
                 "iteration": iteration,
                 "total_steps": total_steps,
-                "mean_reward": np.mean(ep_rewards) if ep_rewards else 0,
-                "mean_length": np.mean(ep_lengths) if ep_lengths else 0,
+                "mean_reward": mr,
+                "std_reward": sr,
+                "mean_length": ml,
+                "mean_robot_z": mean_robot_z,
                 "policy_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
                 "entropy": -entropy_loss.item(),
+                "explained_variance": explained_var,
+                "approx_kl": approx_kl,
+                "clip_fraction": clip_frac,
             }
+            # Per-component reward breakdown
+            for k, q in comp_queues.items():
+                if q:
+                    metrics[f"rewards/{k}"] = float(np.mean(q))
 
             if iteration % 10 == 0:
                 print(
                     f"[{phase}|{curriculum_stage or 'full'}] "
                     f"Iter {iteration:5d} | "
                     f"Steps {total_steps:10,d} | "
-                    f"R̄={metrics['mean_reward']:7.2f} | "
-                    f"L̄={metrics['mean_length']:6.1f} | "
-                    f"π_loss={metrics['policy_loss']:.4f}"
+                    f"R̄={mr:7.2f} (σ={sr:.2f}) | "
+                    f"L̄={ml:5.1f} | z̄={mean_robot_z:.3f} | "
+                    f"π={policy_loss.item():.4f} V={value_loss.item():.4f} "
+                    f"KL={approx_kl:.4f} ev={explained_var:.3f}"
                 )
 
             log_metrics(logger, metrics, total_steps)

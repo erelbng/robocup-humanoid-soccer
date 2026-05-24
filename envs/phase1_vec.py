@@ -139,7 +139,7 @@ class K1DribbleShootVecEnv:
             "K1_22dof.urdf",
         )
         self.robot = self.scene.add_entity(
-            gs.morphs.URDF(file=urdf_path, pos=(0, 0, 1.05),
+            gs.morphs.URDF(file=urdf_path, pos=(0, 0, 0.65),
                            merge_fixed_links=True),
         )
 
@@ -210,9 +210,9 @@ class K1DribbleShootVecEnv:
     def _reset_pose(self, envs_idx: np.ndarray):
         n = envs_idx.shape[0]
         try:
-            # Trunk at z=1.05, neutral orientation
+            # Trunk at z=0.65 (settles to ~0.55m standing height)
             pos = np.zeros((n, 3), dtype=np.float32)
-            pos[:, 2] = 1.05
+            pos[:, 2] = 0.65
             if self.cfg.randomize_robot_pos:
                 pos[:, 0] = self.rng.uniform(-0.5, 0.5, n)
                 pos[:, 1] = self.rng.uniform(-0.5, 0.5, n)
@@ -231,8 +231,9 @@ class K1DribbleShootVecEnv:
         try:
             bpos = np.zeros((n, 3), dtype=np.float32)
             if self.curriculum_stage in ("stand", "standup"):
-                bpos[:, 0] = 5.0
-                bpos[:, 1] = 5.0
+                # y=5.0 is outside the 8m-wide field; use far end instead.
+                bpos[:, 0] = 3.5
+                bpos[:, 1] = 0.0
             else:
                 bpos[:, 0] = self.rng.uniform(0.5, 3.0, n)
                 bpos[:, 1] = self.rng.uniform(-2.0, 2.0, n)
@@ -261,7 +262,7 @@ class K1DribbleShootVecEnv:
         self.step_count += 1
 
         obs = self._get_obs()
-        reward = self._compute_reward_batch(action)
+        reward, batch_components = self._compute_reward_batch(action)
         done = self._check_done_batch()
 
         self.episode_reward += reward
@@ -271,8 +272,11 @@ class K1DribbleShootVecEnv:
         if done.any():
             self.reset(envs_idx=np.where(done)[0])
 
-        info = {"episode_reward": self.episode_reward.copy(),
-                "curriculum_stage": self.curriculum_stage}
+        info = {
+            "episode_reward": self.episode_reward.copy(),
+            "curriculum_stage": self.curriculum_stage,
+            "reward_components": batch_components,
+        }
         return obs, reward, done, info
 
     # ── Observations / rewards / done — batched ────────────────────
@@ -312,22 +316,16 @@ class K1DribbleShootVecEnv:
             pass
         return out
 
-    def _compute_reward_batch(self, action: np.ndarray) -> np.ndarray:
-        """Batched reward.
-
-        Current implementation: upright + style-velocity tracking + small
-        smoothness penalty + ball-distance shaping. Mirrors the most
-        important pieces of the single-env reward. Standup and gait-shaping
-        terms are scalar today; that's the next refactor.
-        """
+    def _compute_reward_batch(self, action: np.ndarray
+                              ) -> tuple[np.ndarray, dict]:
+        """Batched reward. Returns (reward_array, mean_component_dict)."""
         try:
             pos = _to_np(self.robot.get_pos())
             quat = _to_np(self.robot.get_quat())
             vel = _to_np(self.robot.get_vel())
-            angv = _to_np(self.robot.get_ang())
             bpos = _to_np(self.ball.get_pos())
         except Exception:
-            return np.zeros(self.num_envs, dtype=np.float32)
+            return np.zeros(self.num_envs, dtype=np.float32), {}
 
         # Upright (cos of trunk pitch+roll)
         upright = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
@@ -336,10 +334,9 @@ class K1DribbleShootVecEnv:
         height_err = pos[:, 2] - 0.55
         height_r = np.exp(-(height_err ** 2) / (0.12 ** 2))
 
-        # Style-command velocity tracking (only meaningful for non-stand stages)
+        # Style-command velocity tracking
         vx_target = self._cmd[:, 0] if self._style_dim > 0 else 0.0
         vy_target = self._cmd[:, 1] if self._style_dim > 1 else 0.0
-        # World→body via yaw
         w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
         yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
         vx_body = np.cos(-yaw) * vel[:, 0] - np.sin(-yaw) * vel[:, 1]
@@ -347,12 +344,15 @@ class K1DribbleShootVecEnv:
         vel_err = (vx_body - vx_target) ** 2 + (vy_body - vy_target) ** 2
         vel_track = np.exp(-vel_err / (0.25 ** 2))
 
-        # Ball distance shaping (only for walk/dribble/shoot/full)
+        # Ball distance shaping
         ball_dist = np.linalg.norm(bpos[:, :2] - pos[:, :2], axis=1)
         ball_close_r = np.exp(-(ball_dist ** 2) / (1.0 ** 2))
 
         # Smoothness penalty
         smooth = np.sum((action - self._prev_action) ** 2, axis=1)
+
+        # Fall penalty
+        fallen = pos[:, 2] < 0.20
 
         r = np.zeros(self.num_envs, dtype=np.float32)
         r += 1.0 * upright.astype(np.float32)
@@ -363,12 +363,18 @@ class K1DribbleShootVecEnv:
             r += 0.8 * ball_close_r.astype(np.float32)
 
         r -= 0.05 * smooth.astype(np.float32)
-
-        # Fall penalty
-        fallen = pos[:, 2] < 0.20
         r -= 10.0 * fallen.astype(np.float32)
 
-        return r
+        components = {
+            "upright": float(np.mean(upright)),
+            "height": float(np.mean(height_r)),
+            "vel_track": float(np.mean(vel_track)),
+            "ball_close": float(np.mean(ball_close_r)),
+            "smoothness": float(np.mean(smooth)),
+            "fall_rate": float(np.mean(fallen)),
+            "mean_robot_z": float(np.mean(pos[:, 2])),
+        }
+        return r, components
 
     def _check_done_batch(self) -> np.ndarray:
         try:
