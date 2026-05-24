@@ -86,8 +86,8 @@ def train_flashsac_vec(
     curriculum_stage: Optional[str] = None,
     checkpoint_dir: str = "checkpoints",
     # SAC-specific hyperparams (sensible defaults for Genesis humanoid):
-    buffer_capacity: int = 1_000_000,
-    batch_size: int = 1024,
+    buffer_capacity: int = 200_000,   # 200k × 190 floats ≈ 152 MB on CPU
+    batch_size: int = 512,
     actor_hidden=(512, 256, 128),
     critic_hidden=(512, 256, 128),
     actor_lr: float = 3e-4,
@@ -99,7 +99,11 @@ def train_flashsac_vec(
     warmup_steps: int = 1024,  # use random actions until buffer has this many
     learning_starts: int = 5_000,  # first gradient update after this many env-steps
     gradient_steps: int = 1,  # updates per env-step
-    action_scale: Optional[float] = None,  # default: π (matches env clip)
+    # Joint position targets only need ~1.5 rad of range from the default
+    # pose to cover everything a walking humanoid does. The old default
+    # of π let the policy slam joints to ±π, flipping the robot before
+    # it could learn anything. Override to π for full-range tasks.
+    action_scale: Optional[float] = None,  # default: 1.5 rad
     video_frequency: int = 50,  # log a video clip every N trainer iterations
     video_n_frames: int = 300,
     video_fps: int = 30,
@@ -113,7 +117,7 @@ def train_flashsac_vec(
     act_dim = int(config.act_dim)
     n_envs = int(env.num_envs)
     if action_scale is None:
-        action_scale = math.pi
+        action_scale = 1.5  # joint-range-friendly default
     if target_entropy is None:
         target_entropy = -float(act_dim)
 
@@ -140,7 +144,22 @@ def train_flashsac_vec(
     buffer = GPUReplayBuffer(buffer_capacity, obs_dim, act_dim, device)
 
     # ── Obs normaliser (running stats, updated forever) ──
+    # We keep a numpy RunningMeanStd (Welford) for online updates, plus
+    # mirror tensors on `device` that are refreshed in-place after each
+    # env step. This avoids allocating fresh torch tensors twice per
+    # gradient step, which on CPU adds non-trivial Python overhead.
     obs_norm = RunningMeanStd(shape=(obs_dim,))
+    obs_mean_t = torch.zeros(obs_dim, dtype=torch.float32, device=device)
+    obs_std_t = torch.ones(obs_dim, dtype=torch.float32, device=device)
+
+    def _refresh_norm_cache():
+        obs_mean_t.copy_(torch.from_numpy(
+            obs_norm.mean.astype(np.float32)).to(device))
+        obs_std_t.copy_(torch.from_numpy(
+            (np.sqrt(obs_norm.var) + 1e-8).astype(np.float32)).to(device))
+
+    def _norm(t: torch.Tensor) -> torch.Tensor:
+        return (t - obs_mean_t) / obs_std_t
 
     # ── Rolling metrics ──
     ep_rewards = deque(maxlen=200)
@@ -179,6 +198,7 @@ def train_flashsac_vec(
     # ── Roll the env ──
     obs = env.reset()
     obs_norm.update(obs)
+    _refresh_norm_cache()
 
     iteration = 0
     log_interval = 10
@@ -202,8 +222,11 @@ def train_flashsac_vec(
                     -action_scale, action_scale,
                     size=(n_envs, act_dim)).astype(np.float32)
             else:
-                obs_t = torch.as_tensor(obs_norm.normalize(obs),
-                                        dtype=torch.float32, device=device)
+                # Use cached device tensors; one float32 array→tensor
+                # copy of `obs` per env step instead of two per grad step.
+                obs_t = torch.as_tensor(obs, dtype=torch.float32,
+                                        device=device)
+                obs_t = _norm(obs_t)
                 action_t, _ = actor(obs_t, deterministic=False)
                 action = action_t.cpu().numpy()
 
@@ -245,6 +268,7 @@ def train_flashsac_vec(
             comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
 
         obs_norm.update(next_obs)
+        _refresh_norm_cache()
         obs = next_obs
 
         # ── Gradient updates (off-policy) ──
@@ -260,10 +284,9 @@ def train_flashsac_vec(
                 and buffer.size >= batch_size):
             for _ in range(gradient_steps):
                 batch = buffer.sample(batch_size)
-                # Normalise observations the same way the actor sees them.
-                # We normalise WITH the running stats (no torch grad needed).
-                b_obs = _norm_torch(batch["obs"], obs_norm, device)
-                b_next = _norm_torch(batch["next_obs"], obs_norm, device)
+                # Normalise via cached device tensors (no allocation).
+                b_obs = _norm(batch["obs"])
+                b_next = _norm(batch["next_obs"])
                 b_act = batch["act"]
                 b_rew = batch["rew"]
                 b_done = batch["done"]
@@ -288,10 +311,14 @@ def train_flashsac_vec(
                 critic_opt.step()
 
                 # ── Actor update ──
-                # Sample a NEW action under the current actor (reparam)
+                # Freeze critic params during the actor backward pass —
+                # we still need the dq/d(new_action) gradient to flow
+                # through, but skipping critic-param grads is ~10% faster
+                # on CPU. Mirrors FlashSAC's pattern (requires_grad_(False)).
+                for p in critic.parameters():
+                    p.requires_grad_(False)
+
                 new_action, new_logp = actor(b_obs, deterministic=False)
-                # Use current critic for actor loss (not target — this is
-                # standard SAC).
                 q1_pi, q2_pi = critic(b_obs, new_action)
                 q_pi = torch.min(q1_pi, q2_pi)
                 alpha = log_alpha.exp().detach()
@@ -301,6 +328,9 @@ def train_flashsac_vec(
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
                 actor_opt.step()
+
+                for p in critic.parameters():
+                    p.requires_grad_(True)
 
                 # ── Temperature (α) update ──
                 # log_prob of the SAME action (re-use), detached
@@ -374,21 +404,6 @@ def train_flashsac_vec(
 
 
 # ─── helpers ───────────────────────────────────────────────────────────
-
-
-def _norm_torch(t: torch.Tensor, obs_norm: RunningMeanStd,
-                device: torch.device) -> torch.Tensor:
-    """Apply running-mean/std normalisation to a torch tensor.
-
-    The normaliser internally uses numpy. We do the small CPU↔GPU hop
-    here. It's negligible compared to the gradient step on Genesis-sized
-    networks, but if it becomes a bottleneck the running stats can be
-    cached as torch tensors on device.
-    """
-    mean = torch.as_tensor(obs_norm.mean, dtype=t.dtype, device=device)
-    std = torch.as_tensor(np.sqrt(obs_norm.var) + 1e-8,
-                          dtype=t.dtype, device=device)
-    return (t - mean) / std
 
 
 def _log_metrics(logger, metrics: dict, step: int) -> None:

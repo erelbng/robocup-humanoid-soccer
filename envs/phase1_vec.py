@@ -98,8 +98,14 @@ class K1DribbleShootVecEnv:
         # Per-env bookkeeping (numpy, shape (num_envs,))
         self.step_count = np.zeros(num_envs, dtype=np.int64)
         self.episode_reward = np.zeros(num_envs, dtype=np.float32)
-        self._prev_action = np.zeros((num_envs, self.cfg.act_dim),
-                                     dtype=np.float32)
+        # `_prev_action` is initialised to the default joint pose so the
+        # smoothness penalty on step-0 measures motion away from the
+        # rest pose, not motion away from 0. Otherwise every reset pays
+        # a huge spurious penalty on the first step.
+        self._default_action = np.asarray(self.robot_cfg.default_joint_pos,
+                                          dtype=np.float32)
+        self._prev_action = np.tile(self._default_action,
+                                    (num_envs, 1))
 
         # Style command (one sampler shared, per-env current command)
         self._style_dim = self.cfg.style_command_dim if getattr(
@@ -206,10 +212,12 @@ class K1DribbleShootVecEnv:
             envs_idx = np.arange(self.num_envs)
         envs_idx = np.asarray(envs_idx, dtype=np.int64)
 
-        # Per-env reset bookkeeping
+        # Per-env reset bookkeeping. `_prev_action` resets to the default
+        # joint pose (where the robot is physically) so the first
+        # smoothness measurement is meaningful.
         self.step_count[envs_idx] = 0
         self.episode_reward[envs_idx] = 0.0
-        self._prev_action[envs_idx] = 0.0
+        self._prev_action[envs_idx] = self._default_action
 
         # Resample style command for reset envs
         if self._sampler is not None and self._style_dim > 0:
@@ -333,7 +341,17 @@ class K1DribbleShootVecEnv:
 
     def _compute_reward_batch(self, action: np.ndarray
                               ) -> tuple[np.ndarray, dict]:
-        """Batched reward. Returns (reward_array, mean_component_dict)."""
+        """Batched reward.
+
+        Returns (reward_array, mean_component_dict). The components dict
+        is BATCH-AVERAGED, suitable for `rewards/<name>` TB scalars.
+
+        Reward magnitudes are tuned so an exploring policy has positive
+        EV when staying upright at ~0.55 m. Earlier values had a
+        smoothness term that dominated by 3–5x — the policy couldn't
+        learn because every random action hurt more than standing
+        helped.
+        """
         try:
             pos = _to_np(self.robot.get_pos())
             quat = _to_np(self.robot.get_quat())
@@ -342,14 +360,18 @@ class K1DribbleShootVecEnv:
         except Exception:
             return np.zeros(self.num_envs, dtype=np.float32), {}
 
-        # Upright (cos of trunk pitch+roll)
-        upright = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+        # ── Posture ──────────────────────────────────────────────
+        # Upright: cos of angle between body-z and world-z, in [-1, 1].
+        # We clamp to [0, 1] so the reward never goes negative just from
+        # being knocked over — the fall penalty handles that separately.
+        upright_raw = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+        upright = np.maximum(0.0, upright_raw)
 
-        # Trunk height shaping
+        # Trunk height Gaussian centered at 0.55 m (default standing).
         height_err = pos[:, 2] - 0.55
         height_r = np.exp(-(height_err ** 2) / (0.12 ** 2))
 
-        # Style-command velocity tracking
+        # ── Velocity tracking (only for walking stages) ──────────
         vx_target = self._cmd[:, 0] if self._style_dim > 0 else 0.0
         vy_target = self._cmd[:, 1] if self._style_dim > 1 else 0.0
         w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
@@ -357,37 +379,46 @@ class K1DribbleShootVecEnv:
         vx_body = np.cos(-yaw) * vel[:, 0] - np.sin(-yaw) * vel[:, 1]
         vy_body = np.sin(-yaw) * vel[:, 0] + np.cos(-yaw) * vel[:, 1]
         vel_err = (vx_body - vx_target) ** 2 + (vy_body - vy_target) ** 2
-        vel_track = np.exp(-vel_err / (0.25 ** 2))
+        vel_track = np.exp(-vel_err / (0.4 ** 2))  # wider σ for shaping
 
-        # Ball distance shaping
+        # ── Ball proximity (walk+) ───────────────────────────────
         ball_dist = np.linalg.norm(bpos[:, :2] - pos[:, :2], axis=1)
-        ball_close_r = np.exp(-(ball_dist ** 2) / (1.0 ** 2))
+        ball_close_r = np.exp(-(ball_dist ** 2) / (1.5 ** 2))  # wider σ
 
-        # Smoothness penalty
+        # ── Action smoothness ────────────────────────────────────
+        # Tuned to be a SOFT shaping term, not a barrier. Old weight
+        # 0.05 over 22 action dims × σ² ≈ 2 gave −2.2/step which
+        # dominated everything else. 0.002 gives ≤ −0.1 typical.
         smooth = np.sum((action - self._prev_action) ** 2, axis=1)
 
-        # Fall penalty
+        # ── Termination signals ──────────────────────────────────
         fallen = pos[:, 2] < 0.20
+        alive = (pos[:, 2] >= 0.30).astype(np.float32)
 
+        # ── Aggregate ────────────────────────────────────────────
         r = np.zeros(self.num_envs, dtype=np.float32)
         r += 1.0 * upright.astype(np.float32)
-        r += 0.5 * height_r.astype(np.float32)
+        r += 1.0 * height_r.astype(np.float32)
+        r += 0.5 * alive   # survival bonus (only while clearly standing)
 
         if self.curriculum_stage in ("walk", "dribble", "shoot", "full"):
             r += 1.5 * vel_track.astype(np.float32)
-            r += 0.8 * ball_close_r.astype(np.float32)
+            r += 0.5 * ball_close_r.astype(np.float32)
 
-        r -= 0.05 * smooth.astype(np.float32)
-        r -= 10.0 * fallen.astype(np.float32)
+        r -= 0.002 * smooth.astype(np.float32)
+        r -= 2.0 * fallen.astype(np.float32)  # less punishing; episode
+                                              # ends at z<0.10 anyway
 
         components = {
             "upright": float(np.mean(upright)),
             "height": float(np.mean(height_r)),
+            "alive_rate": float(np.mean(alive)),
             "vel_track": float(np.mean(vel_track)),
             "ball_close": float(np.mean(ball_close_r)),
             "smoothness": float(np.mean(smooth)),
             "fall_rate": float(np.mean(fallen)),
             "mean_robot_z": float(np.mean(pos[:, 2])),
+            "mean_reward": float(np.mean(r)),
         }
         return r, components
 
