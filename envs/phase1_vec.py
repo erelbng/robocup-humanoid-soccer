@@ -66,7 +66,7 @@ class K1DribbleShootVecEnv:
         field_info: dict = None,
         render: bool = False,
         curriculum_stage: str = "full",
-        env_spacing: Tuple[float, float] = (12.0, 9.0),
+        env_spacing: Tuple[float, float] = (14.0, 11.0),
     ):
         self.num_envs = num_envs
         self.cfg = cfg or Phase1Config()
@@ -130,14 +130,26 @@ class K1DribbleShootVecEnv:
         self.scene = gs.Scene(
             show_viewer=self.render,
             sim_options=gs.options.SimOptions(dt=self.cfg.sim_dt, substeps=2),
+            vis_options=gs.options.VisOptions(
+                show_world_frame=False,
+                ambient_light=(0.4, 0.4, 0.4),
+            ),
         )
 
-        # Field (built once; replicated by Genesis across envs at build())
+        # Field — physics_only=True skips the 80+ visual-only entities
+        # (lines, circle, nets) so Genesis only replicates ~9 bodies per
+        # env instead of ~90. With n_envs=4096 this is the difference
+        # between 36k and 368k rigid bodies in the scene.
         try:
             from models.field.field_genesis_builder import build_soccer_field
-            build_soccer_field(self.scene)
-        except Exception:
-            self.scene.add_entity(gs.morphs.Plane())
+            build_soccer_field(self.scene, physics_only=True)
+        except Exception as e:
+            print(f"[vec] field builder failed ({e}); using plain green plane")
+            self.scene.add_entity(
+                gs.morphs.Plane(),
+                surface=gs.surfaces.Default(color=(0.10, 0.55, 0.10, 1.0),
+                                            roughness=0.9),
+            )
 
         # Robot
         urdf_path = os.path.join(
@@ -169,8 +181,12 @@ class K1DribbleShootVecEnv:
         except Exception as e:
             print(f"[vec] camera setup failed: {e}; videos will be unavailable")
 
+        # center_envs_at_origin=False keeps env 0 at world (0,0) so the
+        # fixed camera at (0, -6, 4) correctly frames env 0's field.
+        # With center=True, env 0 ends up at (-half_grid × spacing) in
+        # world space, which is hundreds of metres from the camera.
         self.scene.build(n_envs=self.num_envs, env_spacing=self.env_spacing,
-                         center_envs_at_origin=True)
+                         center_envs_at_origin=False)
         self._setup_joint_mapping()
 
         # PD gains on actuated joints

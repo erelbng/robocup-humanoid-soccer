@@ -123,6 +123,18 @@ def train_flashsac_vec(
     if target_entropy is None:
         target_entropy = -float(act_dim)
 
+    # Auto-scale gradient_steps with n_envs so effective per-transition
+    # UTD stays roughly constant regardless of parallelism.
+    # Reference: gradient_steps calibrated for n_envs=256.
+    # With n_envs=4096 we collect 16× more transitions per env-step, so
+    # scale up proportionally. Only increases — never reduces a value the
+    # caller explicitly set higher. Cap at 20 to bound wall-clock cost.
+    _auto_gs = max(1, n_envs // 256)
+    if _auto_gs > gradient_steps:
+        gradient_steps = min(20, _auto_gs)
+        print(f"   [auto] gradient_steps → {gradient_steps} "
+              f"(n_envs={n_envs} / 256)")
+
     # ── Build networks ──
     actor = SACActor(obs_dim, act_dim, hidden_dims=actor_hidden,
                      action_scale=action_scale).to(device)
@@ -133,6 +145,19 @@ def train_flashsac_vec(
     target_critic.load_state_dict(critic.state_dict())
     for p in target_critic.parameters():
         p.requires_grad_(False)
+
+    # torch.compile gives 2-3× throughput on CUDA with PyTorch ≥ 2.0.
+    # We compile after moving to device so the tracer sees the right dtype.
+    _compiled = False
+    if device.type == "cuda" and int(torch.__version__.split(".")[0]) >= 2:
+        try:
+            actor = torch.compile(actor)
+            critic = torch.compile(critic)
+            target_critic = torch.compile(target_critic)
+            _compiled = True
+            print("   [compile] torch.compile enabled")
+        except Exception as _ce:
+            print(f"   [compile] torch.compile unavailable: {_ce}")
 
     # Learnable log α with optimizer
     log_alpha = torch.tensor(math.log(init_alpha), dtype=torch.float32,
@@ -270,7 +295,11 @@ def train_flashsac_vec(
             comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
 
         obs_norm.update(next_obs)
-        _refresh_norm_cache()
+        # Refreshing cached device tensors every step adds two host→device
+        # transfers per env step. Amortise to every 10 iterations — the
+        # normaliser stats change slowly enough that stale values are fine.
+        if iteration % 10 == 0:
+            _refresh_norm_cache()
         obs = next_obs
 
         # ── Gradient updates (off-policy) ──

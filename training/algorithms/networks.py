@@ -169,11 +169,9 @@ class SACActor(nn.Module):
         log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
         std = log_std.exp()
 
-        if deterministic:
-            pre_tanh = mean
-        else:
-            normal = torch.distributions.Normal(mean, std)
-            pre_tanh = normal.rsample()
+        # Build distribution once; rsample uses the same object for log_prob.
+        dist = torch.distributions.Normal(mean, std)
+        pre_tanh = mean if deterministic else dist.rsample()
 
         squashed = torch.tanh(pre_tanh)
         action = squashed * self.action_scale
@@ -185,8 +183,7 @@ class SACActor(nn.Module):
         # target_entropy = -|A| keep its usual meaning.
         # log p(tanh u) = log N(u|μ,σ) − Σ log(1 − tanh(u)²)
         # Stable form: log(1 − tanh²) = 2(log 2 − u − softplus(−2u))
-        normal = torch.distributions.Normal(mean, std)
-        log_prob = normal.log_prob(pre_tanh).sum(-1)
+        log_prob = dist.log_prob(pre_tanh).sum(-1)
         log_prob = log_prob - (
             2.0 * (math.log(2.0) - pre_tanh
                    - torch.nn.functional.softplus(-2.0 * pre_tanh))

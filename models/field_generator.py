@@ -521,11 +521,17 @@ class GenesisFieldBuilder:
         paw = self.f.penalty_area_width / 2
 
         return f'''
-def build_soccer_field(scene):
+def build_soccer_field(scene, physics_only: bool = False):
     """Add RoboCup HSL soccer field entities to a Genesis scene.
 
     Field dimensions: {self.f.length}m x {self.f.width}m
     Total with border: {tl}m x {tw}m
+
+    Args:
+        physics_only: When True, skip all visual-only entities (field lines,
+            center circle, goal nets). Reduces entity count from ~90 to ~9,
+            critical for vectorised training where each entity is replicated
+            per env.
 
     Returns the carpet entity so callers can identify it (e.g. for contact
     filtering). Field lines and the center circle are visual-only
@@ -546,68 +552,69 @@ def build_soccer_field(scene):
         surface=green,
     )
 
-    # ── Field lines (thin white boxes, visual only) ───────────────
-    line_h = 0.003
-    line_z = line_h / 2 + 0.002  # sit just above carpet top (z=0)
+    if not physics_only:
+        # ── Field lines (thin white boxes, visual only) ───────────────
+        line_h = 0.003
+        line_z = line_h / 2 + 0.002  # sit just above carpet top (z=0)
 
-    # Touchlines
-    for sign in [1, -1]:
-        scene.add_entity(
-            gs.morphs.Box(size=({hl * 2}, {lw}, line_h),
-                          pos=(0, sign * {hw}, line_z),
-                          fixed=True, collision=False),
-            surface=white,
-        )
-
-    # Goal lines
-    for sign in [1, -1]:
-        scene.add_entity(
-            gs.morphs.Box(size=({lw}, {hw * 2}, line_h),
-                          pos=(sign * {hl}, 0, line_z),
-                          fixed=True, collision=False),
-            surface=white,
-        )
-
-    # Center line
-    scene.add_entity(
-        gs.morphs.Box(size=({lw}, {hw * 2}, line_h),
-                      pos=(0, 0, line_z),
-                      fixed=True, collision=False),
-        surface=white,
-    )
-
-    # Penalty areas
-    for sign in [1, -1]:
-        scene.add_entity(
-            gs.morphs.Box(size=({lw}, {paw * 2}, line_h),
-                          pos=(sign * ({hl} - {pal}), 0, line_z),
-                          fixed=True, collision=False),
-            surface=white,
-        )
-        for y_sign in [1, -1]:
+        # Touchlines
+        for sign in [1, -1]:
             scene.add_entity(
-                gs.morphs.Box(size=({pal}, {lw}, line_h),
-                              pos=(sign * ({hl} - {pal}/2), y_sign * {paw}, line_z),
+                gs.morphs.Box(size=({hl * 2}, {lw}, line_h),
+                              pos=(0, sign * {hw}, line_z),
                               fixed=True, collision=False),
                 surface=white,
             )
 
-    # Center circle (segments)
-    n_seg = 48
-    for i in range(n_seg):
-        a0 = 2 * math.pi * i / n_seg
-        a1 = 2 * math.pi * (i + 1) / n_seg
-        cx = ({ccr} * math.cos(a0) + {ccr} * math.cos(a1)) / 2
-        cy = ({ccr} * math.sin(a0) + {ccr} * math.sin(a1)) / 2
-        seg_len = 2 * {ccr} * math.sin(math.pi / n_seg)
-        angle = (a0 + a1) / 2
+        # Goal lines
+        for sign in [1, -1]:
+            scene.add_entity(
+                gs.morphs.Box(size=({lw}, {hw * 2}, line_h),
+                              pos=(sign * {hl}, 0, line_z),
+                              fixed=True, collision=False),
+                surface=white,
+            )
+
+        # Center line
         scene.add_entity(
-            gs.morphs.Box(size=(seg_len, {lw}, line_h),
-                          pos=(cx, cy, line_z),
-                          euler=(0, 0, angle),
+            gs.morphs.Box(size=({lw}, {hw * 2}, line_h),
+                          pos=(0, 0, line_z),
                           fixed=True, collision=False),
             surface=white,
         )
+
+        # Penalty areas
+        for sign in [1, -1]:
+            scene.add_entity(
+                gs.morphs.Box(size=({lw}, {paw * 2}, line_h),
+                              pos=(sign * ({hl} - {pal}), 0, line_z),
+                              fixed=True, collision=False),
+                surface=white,
+            )
+            for y_sign in [1, -1]:
+                scene.add_entity(
+                    gs.morphs.Box(size=({pal}, {lw}, line_h),
+                                  pos=(sign * ({hl} - {pal}/2), y_sign * {paw}, line_z),
+                                  fixed=True, collision=False),
+                    surface=white,
+                )
+
+        # Center circle (segments)
+        n_seg = 48
+        for i in range(n_seg):
+            a0 = 2 * math.pi * i / n_seg
+            a1 = 2 * math.pi * (i + 1) / n_seg
+            cx = ({ccr} * math.cos(a0) + {ccr} * math.cos(a1)) / 2
+            cy = ({ccr} * math.sin(a0) + {ccr} * math.sin(a1)) / 2
+            seg_len = 2 * {ccr} * math.sin(math.pi / n_seg)
+            angle = (a0 + a1) / 2
+            scene.add_entity(
+                gs.morphs.Box(size=(seg_len, {lw}, line_h),
+                              pos=(cx, cy, line_z),
+                              euler=(0, 0, angle),
+                              fixed=True, collision=False),
+                surface=white,
+            )
 
     # ── Goals (collidable so the ball bounces off) ────────────────
     for sign in [1, -1]:
@@ -625,12 +632,13 @@ def build_soccer_field(scene):
                           fixed=True, collision=True),
             surface=post,
         )
-        scene.add_entity(
-            gs.morphs.Box(size=(0.01, {gw * 2}, {gh}),
-                          pos=(gx + sign * {gd}, 0, {gh / 2}),
-                          fixed=True, collision=True),
-            surface=net,
-        )
+        if not physics_only:
+            scene.add_entity(
+                gs.morphs.Box(size=(0.01, {gw * 2}, {gh}),
+                              pos=(gx + sign * {gd}, 0, {gh / 2}),
+                              fixed=True, collision=True),
+                surface=net,
+            )
 
     return carpet
 '''

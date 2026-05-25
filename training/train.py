@@ -287,8 +287,13 @@ _CPU_PRESET = {
 }
 _GPU_PRESET = {
     "vec_num_envs": 1024,
-    "flashsac": {"buffer_capacity": 1_000_000, "batch_size": 1024,
-                 "gradient_steps": 1},
+    # buffer_capacity: 2M keeps ~488 env-steps of history with n_envs=4096
+    # (vs 244 with 1M). Fits in ~1.5 GB VRAM for obs_dim=83.
+    # batch_size: 2048 better saturates GPU matrix ops vs 1024.
+    # gradient_steps: 4 baseline for n_envs=1024; auto-scaled up inside
+    # train_flashsac_vec when n_envs is larger (e.g. → 16 for n_envs=4096).
+    "flashsac": {"buffer_capacity": 2_000_000, "batch_size": 2048,
+                 "gradient_steps": 4},
     "ppo": {},
 }
 
