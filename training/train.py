@@ -24,8 +24,8 @@ import numpy as np
 # Add project root for sibling imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from configs.config import (CHECKPOINTS_DIR, LOGS_DIR, VIDEOS_DIR,
-                            Phase1Config, Phase2Config, ProjectConfig)
+from configs.config import (CHECKPOINTS_DIR, FIELD_DIR, FIELD_JSON, LOGS_DIR,
+                            VIDEOS_DIR, Phase1Config, Phase2Config, ProjectConfig)
 
 
 # ─── logger setup ──────────────────────────────────────────────────────
@@ -376,9 +376,33 @@ def main():
     # explicit CLI flag overrides.
     device, preset, device_kind = _resolve_device(args.device)
     algo_kwargs = dict(preset.get(algorithm, {}))
+
+    # TensorFloat32 is disabled by default in PyTorch but gives free
+    # throughput on Ampere+ GPUs (RTX 30xx/40xx) for float32 matmuls.
+    if device_kind == "gpu":
+        import torch as _torch
+        _torch.set_float32_matmul_precision("high")
+
+    # Effective vec_num_envs: CLI overrides the preset; compute it now so
+    # the log line is accurate instead of always showing the preset default.
+    effective_nvenvs = args.vec_num_envs if args.vec_num_envs else preset["vec_num_envs"]
     print(f"[device] resolved: kind={device_kind}  torch={device}  "
-          f"vec_num_envs={preset['vec_num_envs']}  "
+          f"vec_num_envs={effective_nvenvs}  "
           f"algo_kwargs={algo_kwargs or '{}'}")
+
+    # field_genesis_builder.py is gitignored (auto-generated). Regenerate
+    # it on the fly if it's missing so train commands work without a
+    # separate setup step after git pull.
+    _builder = os.path.join(str(FIELD_DIR), "field_genesis_builder.py")
+    if not os.path.exists(_builder):
+        print("[setup] field_genesis_builder.py missing; regenerating...")
+        try:
+            from models.field_generator import generate_field_assets
+            generate_field_assets(str(FIELD_JSON), str(FIELD_DIR))
+        except Exception as _fe:
+            print(f"[setup] field regeneration failed: {_fe} "
+                  "(run: python -m models.field_generator "
+                  "configs/field_hsl_2026.json -o models/field)")
 
     config = ProjectConfig()
     config.seed = args.seed
@@ -403,7 +427,7 @@ def main():
     # preset, but keep this as a defensive double-check).
     if algorithm == "flashsac" and not config.phase1.use_vec_env:
         print("[train] FlashSAC requires a vectorised env; "
-              f"enabling with vec_num_envs={preset['vec_num_envs']}")
+              f"enabling with vec_num_envs={effective_nvenvs}")
         config.phase1.use_vec_env = True
 
     np.random.seed(config.seed)
