@@ -524,7 +524,7 @@ def run_evaluation(checkpoint_path: str, phase: str = "phase1",
         else config.phase2.act_dim
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from training.train import create_policy, load_checkpoint
+    from training.common import create_policy, load_checkpoint
 
     policy = create_policy(obs_dim, act_dim)
     if policy is None:

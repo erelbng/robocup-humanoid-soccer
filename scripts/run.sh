@@ -89,6 +89,18 @@ activate_or_die() {
     source "$VENV_DIR/bin/activate"
 }
 
+# ── Skill-library helpers ───────────────────────────────────────
+
+VALID_SKILLS=(standup walk dribble shoot)
+
+is_valid_skill() {
+    local s="$1"
+    for v in "${VALID_SKILLS[@]}"; do
+        [ "$v" = "$s" ] && return 0
+    done
+    return 1
+}
+
 # ── Commands ─────────────────────────────────────────────────────
 case "${1:-help}" in
     setup)
@@ -97,25 +109,45 @@ case "${1:-help}" in
         setup_robot_assets
         generate_field
         mkdir -p checkpoints logs videos
-        log "Setup complete! Run: ./scripts/run.sh train-phase1"
+        log "Setup complete!"
+        log "Next: train each skill, then the orchestrator."
+        log "  ./scripts/run.sh train-skill walk"
+        log "  ./scripts/run.sh train-skill standup"
+        log "  ./scripts/run.sh train-skill dribble"
+        log "  ./scripts/run.sh train-skill shoot"
+        log "  ./scripts/run.sh train-orchestrator"
         ;;
-    train)
+    train-skill)
         shift
         activate_or_die
-        log "Starting training..."
-        python3 -m training.train "$@"
+        if [ $# -lt 1 ]; then
+            err "Usage: ./scripts/run.sh train-skill <walk|standup|dribble|shoot> [extra-args...]"
+        fi
+        SKILL="$1"; shift
+        if ! is_valid_skill "$SKILL"; then
+            err "Unknown skill '$SKILL'. Valid: ${VALID_SKILLS[*]}"
+        fi
+        log "Training skill: $SKILL"
+        python3 -m training.train_skill --skill "$SKILL" "$@"
         ;;
-    train-phase1)
+    train-skills-all)
+        # Train every skill sequentially in its OWN python process — so
+        # Genesis releases its GPU allocation between skills and we
+        # don't hit the cross-stage OOM that drove this refactor.
         shift
         activate_or_die
-        log "Starting Phase 1 training (single-robot skills)..."
-        python3 -m training.train --phase 1 "$@"
+        for SKILL in "${VALID_SKILLS[@]}"; do
+            log "── Training skill: $SKILL ──"
+            python3 -m training.train_skill --skill "$SKILL" "$@" || \
+                err "Skill $SKILL training failed; halting sequence."
+        done
+        log "All skills trained."
         ;;
-    train-phase2)
+    train-orchestrator)
         shift
         activate_or_die
-        log "Starting Phase 2 training (match)..."
-        python3 -m training.train --phase 2 "$@"
+        log "Starting Phase-2 orchestrator training (4v4 self-play)..."
+        python3 -m training.train_orchestrator "$@"
         ;;
     eval|evaluate)
         shift
@@ -152,25 +184,41 @@ case "${1:-help}" in
         exec "$SHELL"
         ;;
     help|*)
-        echo "Usage: $0 {setup|train|train-phase1|train-phase2|eval|generate-field|debug-genesis|debug-mujoco|make-ball-texture|shell}"
-        echo ""
-        echo "Commands:"
-        echo "  setup             - Create venv, install deps, download robot assets, generate field"
-        echo "  train             - Run full training pipeline (Phase 1 + 2)"
-        echo "  train-phase1      - Train single-robot skills only"
-        echo "  train-phase2      - Train multi-robot match (needs Phase 1 checkpoint)"
-        echo ""
-        echo "Training options (pass after the command, e.g. 'train-phase1 --algorithm flashsac'):"
-        echo "  --algorithm ppo|flashsac   Select RL algorithm (default: ppo)"
-        echo "  --vec-num-envs N           Use vectorised Genesis env with N parallel envs"
-        echo "  --no-curriculum            Skip curriculum stages"
-        echo "  --wandb                    Also log to Weights & Biases"
-        echo "  eval              - Evaluate checkpoint in MuJoCo"
-        echo "  generate-field    - Regenerate field models from JSON"
-        echo "  debug-genesis     - Spawn debugger for Genesis (--render --screenshot=PATH)"
-        echo "  debug-mujoco      - Spawn debugger for MuJoCo (--screenshot=PATH)"
-        echo "  make-ball-texture - Re-render the soccer ball texture"
-        echo "  shell             - Open a shell with the venv activated"
+        cat <<EOF
+Usage: $0 <command> [args...]
+
+Setup:
+  setup                     Create venv, install deps, fetch K1 assets, generate field.
+
+Skill-library training (Phase 1 — each skill in its own process):
+  train-skill <name>        Train a single skill: walk | standup | dribble | shoot.
+  train-skills-all          Train every skill sequentially.
+
+Orchestrator (Phase 2 — discrete-skill controller, 4v4 self-play):
+  train-orchestrator        Train the orchestrator over frozen skill checkpoints.
+
+Evaluation & utilities:
+  eval <ckpt>               Evaluate a checkpoint in MuJoCo.
+  generate-field            Regenerate field models from configs/field_hsl_2026.json.
+  debug-genesis             Genesis spawn debugger (--render --screenshot=PATH).
+  debug-mujoco              MuJoCo scene debugger (--screenshot=PATH).
+  make-ball-texture         Re-render the soccer ball texture.
+  shell                     Open a shell inside the project's venv.
+
+Training options (forwarded to train-skill / train-orchestrator):
+  --algorithm ppo|flashsac  Select RL algorithm (skills only; default ppo).
+  --vec-num-envs N          Parallel Genesis env count.
+  --device {auto,cpu,gpu}   Hardware preset. 'auto' detects CUDA.
+  --total-timesteps N       Override default timestep budget.
+  --resume PATH             Resume from checkpoint (full state load).
+  --init-from PATH          PPO-only: warm-start policy weights from another ckpt.
+  --wandb                   Also log to Weights & Biases (TensorBoard always on).
+
+Examples:
+  ./scripts/run.sh train-skill walk --device gpu --vec-num-envs 1024 --wandb
+  ./scripts/run.sh train-skill dribble --init-from checkpoints/skill_walk/skill_walk_step50000000.pt
+  ./scripts/run.sh train-orchestrator --num-envs 256 --wandb
+EOF
         exit 1
         ;;
 esac

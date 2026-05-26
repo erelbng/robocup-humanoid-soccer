@@ -12,9 +12,13 @@ Design notes:
   * W&B is opt-in. If the caller passes `use_wandb=True` but the package
     is missing, we warn and continue with TB only — never crash the run
     over telemetry.
-  * Videos are normalised to (T, H, W, 3) uint8 numpy and passed to both
-    backends in their preferred format (TB needs (T, 3, H, W); W&B takes
-    a file path or ndarray).
+  * Videos are encoded to MP4 ONCE via imageio (+ imageio-ffmpeg) and
+    the same bytes are written to disk, embedded directly into a TB
+    `Summary.Image` proto (TensorBoard's image plugin detects MP4 by
+    magic bytes and renders a playable <video> element), and forwarded
+    to W&B as an mp4 file. We bypass `SummaryWriter.add_video()` because
+    it depends on `moviepy.editor`, which moviepy 2.x removed — falling
+    back to thumbnails on any modern install.
 
 The logger owns the run name + log directory so the trainer doesn't have
 to pass them around to W&B and TB separately.
@@ -40,19 +44,41 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
-def _moviepy_editor_available() -> bool:
-    """TensorBoard's add_video pipeline imports `moviepy.editor`. That
-    module exists in moviepy 1.x but was removed in moviepy 2.x — so on
-    any modern install, add_video silently fails to write any video
-    summary. Detect this at logger init so we can fall back to logging
-    thumbnails instead, and the TensorBoard panel always shows SOMETHING.
+def _video_summary_from_mp4_bytes(tag: str, mp4_bytes: bytes,
+                                   height: int, width: int,
+                                   colorspace: int = 3):
+    """Build a TensorBoard `Summary` proto carrying MP4 video bytes.
+
+    TensorBoard's image plugin (`tensorboard.plugins.image.images_plugin`)
+    inspects the magic bytes of `encoded_image_string` and serves MP4
+    with mimetype `video/mp4`; the frontend then renders a `<video>`
+    element with playback controls.
+
+    Args:
+        tag: summary tag (e.g. "train/rollout").
+        mp4_bytes: bytes of a complete MP4 file (typically produced by
+            imageio + libx264).
+        height, width: frame dimensions — required by the proto, but
+            TensorBoard reads them from the MP4 container so a slight
+            mismatch is harmless.
+        colorspace: nominal channel count, kept for proto completeness.
+
+    Returns:
+        A `tensorboard.compat.proto.summary_pb2.Summary` proto, ready
+        to be passed to `file_writer.add_summary(summary, step)`.
     """
-    try:
-        import importlib
-        importlib.import_module("moviepy.editor")
-        return True
-    except Exception:
-        return False
+    from tensorboard.compat.proto.summary_pb2 import Summary
+    return Summary(value=[
+        Summary.Value(
+            tag=tag,
+            image=Summary.Image(
+                height=int(height),
+                width=int(width),
+                colorspace=int(colorspace),
+                encoded_image_string=mp4_bytes,
+            ),
+        )
+    ])
 
 
 class TrainingLogger:
@@ -96,15 +122,10 @@ class TrainingLogger:
         except ImportError:
             print("[logger] tensorboard not installed; only console logging")
 
-        # Check moviepy.editor availability up front. If unusable, we
-        # skip add_video (which would silently fail) and just log a
-        # thumbnail image — the MP4 still goes to disk regardless.
-        self._can_log_video = _moviepy_editor_available()
-        if self._tb is not None and not self._can_log_video:
-            print("[logger] moviepy.editor unavailable (moviepy 2.x removed it). "
-                  "Videos saved to disk; TB will show thumbnail strips only. "
-                  "Install moviepy 1.x (`pip install moviepy==1.0.3`) to embed "
-                  "playable videos in TB.")
+        # Video logging path: we encode MP4 with imageio (+ libx264
+        # from imageio-ffmpeg) and embed the bytes directly into a TB
+        # Summary.Image proto. No moviepy required. The thumbnail-strip
+        # fallback only fires if ffmpeg encoding itself fails (unusual).
 
         # ── W&B ────────────────────────────────────────────────────
         self._wandb = None
@@ -179,9 +200,10 @@ class TrainingLogger:
         """Log a video clip.
 
         `frames` is anything coercible to a numpy array shaped
-        (T, H, W, 3) — accepts uint8 or float-in-[0,1]. The clip is saved
-        to disk as MP4 (so it's available outside TB/W&B too) and pushed
-        to both backends.
+        (T, H, W, 3) — accepts uint8 or float-in-[0,1]. The clip is
+        MP4-encoded ONCE (libx264) and the same bytes are written to
+        disk, embedded into a TB Summary proto (rendered as a playable
+        <video> by TensorBoard's image plugin), and forwarded to W&B.
         """
         try:
             arr = np.stack([np.asarray(f) for f in frames]) if isinstance(
@@ -196,34 +218,42 @@ class TrainingLogger:
             return
         arr = _to_uint8(arr)
 
-        # Save to disk first
+        # ── Encode MP4 to disk (also gives us bytes for TB summary) ──
         safe = name.replace("/", "_")
         path = self.video_dir / f"{safe}_step{step}.mp4"
+        mp4_bytes: Optional[bytes] = None
         try:
             import imageio.v2 as imageio
             imageio.mimwrite(str(path), arr, fps=fps,
                              codec="libx264", quality=8)
+            with open(path, "rb") as f:
+                mp4_bytes = f.read()
         except Exception as e:
             path = None
-            print(f"[logger] video write failed: {e}")
+            mp4_bytes = None
+            print(f"[logger] video MP4 encode failed: {e}")
 
-        # TensorBoard wants (N, T, C, H, W) for add_video. If moviepy.editor
-        # is missing (moviepy 2.x), add_video silently emits no summary —
-        # fall back to a horizontal thumbnail strip + a sample frame so
-        # the TB panel still shows something useful.
+        # ── TensorBoard ───────────────────────────────────────────
+        # Direct path: drop the MP4 bytes into a Summary.Image proto.
+        # TB's image plugin sniffs MP4 magic bytes and serves the value
+        # as `video/mp4`; the frontend renders a <video> element with
+        # playback controls. Only falls back to the thumbnail strip if
+        # the MP4 encode itself failed.
         if self._tb is not None:
-            if self._can_log_video:
+            if mp4_bytes is not None:
                 try:
-                    t = arr.transpose(0, 3, 1, 2)[None, ...]  # (1, T, 3, H, W)
-                    self._tb.add_video(name, t, global_step=step, fps=fps)
+                    h, w = int(arr.shape[1]), int(arr.shape[2])
+                    summary = _video_summary_from_mp4_bytes(
+                        name, mp4_bytes, h, w)
+                    self._tb._get_file_writer().add_summary(summary, step)
                 except Exception as e:
-                    print(f"[logger] TB add_video failed: {e}; "
+                    print(f"[logger] TB video summary failed: {e}; "
                           f"falling back to thumbnail strip")
                     self._log_video_thumbnails(name, arr, step)
             else:
                 self._log_video_thumbnails(name, arr, step)
 
-        # W&B accepts a path
+        # ── W&B ───────────────────────────────────────────────────
         if (self._wandb is not None and self._wandb_run is not None
                 and path is not None):
             try:

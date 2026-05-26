@@ -80,7 +80,12 @@ def train_ppo_vec(env, policy, config, logger=None,
         env: Vec env with `.num_envs`, `.reset()`, `.step()` returning
              (obs[N,O], rew[N], done[N], info).
         policy: PPOActorCritic instance, or None to build one.
-        config: Phase1Config / Phase2Config.
+        config: a duck-typed config object exposing `obs_dim`, `act_dim`,
+                `learning_rate`, `gamma`, `gae_lambda`, `clip_range`,
+                `entropy_coef`, `vf_coef`, `max_grad_norm`, `n_epochs`,
+                `n_steps`, `total_timesteps`. The per-skill configs
+                (WalkConfig / StandupConfig / DribbleConfig / ShootConfig)
+                and `OrchestratorConfig` all satisfy this contract.
         desired_kl: Target KL per iteration for adaptive LR + early stop.
         use_value_clipping: Apply PPO-style value clipping.
         adaptive_lr: rsl_rl-style LR adjustment based on KL.
