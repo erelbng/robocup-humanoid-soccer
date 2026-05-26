@@ -227,6 +227,7 @@ def train_phase1(config: ProjectConfig, resume_from: str = None,
 
     policy = None
     if config.phase1.use_curriculum:
+        import gc, torch as _torch
         stages = config.phase1.curriculum_stages
         steps_per_stage = config.phase1.total_timesteps // len(stages)
         for stage in stages:
@@ -240,6 +241,12 @@ def train_phase1(config: ProjectConfig, resume_from: str = None,
                 init_actor=policy,
                 device=device, algo_kwargs=algo_kwargs,
             )
+            # Flush GPU memory freed by env.close() inside _train_phase
+            # before the next stage builds a new scene of the same size.
+            gc.collect()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
     else:
         policy = _train_phase(config, _env_factory, config.phase1, logger,
                               "phase1", algorithm, "full",

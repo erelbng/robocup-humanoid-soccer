@@ -474,5 +474,16 @@ class K1DribbleShootVecEnv:
             return None
 
     def close(self):
+        # Drop all references to Genesis-owned GPU objects so the constraint
+        # solver and rigid-body buffers can be freed before the next stage
+        # allocates a fresh scene with the same n_envs budget.
+        self.camera = None
+        self.robot = None
+        self.ball = None
         self.scene = None
         self._initialized = False
+        import gc, torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
