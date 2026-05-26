@@ -26,6 +26,13 @@ class WalkConfig:
     foot_clearance_range: Tuple[float, float] = (0.04, 0.12)  # m
     step_freq_range: Tuple[float, float] = (1.0, 2.5)         # Hz
 
+    # ── head-look command (from the vision system) ───────────────
+    # Direct joint targets for AAHead_yaw / Head_pitch (rad). Ranges
+    # are intentionally narrower than the URDF mechanical limits so
+    # the policy doesn't waste samples on hyperextended postures.
+    head_yaw_range:   Tuple[float, float] = (-0.8, 0.8)   # ~±46°
+    head_pitch_range: Tuple[float, float] = (-0.4, 0.6)   # slight down-bias
+
     # ── PPO hyperparams (consumed by training.algorithms.ppo) ─────
     total_timesteps: int = 100_000_000
     learning_rate: float = 3e-4
@@ -64,6 +71,16 @@ class WalkRewardWeights:
     # gait shaping
     foot_clearance: float = 0.3        # match commanded swing height
     feet_air_time: float = 0.2         # encourage non-zero air time
+
+    # head-look tracking (from the vision system) — small weight so it
+    # doesn't trade off against velocity tracking.
+    head_tracking: float = 0.3
+
+    # arms-at-side regulariser (legged_gym-style): squared deviation
+    # of the 8 arm DOFs from the default rest pose. Small weight so it
+    # only kicks in when the policy is otherwise indifferent about arm
+    # posture — keeps shoulders / elbows tucked instead of flailing.
+    arm_pose: float = 0.05
 
     # regularizers (negative)
     action_smoothness: float = 0.002

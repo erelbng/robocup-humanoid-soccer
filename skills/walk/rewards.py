@@ -21,6 +21,7 @@ from typing import Tuple
 import numpy as np
 
 from skills.common_obs import body_frame_velocity, projected_gravity
+from skills.common_rewards import head_tracking_reward, joint_pose_deviation
 
 
 # ─── primary tracking ──────────────────────────────────────────────────
@@ -140,12 +141,16 @@ def compute_walk_reward(
     *,
     root_pos: np.ndarray, root_quat: np.ndarray,
     root_lin_vel: np.ndarray, root_ang_vel: np.ndarray,
-    jvel: np.ndarray, prev_jvel: np.ndarray,
+    jpos: np.ndarray, jvel: np.ndarray, prev_jvel: np.ndarray,
     action: np.ndarray, prev_action: np.ndarray,
     applied_torque: np.ndarray,
     feet_z: np.ndarray, contact_mask: np.ndarray,
     commands: np.ndarray,  # (N, 5) — vx, vy, vyaw, foot_clearance, step_freq
     weights,               # WalkRewardWeights
+    head_commands: np.ndarray = None,    # (N, 2) target yaw/pitch — optional
+    head_joint_indices: tuple = (),      # K1 → (0, 1) for AAHead_yaw/Head_pitch
+    arm_joint_indices: tuple = (),       # K1 → (2..9) for shoulder/elbow joints
+    default_joint_pos: np.ndarray = None,
     dt: float = 0.02,
 ) -> Tuple[np.ndarray, dict]:
     """Aggregate walk reward.
@@ -174,6 +179,20 @@ def compute_walk_reward(
     fallen = (root_pos[:, 2] < 0.30).astype(np.float32)
     alive = 1.0 - fallen
 
+    # Head-look tracking — optional (only if both head_commands and the
+    # joint indices were supplied). Zero contribution otherwise.
+    head = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if head_commands is not None and head_commands.size > 0 \
+            and len(head_joint_indices) > 0:
+        head = head_tracking_reward(jpos, head_joint_indices, head_commands)
+
+    # Arm-pose deviation — keeps arms near the default rest pose so the
+    # policy doesn't learn to flail. Pure penalty.
+    arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if len(arm_joint_indices) > 0 and default_joint_pos is not None:
+        arm_dev = joint_pose_deviation(jpos, arm_joint_indices,
+                                        default_joint_pos)
+
     w = weights
     r = (
         w.track_lin_vel * lin
@@ -182,11 +201,13 @@ def compute_walk_reward(
         + w.height * h
         + w.foot_clearance * clearance
         + w.alive * alive
+        + getattr(w, "head_tracking", 0.0) * head
         - w.action_smoothness * smooth
         - w.dof_acc * acc
         - w.torque * torq
         - w.base_motion * base
         - w.energy * energy
+        - getattr(w, "arm_pose", 0.0) * arm_dev
         + w.fall * fallen
     ).astype(np.float32)
 
@@ -196,6 +217,8 @@ def compute_walk_reward(
         "upright": float(np.mean(up)),
         "height": float(np.mean(h)),
         "foot_clearance": float(np.mean(clearance)),
+        "head_tracking": float(np.mean(head)),
+        "arm_pose_dev": float(np.mean(arm_dev)),
         "action_smooth": float(np.mean(smooth)),
         "dof_acc": float(np.mean(acc)),
         "torque": float(np.mean(torq)),

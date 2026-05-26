@@ -144,13 +144,34 @@ class SkillEnv(ABC):
         self.commands = np.zeros((self.num_envs, self.command_spec.dim),
                                  dtype=np.float32)
 
+        # Optional head-look command — a parallel channel from the
+        # vision system (orchestrator does not emit this). Subclasses
+        # opt in via _make_head_command_spec(). During single-skill
+        # training we sample uniformly inside the configured range so
+        # the policy learns to track the full command distribution;
+        # at deployment, external code overwrites self.head_commands.
+        self.head_command_spec: Optional[CommandSpec] = (
+            self._make_head_command_spec())
+        head_dim = (self.head_command_spec.dim
+                    if self.head_command_spec is not None else 0)
+        self.head_commands = np.zeros((self.num_envs, head_dim),
+                                       dtype=np.float32)
+
     # ── shape properties ───────────────────────────────────────────────
 
     @property
     def obs_dim(self) -> int:
+        head_dim = (self.head_command_spec.dim
+                    if self.head_command_spec is not None else 0)
         return (SKILL_BASE_OBS_DIM
                 + self.command_spec.dim
-                + self.SKILL_OBS_ADDONS)
+                + self.SKILL_OBS_ADDONS
+                + head_dim)
+
+    @property
+    def head_command_dim(self) -> int:
+        return (self.head_command_spec.dim
+                if self.head_command_spec is not None else 0)
 
     @property
     def act_dim(self) -> int:
@@ -162,6 +183,17 @@ class SkillEnv(ABC):
     def _make_command_spec(self) -> CommandSpec:
         """Return the command vector for this skill (use CommandSpec.empty()
         for no command)."""
+
+    def _make_head_command_spec(self) -> Optional[CommandSpec]:
+        """Override to enable head-look tracking. Default: disabled.
+
+        When enabled, every reset draws fresh head targets from this
+        spec; the policy sees them appended to its obs and is rewarded
+        for matching the actual head joint positions. At deployment,
+        external code (the vision system) overwrites `self.head_commands`
+        directly between env steps.
+        """
+        return None
 
     def _add_scene_extras(self, scene) -> None:
         """Optional: add ball, obstacles, etc. Called once during scene
@@ -323,6 +355,11 @@ class SkillEnv(ABC):
             self.commands[envs_idx] = self.command_spec.sample(
                 len(envs_idx), self.rng)
 
+        if self.head_command_spec is not None \
+                and self.head_command_spec.dim > 0:
+            self.head_commands[envs_idx] = self.head_command_spec.sample(
+                len(envs_idx), self.rng)
+
         self._reset_robot_pose(envs_idx)
         self._reset_skill_state(envs_idx)
 
@@ -386,6 +423,9 @@ class SkillEnv(ABC):
             parts.append(self.commands.astype(np.float32))
         if self.SKILL_OBS_ADDONS > 0:
             parts.append(self._skill_obs_addons())
+        if self.head_command_spec is not None \
+                and self.head_command_spec.dim > 0:
+            parts.append(self.head_commands.astype(np.float32))
         return np.concatenate(parts, axis=1)
 
     # ── rendering / cleanup ────────────────────────────────────────────
@@ -430,11 +470,18 @@ class SkillEnv(ABC):
 class SkillSpec:
     """Lightweight descriptor used by the orchestrator (Phase 2) to know
     the obs/act dims and command spec of each skill without importing
-    the heavy SkillEnv subclass."""
+    the heavy SkillEnv subclass.
+
+    `head_command_dim` is the width of the optional head-look channel
+    appended to the skill's obs (after the main command and any skill
+    addons). It is supplied by the vision system at deployment, not by
+    the orchestrator policy.
+    """
     name: str
     obs_dim: int
     act_dim: int
     command_spec: CommandSpec
+    head_command_dim: int = 0
     checkpoint_path: str = ""
 
 

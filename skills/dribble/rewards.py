@@ -14,6 +14,7 @@ from typing import Tuple
 import numpy as np
 
 from skills.common_obs import body_frame_velocity
+from skills.common_rewards import head_tracking_reward, joint_pose_deviation
 from skills.walk.rewards import (action_smoothness, base_motion_penalty,
                                   dof_acc_penalty, energy_penalty,
                                   foot_clearance_reward, height_reward,
@@ -81,13 +82,17 @@ def compute_dribble_reward(
     *,
     root_pos: np.ndarray, root_quat: np.ndarray,
     root_lin_vel: np.ndarray, root_ang_vel: np.ndarray,
-    jvel: np.ndarray, prev_jvel: np.ndarray,
+    jpos: np.ndarray, jvel: np.ndarray, prev_jvel: np.ndarray,
     action: np.ndarray, prev_action: np.ndarray,
     applied_torque: np.ndarray,
     feet_z: np.ndarray, contact_mask: np.ndarray,
     ball_pos: np.ndarray, ball_vel: np.ndarray,
     commands: np.ndarray,    # (N, 7) — walk(5) + ball_off(2)
     weights,                  # DribbleRewardWeights
+    head_commands: np.ndarray = None,    # (N, 2) optional
+    head_joint_indices: tuple = (),
+    arm_joint_indices: tuple = (),
+    default_joint_pos: np.ndarray = None,
     ball_lost_distance: float = 2.0,
     dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
@@ -125,6 +130,18 @@ def compute_dribble_reward(
     ball_vel_r = ball_velocity_reward(ball_vel_body, cmd_vx, cmd_vy)
     lost = ball_lost_mask(ball_pos_body[:, :2], ball_lost_distance)
 
+    # Head-look tracking — optional.
+    head = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if head_commands is not None and head_commands.size > 0 \
+            and len(head_joint_indices) > 0:
+        head = head_tracking_reward(jpos, head_joint_indices, head_commands)
+
+    # Arm-pose deviation — keeps arms hanging naturally at the sides.
+    arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if len(arm_joint_indices) > 0 and default_joint_pos is not None:
+        arm_dev = joint_pose_deviation(jpos, arm_joint_indices,
+                                        default_joint_pos)
+
     # ── compose ──────────────────────────────────────────────────
     w = weights
     r = (
@@ -134,11 +151,13 @@ def compute_dribble_reward(
         + w.height * h
         + w.foot_clearance * clearance
         + w.alive * alive
+        + getattr(w, "head_tracking", 0.0) * head
         - w.action_smoothness * smooth
         - w.dof_acc * acc
         - w.torque * torq
         - w.base_motion * base
         - w.energy * energy
+        - getattr(w, "arm_pose", 0.0) * arm_dev
         + w.fall * fallen
         + w.ball_offset * ball_off_r
         + w.ball_velocity * ball_vel_r
@@ -152,6 +171,8 @@ def compute_dribble_reward(
         "upright": float(np.mean(up)),
         "height": float(np.mean(h)),
         "foot_clearance": float(np.mean(clearance)),
+        "head_tracking": float(np.mean(head)),
+        "arm_pose_dev": float(np.mean(arm_dev)),
         "action_smooth": float(np.mean(smooth)),
         "dof_acc": float(np.mean(acc)),
         "torque": float(np.mean(torq)),

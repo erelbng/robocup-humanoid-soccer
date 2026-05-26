@@ -47,6 +47,12 @@ class DribbleConfig:
     ball_off_x_range: Tuple[float, float] = (0.30, 0.60)
     ball_off_y_range: Tuple[float, float] = (-0.15, 0.15)
 
+    # ── head-look command (from the vision system) ───────────────
+    # During dribbling, the head will typically look at the ball, so
+    # pitch skews downward.
+    head_yaw_range:   Tuple[float, float] = (-0.8, 0.8)
+    head_pitch_range: Tuple[float, float] = (-0.2, 0.7)   # down-bias for ball
+
     # Episode-termination ball thresholds (relative to robot).
     ball_lost_distance: float = 2.0       # >2m → episode ends (out of control)
 
@@ -98,3 +104,8 @@ class DribbleRewardWeights:
     ball_offset: float = 2.0              # exp-shaped on (ball - target_offset)
     ball_velocity: float = 0.5            # ball moves in commanded direction
     ball_lost: float = -10.0              # ball drifts beyond threshold
+
+    # Head-look tracking from the vision system.
+    head_tracking: float = 0.3
+    # Arms-at-side regulariser (legged_gym-style).
+    arm_pose: float = 0.05

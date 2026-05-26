@@ -198,6 +198,16 @@ class K1MatchEnv:
             (self.num_envs, self.n_agents, ORCHESTRATOR_CMD_DIM),
             dtype=np.float32)
 
+        # Head-look command per agent (head_yaw, head_pitch). External
+        # code (the vision system) overwrites this between steps — the
+        # orchestrator policy does not emit head commands. During
+        # training without a vision system we sample plausible targets
+        # on reset; in production, drop them in here. The field stays
+        # 2-dim regardless of skill: skills that don't use it simply
+        # ignore the slot (head_command_dim=0 on their SkillSpec).
+        self.head_commands = np.zeros(
+            (self.num_envs, self.n_agents, 2), dtype=np.float32)
+
         # Roles (one-hot). Default assignment: per team, agent 0 = GK,
         # agent 1 = DEF, agent 2 = MID, agent 3 = ATK. Configurable.
         # role_onehot shape: (n_agents, 4)
@@ -388,6 +398,16 @@ class K1MatchEnv:
         self.orch_substep[envs_idx] = 0
         self._last_action_per_agent[envs_idx] = self._default_action
 
+        # Sample plausible head commands for the resetting envs. In
+        # production these get overwritten by the vision system per
+        # step. The ranges below are deliberately narrow (the head
+        # tracks the ball / a teammate, not arbitrary directions).
+        n_reset = envs_idx.shape[0]
+        self.head_commands[envs_idx, :, 0] = self.rng.uniform(
+            -0.5, 0.5, size=(n_reset, self.n_agents))    # head_yaw rad
+        self.head_commands[envs_idx, :, 1] = self.rng.uniform(
+            -0.1, 0.6, size=(n_reset, self.n_agents))    # head_pitch rad
+
         for i in envs_idx:
             self.gcs[int(i)].reset(kick_off_team=int(self.rng.integers(0, 2)))
 
@@ -502,11 +522,13 @@ class K1MatchEnv:
         base_flat = base_obs_all.reshape(E * A, P)
         skill_idx_flat = self._latched_skill_idx.reshape(E * A)
         cmd_flat = self._latched_cmd.reshape(E * A, ORCHESTRATOR_CMD_DIM)
+        head_flat = self.head_commands.reshape(E * A, -1)
 
         addon_inputs = self._build_skill_addon_inputs()
         return self.skill_router.route(
             base_obs=base_flat, skill_idx=skill_idx_flat,
-            cmd_vec=cmd_flat, addon_inputs=addon_inputs)
+            cmd_vec=cmd_flat, addon_inputs=addon_inputs,
+            head_commands=head_flat)
 
     def _build_skill_addon_inputs(self) -> dict:
         """Provide live state to each skill's `addon_builder`.
@@ -812,6 +834,32 @@ class K1MatchEnv:
             self._prev_scores[envs_idx] = 0
 
     # ── rendering / cleanup ────────────────────────────────────────
+
+    # ── vision-system side channel ────────────────────────────────
+
+    def set_head_commands(self, head_commands: np.ndarray,
+                          envs_idx: Optional[np.ndarray] = None,
+                          agents_idx: Optional[np.ndarray] = None) -> None:
+        """Write head-look targets from an external source (the vision
+        system). Shape (M, 2) if both index arrays are given; (N, A, 2)
+        if both are None (overwrite everything). The skill router will
+        use these on the next step. Each entry is `(head_yaw, head_pitch)`
+        in radians. Idempotent — call as often as the vision system
+        publishes new targets.
+        """
+        head_commands = np.asarray(head_commands, dtype=np.float32)
+        if envs_idx is None and agents_idx is None:
+            assert head_commands.shape == self.head_commands.shape, (
+                f"expected {self.head_commands.shape}, got "
+                f"{head_commands.shape}")
+            self.head_commands[:] = head_commands
+            return
+        if envs_idx is None:
+            envs_idx = np.arange(self.num_envs)
+        if agents_idx is None:
+            agents_idx = np.arange(self.n_agents)
+        ix = np.ix_(envs_idx, agents_idx)
+        self.head_commands[ix] = head_commands
 
     def render_frame(self):
         if self.camera is None:

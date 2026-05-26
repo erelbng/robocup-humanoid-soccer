@@ -27,6 +27,7 @@ from typing import Tuple
 import numpy as np
 
 from skills.common_obs import body_frame_velocity, projected_gravity
+from skills.common_rewards import head_tracking_reward, joint_pose_deviation
 
 
 def _safe_unit(v: np.ndarray, axis: int = -1, eps: float = 1e-6
@@ -92,12 +93,16 @@ def compute_shoot_reward(
     *,
     root_pos: np.ndarray, root_quat: np.ndarray,
     root_lin_vel: np.ndarray, root_ang_vel: np.ndarray,
-    jvel: np.ndarray, prev_jvel: np.ndarray,
+    jpos: np.ndarray, jvel: np.ndarray, prev_jvel: np.ndarray,
     action: np.ndarray, prev_action: np.ndarray,
     ball_pos: np.ndarray, ball_vel: np.ndarray,
     target_world: np.ndarray,           # (N, 3)
     commands: np.ndarray,                # (N, 3) — aim_angle, power, foot
     weights,                              # ShootRewardWeights
+    head_commands: np.ndarray = None,    # (N, 2) optional
+    head_joint_indices: tuple = (),
+    arm_joint_indices: tuple = (),
+    default_joint_pos: np.ndarray = None,
     kick_speed_threshold: float = 1.5,
     ball_lost_distance: float = 3.0,
     dt: float = 0.02,
@@ -150,6 +155,18 @@ def compute_shoot_reward(
     dist = np.linalg.norm(ball_pos[:, :2] - root_pos[:, :2], axis=1)
     ball_lost = (dist > float(ball_lost_distance))
 
+    # Head-look tracking — optional.
+    head = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if head_commands is not None and head_commands.size > 0 \
+            and len(head_joint_indices) > 0:
+        head = head_tracking_reward(jpos, head_joint_indices, head_commands)
+
+    # Arm-pose deviation — keep arms tucked even during the kick.
+    arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if len(arm_joint_indices) > 0 and default_joint_pos is not None:
+        arm_dev = joint_pose_deviation(jpos, arm_joint_indices,
+                                        default_joint_pos)
+
     # ── compose ────────────────────────────────────────────────
     w = weights
     r = (
@@ -158,9 +175,11 @@ def compute_shoot_reward(
         + w.upright * up
         + w.height * h
         + w.alive * alive
+        + getattr(w, "head_tracking", 0.0) * head
         - w.action_smoothness * smooth
         - w.dof_acc * acc
         - w.base_motion * rp_rate
+        - getattr(w, "arm_pose", 0.0) * arm_dev
         + w.kick_event * pulse_mask
         + w.power_match * power_match_r * pulse_mask
         + w.aim_accuracy * aim_acc_r * pulse_mask
@@ -173,6 +192,8 @@ def compute_shoot_reward(
         "ball_to_target": float(np.mean(btt)),
         "upright": float(np.mean(up)),
         "height": float(np.mean(h)),
+        "head_tracking": float(np.mean(head)),
+        "arm_pose_dev": float(np.mean(arm_dev)),
         "ball_speed": float(np.mean(ball_speed)),
         "aim_err_deg": float(np.mean(np.rad2deg(aim_err))),
         "power_err": float(np.mean(np.abs(pow_err))),

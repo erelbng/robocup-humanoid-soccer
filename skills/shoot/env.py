@@ -74,6 +74,17 @@ class K1ShootEnv(SkillEnv):
             names=("aim_angle", "power", "foot_pref"),
         )
 
+    def _make_head_command_spec(self) -> CommandSpec:
+        c = self.cfg if hasattr(self, "cfg") and self.cfg is not None else ShootConfig()
+        return CommandSpec(
+            dim=2,
+            low=np.array([c.head_yaw_range[0], c.head_pitch_range[0]],
+                         dtype=np.float32),
+            high=np.array([c.head_yaw_range[1], c.head_pitch_range[1]],
+                          dtype=np.float32),
+            names=("head_yaw", "head_pitch"),
+        )
+
     # ── scene extras: ball ────────────────────────────────────────
 
     def _add_scene_extras(self, scene) -> None:
@@ -156,6 +167,7 @@ class K1ShootEnv(SkillEnv):
             root_quat = _to_np(self.robot.get_quat())
             root_lin_vel = _to_np(self.robot.get_vel())
             root_ang_vel = _to_np(self.robot.get_ang())
+            jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
             bpos = _to_np(self.ball.get_pos())
             bvel = _to_np(self.ball.get_vel())
@@ -165,12 +177,16 @@ class K1ShootEnv(SkillEnv):
         reward, kick_now, lost, components = compute_shoot_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
-            jvel=jvel, prev_jvel=self._prev_jvel,
+            jpos=jpos, jvel=jvel, prev_jvel=self._prev_jvel,
             action=action, prev_action=self._last_action,
             ball_pos=bpos, ball_vel=bvel,
             target_world=self._target_world,
             commands=self.commands,
             weights=self.cfg.rewards,
+            head_commands=self.head_commands,
+            head_joint_indices=self.robot_cfg.head_joint_indices,
+            arm_joint_indices=self.robot_cfg.arm_joint_indices,
+            default_joint_pos=self._default_action,
             kick_speed_threshold=self.cfg.kick_speed_threshold,
             ball_lost_distance=self.cfg.ball_lost_distance,
             dt=self.dt,

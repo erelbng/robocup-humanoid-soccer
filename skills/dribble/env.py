@@ -77,6 +77,17 @@ class K1DribbleEnv(SkillEnv):
                    "ball_off_x", "ball_off_y"),
         )
 
+    def _make_head_command_spec(self) -> CommandSpec:
+        c = self.cfg if hasattr(self, "cfg") and self.cfg is not None else DribbleConfig()
+        return CommandSpec(
+            dim=2,
+            low=np.array([c.head_yaw_range[0], c.head_pitch_range[0]],
+                         dtype=np.float32),
+            high=np.array([c.head_yaw_range[1], c.head_pitch_range[1]],
+                          dtype=np.float32),
+            names=("head_yaw", "head_pitch"),
+        )
+
     # ── scene extras: add the ball ────────────────────────────────
 
     def _add_scene_extras(self, scene) -> None:
@@ -170,6 +181,7 @@ class K1DribbleEnv(SkillEnv):
             root_quat = _to_np(self.robot.get_quat())
             root_lin_vel = _to_np(self.robot.get_vel())
             root_ang_vel = _to_np(self.robot.get_ang())
+            jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
             bpos = _to_np(self.ball.get_pos())
             bvel = _to_np(self.ball.get_vel())
@@ -187,13 +199,17 @@ class K1DribbleEnv(SkillEnv):
         reward, lost, components = compute_dribble_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
-            jvel=jvel, prev_jvel=self._prev_jvel,
+            jpos=jpos, jvel=jvel, prev_jvel=self._prev_jvel,
             action=action, prev_action=self._last_action,
             applied_torque=applied_torque,
             feet_z=feet_z, contact_mask=contact,
             ball_pos=bpos, ball_vel=bvel,
             commands=self.commands,
             weights=self.cfg.rewards,
+            head_commands=self.head_commands,
+            head_joint_indices=self.robot_cfg.head_joint_indices,
+            arm_joint_indices=self.robot_cfg.arm_joint_indices,
+            default_joint_pos=self._default_action,
             ball_lost_distance=self.cfg.ball_lost_distance,
             dt=self.dt,
         )

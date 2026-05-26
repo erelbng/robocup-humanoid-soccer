@@ -54,6 +54,13 @@ class ShootConfig:
     power_range: Tuple[float, float] = (1.0, 4.0)        # m/s
     foot_range: Tuple[float, float] = (-1.0, 1.0)
 
+    # ── head-look command (from the vision system) ───────────────
+    # During shooting, the head will look at the ball / target. Pitch
+    # range is biased a bit further down than walk because the ball is
+    # near the feet.
+    head_yaw_range:   Tuple[float, float] = (-0.6, 0.6)
+    head_pitch_range: Tuple[float, float] = (-0.1, 0.8)
+
     # ── kick detection thresholds ─────────────────────────────────
     kick_speed_threshold: float = 1.5    # m/s — ball speed considered "kicked"
     ball_lost_distance: float = 3.0      # >3m → episode end (out of range)
@@ -102,3 +109,8 @@ class ShootRewardWeights:
     aim_accuracy: float = 5.0       # exp-shaped on (ball_dir - target_dir)
     fall: float = -2.0
     ball_lost: float = -5.0
+
+    # Head-look tracking from the vision system.
+    head_tracking: float = 0.3
+    # Arms-at-side regulariser (legged_gym-style).
+    arm_pose: float = 0.05

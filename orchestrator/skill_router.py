@@ -54,13 +54,15 @@ def build_skill_spec(name: str, env_for_dims) -> SkillSpec:
 
     `env_for_dims` should be a single-process construction of the
     skill's env (not initialised — we just need obs_dim/act_dim/
-    command_spec). The env is discarded after metadata extraction.
+    command_spec/head_command_dim). The env is discarded after metadata
+    extraction.
     """
     return SkillSpec(
         name=name,
         obs_dim=int(env_for_dims.obs_dim),
         act_dim=int(env_for_dims.act_dim),
         command_spec=env_for_dims.command_spec,
+        head_command_dim=int(getattr(env_for_dims, "head_command_dim", 0)),
     )
 
 
@@ -117,8 +119,18 @@ class SkillRouter:
               skill_idx: np.ndarray,          # (B,) int64 — chosen skill per agent
               cmd_vec: np.ndarray,            # (B, 7) — orchestrator cmd, masked per skill
               addon_inputs: dict = None,
+              head_commands: np.ndarray = None,  # (B, 2) — vision-system look targets
               ) -> np.ndarray:
         """Return joint targets (B, act_dim) for every agent.
+
+        Per-agent obs is built as:
+            base_obs (78) + sliced cmd_vec + skill addon + head_command
+
+        `head_commands` is optional. When supplied (and the active
+        skill's `head_command_dim > 0`), the leading dims are appended
+        to that agent's obs — same role as the main command vec, but
+        sourced separately because in production these come from the
+        vision system, not the orchestrator policy.
 
         `addon_inputs` is forwarded to each skill's `addon_builder`
         when present; it carries whatever live state the addon builder
@@ -145,11 +157,19 @@ class SkillRouter:
             if sk.addon_builder is not None and sk.name in addon_inputs:
                 addon_k = sk.addon_builder(idx_k, addon_inputs[sk.name])
 
+            # Optional head command (walk / dribble / shoot in K1).
+            head_dim_k = int(sk.spec.head_command_dim)
+            head_k = None
+            if head_dim_k > 0 and head_commands is not None:
+                head_k = head_commands[idx_k, :head_dim_k]
+
             parts = [base_k]
             if cmd_k is not None:
                 parts.append(cmd_k.astype(np.float32))
             if addon_k is not None:
                 parts.append(addon_k.astype(np.float32))
+            if head_k is not None:
+                parts.append(head_k.astype(np.float32))
             obs_k = np.concatenate(parts, axis=1)
 
             assert obs_k.shape[1] == sk.spec.obs_dim, (
