@@ -60,20 +60,40 @@ class K1RobotConfig:
     arm_joint_indices: Tuple[int, ...] = (2, 3, 4, 5, 6, 7, 8, 9)
     head_joint_indices: Tuple[int, ...] = (0, 1)
 
-    # Default standing pose (radians)
+    # Default standing pose (radians). Aligned with the T1 walking
+    # config (`booster_gym/envs/T1.yaml`) — Booster's well-tested biped
+    # rest pose: slight hip/knee/ankle bend (≈ 11/23/14 deg) for a
+    # natural standing posture, not the deep squat the old defaults
+    # encoded. Arms are zero (hanging at the sides) and the head is
+    # neutral.
     default_joint_pos: Tuple[float, ...] = (
-        0.0, 0.0,        # head
-        0.0, 0.0, 0.0, 0.0,  # left arm
-        0.0, 0.0, 0.0, 0.0,  # right arm
-        0.0, 0.0, 0.0,       # left hip
-        -0.4, 0.8, -0.4,     # left knee/ankle (slight bend)
-        0.0, 0.0, 0.0,       # right hip
-        -0.4, 0.8, -0.4,     # right knee/ankle
+        0.0, 0.0,                 # head: yaw, pitch
+        0.0, 0.0, 0.0, 0.0,       # left arm: shoulder pitch/roll, elbow pitch/yaw
+        0.0, 0.0, 0.0, 0.0,       # right arm
+        -0.2, 0.0, 0.0,           # left hip: pitch, roll, yaw
+        0.4, -0.25, 0.0,          # left knee, ankle pitch, ankle roll
+        -0.2, 0.0, 0.0,           # right hip
+        0.4, -0.25, 0.0,          # right knee, ankle pitch, ankle roll
     )
 
-    # PD gains
-    kp: float = 50.0
+    # PD gains. T1 uses much higher gains on hip+knee (200/5) and lower
+    # on ankles (50/1) since ankle joints can't physically push as hard.
+    # We expose per-joint-group gains here; per-joint plumbing happens
+    # in the skill env's _init_genesis() when it calls set_dofs_kp.
+    kp: float = 50.0      # legacy uniform fallback
     kd: float = 5.0
+    # T1-style per-joint-group gains (used when set_dofs_kp accepts an
+    # array indexed by joint).
+    kp_hip:   float = 200.0
+    kp_knee:  float = 200.0
+    kp_ankle: float = 50.0
+    kp_arm:   float = 50.0
+    kp_head:  float = 20.0
+    kd_hip:   float = 5.0
+    kd_knee:  float = 5.0
+    kd_ankle: float = 1.0
+    kd_arm:   float = 2.0
+    kd_head:  float = 1.0
 
 
 # ─── Training Config ─────────────────────────────────────────────────────────

@@ -37,6 +37,9 @@ except ImportError:
     gs = None
 
 from configs.config import K1RobotConfig
+from envs.domain_randomization import (DomainRandConfig, DRSample,
+                                        PushScheduler, add_obs_noise,
+                                        sample_dr)
 from skills.common_obs import (SKILL_BASE_OBS_DIM, compute_common_obs,
                                 read_robot_state)
 
@@ -113,6 +116,8 @@ class SkillEnv(ABC):
         seed: int = 0,
         gait_freq_hz: float = 1.5,
         backend: str = "gpu",
+        dr_cfg: Optional[DomainRandConfig] = None,
+        include_privileged: bool = False,
     ):
         self.num_envs = int(num_envs)
         self.robot_cfg = robot_cfg or K1RobotConfig()
@@ -157,21 +162,38 @@ class SkillEnv(ABC):
         self.head_commands = np.zeros((self.num_envs, head_dim),
                                        dtype=np.float32)
 
+        # ── Domain randomisation + teacher-student plumbing ────────
+        # `dr_cfg.enabled=True` (default) → motor / friction / mass /
+        # push perturbations active. `include_privileged=True` → the
+        # teacher policy sees the sampled DR values appended to its
+        # obs (8 dims). The student is built with the same env but
+        # `include_privileged=False`; its policy receives only proprio.
+        self.dr_cfg = dr_cfg if dr_cfg is not None else DomainRandConfig()
+        self.include_privileged = bool(include_privileged)
+        self._dr_sample: Optional[DRSample] = None  # set at scene build
+        self._push_scheduler: Optional[PushScheduler] = None
+
     # ── shape properties ───────────────────────────────────────────────
 
     @property
     def obs_dim(self) -> int:
         head_dim = (self.head_command_spec.dim
                     if self.head_command_spec is not None else 0)
+        priv_dim = DRSample.PRIVILEGED_DIM if self.include_privileged else 0
         return (SKILL_BASE_OBS_DIM
                 + self.command_spec.dim
                 + self.SKILL_OBS_ADDONS
-                + head_dim)
+                + head_dim
+                + priv_dim)
 
     @property
     def head_command_dim(self) -> int:
         return (self.head_command_spec.dim
                 if self.head_command_spec is not None else 0)
+
+    @property
+    def privileged_dim(self) -> int:
+        return DRSample.PRIVILEGED_DIM if self.include_privileged else 0
 
     @property
     def act_dim(self) -> int:
@@ -213,6 +235,43 @@ class SkillEnv(ABC):
 
         Components are batch-averaged scalars used for logging.
         """
+
+    def _apply_base_wrench(self, force: np.ndarray,
+                            torque: np.ndarray) -> None:
+        """Best-effort external-force application to the robot base.
+
+        Genesis exposes external wrenches under a few different names
+        depending on build (`apply_external_force`, `add_link_force`,
+        `set_links_external_force`). We try them in order and skip on
+        AttributeError. Note that on Genesis builds where none match,
+        push DR effectively becomes a no-op — kp/kd/friction/mass DR
+        still apply.
+        """
+        # Genesis link index for the base — robot.base_link if exposed,
+        # otherwise link 0 (the trunk for K1).
+        link = None
+        for attr in ("base_link", "trunk", "root_link"):
+            link = getattr(self.robot, attr, None)
+            if link is not None:
+                break
+        link_idx = 0   # fall back to link 0
+        for method_name in ("apply_links_external_force",
+                            "set_links_external_force",
+                            "apply_external_force"):
+            method = getattr(self.robot, method_name, None)
+            if method is None:
+                continue
+            try:
+                method(force, torque, links_idx_local=[link_idx])
+                return
+            except TypeError:
+                try:
+                    method(force, torque, [link_idx])
+                    return
+                except Exception:
+                    continue
+            except Exception:
+                continue
 
     def _check_skill_done(self) -> np.ndarray:
         """Default termination: timeout + trunk fell below FALL_TERMINATE_Z."""
@@ -308,17 +367,78 @@ class SkillEnv(ABC):
                          center_envs_at_origin=False)
         self._setup_joint_mapping()
 
-        # PD gains
-        n = len(self.dof_indices)
+        # ── domain randomisation sampling ─────────────────────────
+        # Sampled once per scene build. Teacher policies observe these
+        # values directly via `privileged_obs`; the student gets noise-
+        # only obs and has to learn invariance to them.
+        self._dr_sample = sample_dr(self.dr_cfg, self.num_envs, self.rng)
+        self._push_scheduler = PushScheduler(self.dr_cfg, self.num_envs,
+                                              control_dt=self.dt,
+                                              rng=self.rng)
+
+        # ── per-joint PD gains (T1-style: stiff legs, soft ankles) ──
+        # K1RobotConfig exposes kp_{hip,knee,ankle,arm,head} etc. We
+        # build per-joint arrays of length n_dofs from joint names,
+        # then apply per-env DR scaling. Genesis accepts per-env per-
+        # joint gains as (n_envs, n_dofs) arrays where available;
+        # we fall back to scalar set_dofs_kp if per-env API isn't
+        # exposed.
+        kp_arr, kd_arr = self._build_per_joint_gains()
+        self._kp_base = kp_arr.copy()
+        self._kd_base = kd_arr.copy()
+        # Per-env scaled values used at runtime.
+        kp_per_env = kp_arr[None, :] * \
+            self._dr_sample.kp_scale[:, None]            # (N, n_dof)
+        kd_per_env = kd_arr[None, :] * \
+            self._dr_sample.kd_scale[:, None]            # (N, n_dof)
         try:
-            self.robot.set_dofs_kp([float(self.robot_cfg.kp)] * n,
-                                   self.dof_indices)
-            self.robot.set_dofs_kv([float(self.robot_cfg.kd)] * n,
-                                   self.dof_indices)
+            # Preferred: per-env per-joint gains.
+            self.robot.set_dofs_kp(kp_per_env, self.dof_indices)
+            self.robot.set_dofs_kv(kd_per_env, self.dof_indices)
         except Exception:
-            pass
+            # Fall back to scalar mean across envs (DR effectively off
+            # for kp/kd on Genesis builds that don't accept per-env
+            # arrays). Mean-scaled values still apply.
+            try:
+                self.robot.set_dofs_kp(kp_arr.tolist(), self.dof_indices)
+                self.robot.set_dofs_kv(kd_arr.tolist(), self.dof_indices)
+            except Exception:
+                pass
 
         self._initialized = True
+
+    def _build_per_joint_gains(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Map each joint name onto the appropriate (kp, kd) bucket
+        from `K1RobotConfig`. Returns (kp, kd) numpy arrays sized
+        len(dof_indices) — same order as `robot_cfg.joint_names`.
+
+        Falls back to the uniform `robot_cfg.kp` / `kd` if a per-group
+        attribute isn't present (e.g. when running with a stripped-
+        down robot config).
+        """
+        n = len(self.dof_indices)
+        kp = np.full(n, float(self.robot_cfg.kp), dtype=np.float32)
+        kd = np.full(n, float(self.robot_cfg.kd), dtype=np.float32)
+        for i, name in enumerate(self.robot_cfg.joint_names):
+            if i >= n:
+                break
+            lower = name.lower()
+            if "head" in lower:
+                kp[i] = getattr(self.robot_cfg, "kp_head", self.robot_cfg.kp)
+                kd[i] = getattr(self.robot_cfg, "kd_head", self.robot_cfg.kd)
+            elif "shoulder" in lower or "elbow" in lower or "arm" in lower:
+                kp[i] = getattr(self.robot_cfg, "kp_arm", self.robot_cfg.kp)
+                kd[i] = getattr(self.robot_cfg, "kd_arm", self.robot_cfg.kd)
+            elif "knee" in lower:
+                kp[i] = getattr(self.robot_cfg, "kp_knee", self.robot_cfg.kp)
+                kd[i] = getattr(self.robot_cfg, "kd_knee", self.robot_cfg.kd)
+            elif "ankle" in lower:
+                kp[i] = getattr(self.robot_cfg, "kp_ankle", self.robot_cfg.kp)
+                kd[i] = getattr(self.robot_cfg, "kd_ankle", self.robot_cfg.kd)
+            elif "hip" in lower:
+                kp[i] = getattr(self.robot_cfg, "kp_hip", self.robot_cfg.kp)
+                kd[i] = getattr(self.robot_cfg, "kd_hip", self.robot_cfg.kd)
+        return kp, kd
 
     def _setup_joint_mapping(self) -> None:
         self.dof_indices = []
@@ -377,6 +497,17 @@ class SkillEnv(ABC):
         except Exception:
             pass
 
+        # Random base perturbations (push DR). Best-effort: applies
+        # external force/torque to the robot's base link via Genesis'
+        # external-wrench API where available. Different Genesis builds
+        # name this differently, so we try a few common signatures and
+        # silently skip if none match — the perturbation just becomes
+        # a no-op rather than a crash.
+        if self._push_scheduler is not None:
+            force, torque = self._push_scheduler.step()
+            if np.any(force) or np.any(torque):
+                self._apply_base_wrench(force, torque)
+
         for _ in range(self.action_repeat):
             self.scene.step()
 
@@ -408,6 +539,21 @@ class SkillEnv(ABC):
         except Exception:
             return np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
 
+        # Apply Gaussian obs noise to raw sensor channels (DR). The
+        # student needs to learn that the proprio readings are noisy
+        # in real life. Teacher also sees noisy obs — its advantage
+        # comes from the privileged channel, not from clean obs.
+        if self.dr_cfg.enabled:
+            noised = add_obs_noise(
+                root_quat=root_quat, lin_vel=root_lin_vel,
+                ang_vel=root_ang_vel, dof_pos=jpos, dof_vel=jvel,
+                cfg=self.dr_cfg, rng=self.rng)
+            root_quat = noised["root_quat"]
+            root_lin_vel = noised["lin_vel"]
+            root_ang_vel = noised["ang_vel"]
+            jpos = noised["dof_pos"]
+            jvel = noised["dof_vel"]
+
         base = compute_common_obs(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
@@ -426,7 +572,28 @@ class SkillEnv(ABC):
         if self.head_command_spec is not None \
                 and self.head_command_spec.dim > 0:
             parts.append(self.head_commands.astype(np.float32))
+        if self.include_privileged:
+            parts.append(self.privileged_obs())
         return np.concatenate(parts, axis=1)
+
+    # ── privileged obs (teacher only) ─────────────────────────────────
+
+    def privileged_obs(self) -> np.ndarray:
+        """8-dim per-env privileged signal: the actual DR sample.
+
+        Layout: [friction, kp_scale, kd_scale, joint_friction,
+        base_mass_scale, com_offset_xyz]. See
+        `envs.domain_randomization.DRSample`.
+
+        For training a teacher, the env is constructed with
+        `include_privileged=True` and this gets appended to the obs.
+        For deploying the student (sim-to-real), the env is built with
+        `include_privileged=False` and this method is unused.
+        """
+        if self._dr_sample is None:
+            return np.zeros((self.num_envs, DRSample.PRIVILEGED_DIM),
+                             dtype=np.float32)
+        return self._dr_sample.as_privileged_obs()
 
     # ── rendering / cleanup ────────────────────────────────────────────
 

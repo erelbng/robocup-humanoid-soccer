@@ -166,9 +166,36 @@ Both PPO and FlashSAC are wired through `training/train_skill.py` (FlashSAC = of
 
 ## Domain Randomization
 
-Designed-in but currently minimal post-refactor — `WalkConfig` and friends keep DR fields, but the old `envs/domain_randomization.py` motor randomiser was deleted with the monolith. Reintroduce per-skill as needed:
-- Friction range, robot mass, actuator gains, ball restitution.
-- IMU noise injection.
+Active. Lives in `envs/domain_randomization.py`. Ranges aligned with Booster's T1 walking config (`booster_gym/envs/T1.yaml`) — closest published reference for a similar biped. Sampled at scene-build:
+- **Ground friction** 0.5–1.5
+- **Motor gain scaling** kp_scale, kd_scale each ∈ [0.95, 1.05]
+- **Joint friction** additive ∈ [0, 0.4] N·m/(rad/s)
+- **Base / link mass scaling** [0.8, 1.2] / [0.98, 1.02]
+- **COM offset** ±0.02 m on the trunk
+
+Per-step:
+- **Random base pushes** every ~5 s, magnitude up to 12 N / 3 N·m, held for 5 control steps. Applied via Genesis' external-wrench API; falls back silently if the build doesn't expose it.
+
+Observation noise (Gaussian σ): root_quat 0.01, lin_vel 0.05, ang_vel 0.10, dof_pos 0.01, dof_vel 0.10 — applied to raw sensor readings before the common obs builder runs, so the projected_gravity / body-frame velocity downstream are computed from noisy inputs (closer to the real sensor model).
+
+## Teacher-Student (sim-to-real)
+
+Two-stage training pipeline for sim-to-real. Implemented via the `--mode` flag on `train_skill.py`:
+
+```bash
+# Stage 1: train an oracle teacher with PRIVILEGED obs (DR sample appended).
+./scripts/run.sh train-skill walk --mode teacher --device gpu --wandb
+
+# Stage 2: distill into a student that uses PROPRIO obs only (real-robot deployable).
+./scripts/run.sh train-skill walk --mode student \
+    --teacher-ckpt checkpoints/skill_walk/skill_walk_step100000000.pt
+```
+
+**Teacher.** Identical PPO loop as `--mode single`, but `include_privileged=True` appends 8 DR dims to the observation: `[ground_friction, kp_scale, kd_scale, joint_friction, base_mass_scale, com_offset_xyz]`. Teacher learns optimal control given oracle knowledge of the dynamics.
+
+**Student.** Same actor-critic architecture but narrower input (no privileged dims). Trained via DAgger-lite behaviour cloning (`training/algorithms/distillation.py`): MSE between student action and teacher's deterministic action, mixed-policy rollouts with a linear β schedule from 1.0 (teacher only) → 0.0 (student only). The student sees the same noisy proprio + the same DR-perturbed dynamics — what matters for sim-to-real is that it learns invariance to the DR axis, not that it has a clean signal.
+
+**Per-joint PD gains.** T1-style: `kp_hip=kp_knee=200`, `kp_ankle=50`, `kp_arm=50`, `kp_head=20`, with matching `kd`. Per-env scaling by the DR sample is applied at scene build. The legged_gym wisdom is that ankles need lower gains (less mechanical authority) and a stiff hip/knee keeps the base stable.
 
 ## W&B Logging
 

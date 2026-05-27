@@ -42,40 +42,44 @@ from training.common import (create_policy, default_run_name, load_checkpoint,
 # ─── skill registry ────────────────────────────────────────────────────
 
 
-def _build_walk(num_envs):
+def _build_walk(num_envs, include_privileged=False):
     from skills.walk.env import K1WalkEnv
     from skills.walk.config import WalkConfig
     cfg = WalkConfig()
     if num_envs is not None:
         cfg.num_envs = num_envs
-    return K1WalkEnv(cfg=cfg), cfg
+    env = K1WalkEnv(cfg=cfg, include_privileged=include_privileged)
+    return env, cfg
 
 
-def _build_standup(num_envs):
+def _build_standup(num_envs, include_privileged=False):
     from skills.standup.env import K1StandupEnv
     from skills.standup.config import StandupConfig
     cfg = StandupConfig()
     if num_envs is not None:
         cfg.num_envs = num_envs
-    return K1StandupEnv(cfg=cfg), cfg
+    env = K1StandupEnv(cfg=cfg, include_privileged=include_privileged)
+    return env, cfg
 
 
-def _build_dribble(num_envs):
+def _build_dribble(num_envs, include_privileged=False):
     from skills.dribble.env import K1DribbleEnv
     from skills.dribble.config import DribbleConfig
     cfg = DribbleConfig()
     if num_envs is not None:
         cfg.num_envs = num_envs
-    return K1DribbleEnv(cfg=cfg), cfg
+    env = K1DribbleEnv(cfg=cfg, include_privileged=include_privileged)
+    return env, cfg
 
 
-def _build_shoot(num_envs):
+def _build_shoot(num_envs, include_privileged=False):
     from skills.shoot.env import K1ShootEnv
     from skills.shoot.config import ShootConfig
     cfg = ShootConfig()
     if num_envs is not None:
         cfg.num_envs = num_envs
-    return K1ShootEnv(cfg=cfg), cfg
+    env = K1ShootEnv(cfg=cfg, include_privileged=include_privileged)
+    return env, cfg
 
 
 # Maps `--skill <name>` to a builder returning (env, cfg). cfg must
@@ -162,6 +166,18 @@ def main():
     parser.add_argument("--algorithm", choices=["ppo", "flashsac", "sac"],
                         default="ppo",
                         help="RL algorithm. 'sac' is an alias for 'flashsac'.")
+    parser.add_argument(
+        "--mode", choices=["single", "teacher", "student"], default="single",
+        help="Training mode. 'single' = legacy proprio-only PPO/FlashSAC. "
+             "'teacher' = PPO with privileged DR obs appended to inputs "
+             "(used as the oracle for student distillation). "
+             "'student' = behaviour-clone a frozen teacher checkpoint "
+             "using proprio-only obs (sim-to-real path).")
+    parser.add_argument(
+        "--teacher-ckpt", type=str, default=None,
+        help="Required for --mode student: path to a teacher checkpoint "
+             "(produced by `--mode teacher`). The student inherits the "
+             "same actor architecture but with proprio-only input width.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint (full state load).")
     parser.add_argument("--init-from", type=str, default=None,
@@ -195,8 +211,12 @@ def main():
     if num_envs is None:
         num_envs = preset["vec_num_envs"]
 
+    # Teacher needs privileged obs appended to its input; student does
+    # not (it must be deployable on the real robot, which has no oracle
+    # access to friction / mass / motor scales).
+    include_privileged = (args.mode in ("teacher", "student"))
     builder = _SKILL_REGISTRY[args.skill]
-    env, cfg = builder(num_envs)
+    env, cfg = builder(num_envs, include_privileged=include_privileged)
 
     if args.total_timesteps is not None:
         cfg.total_timesteps = int(args.total_timesteps)
@@ -236,18 +256,46 @@ def main():
     # buffer / batch size for FlashSAC, none for PPO).
     algo_kwargs = dict(preset.get(algorithm, {}))
 
-    print(f"\n[train_skill] {args.skill} via {algorithm}  "
+    print(f"\n[train_skill] {args.skill} via {algorithm}  mode={args.mode}  "
           f"num_envs={num_envs}  obs_dim={env.obs_dim}  "
           f"act_dim={env.act_dim}  cmd={env.command_spec.dim}d  "
+          f"privileged_dim={env.privileged_dim}  "
           f"device={device}  algo_kwargs={algo_kwargs or '{}'}\n")
 
     try:
-        _train_with_algorithm(
-            algorithm=algorithm, env=env, cfg=cfg, logger=logger,
-            device=device, checkpoint_dir=ckpt_dir,
-            resume=args.resume, init_from=args.init_from,
-            algo_kwargs=algo_kwargs,
-        )
+        if args.mode == "student":
+            # Behaviour-clone a frozen teacher into a proprio-only
+            # student. The env is built with include_privileged=True
+            # so the same env produces both flavours (proprio is the
+            # leading slice; privileged is the trailing 8 dims).
+            if not args.teacher_ckpt:
+                raise SystemExit(
+                    "--mode student requires --teacher-ckpt PATH "
+                    "(checkpoint from a prior `--mode teacher` run).")
+            import torch
+            from training.algorithms.distillation import train_student
+            student_obs_dim = env.obs_dim - env.privileged_dim
+            teacher = create_policy(env.obs_dim, env.act_dim).to(device)
+            load_checkpoint(args.teacher_ckpt, teacher)
+            train_student(
+                env_teacher=env, teacher_policy=teacher,
+                student_obs_dim=student_obs_dim, act_dim=env.act_dim,
+                total_env_steps=int(cfg.total_timesteps),
+                n_steps=int(cfg.n_steps),
+                learning_rate=float(cfg.learning_rate),
+                logger=logger, skill=args.skill,
+                checkpoint_dir=ckpt_dir, device=device,
+            )
+        else:
+            # 'single' (legacy) and 'teacher' both use the standard PPO
+            # path — the only difference is whether privileged obs are
+            # appended (controlled by include_privileged on env build).
+            _train_with_algorithm(
+                algorithm=algorithm, env=env, cfg=cfg, logger=logger,
+                device=device, checkpoint_dir=ckpt_dir,
+                resume=args.resume, init_from=args.init_from,
+                algo_kwargs=algo_kwargs,
+            )
     finally:
         env.close()
         logger.close()
