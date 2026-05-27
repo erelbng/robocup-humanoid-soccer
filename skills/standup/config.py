@@ -14,17 +14,20 @@ class StandupRewardWeights:
     vanish at the standing equilibrium, so the optimum stays at 'upright
     + still' and isn't pulled away by any one term.
     """
-    # Primary shaping (positive, exp/clipped to [0, 1])
-    upright: float = 3.0               # cos(trunk-z, world-z), clamped [0, 1]
-    height: float = 2.0                # gaussian around target_height
+    # Primary shaping — positive everywhere in [0, 1], smooth monotonic
+    # gradient from upside-down → sideways → upright.
+    upright: float = 3.0               # (cos(trunk-z, world-z) + 1) / 2
+    height: float = 2.0                # gaussian around target_height (σ=0.3)
 
-    # Stability penalties (vanish at equilibrium)
-    gravity_horizontal: float = 0.5    # gx² + gy² — symmetric tilt
+    # Stability penalties — ALL phase-gated by `near_upright_gate`, so
+    # they vanish during deep recovery (the policy needs full motion
+    # freedom to actually stand up) and ramp in only as we approach the
+    # standing pose. They vanish again at the equilibrium itself.
     base_ang_vel_sway: float = 0.05    # ωx² + ωy² — roll/pitch rate
-    base_lin_vel_drift: float = 0.5    # ||v||², phase-gated near upright
-    joint_vel_quiet: float = 0.001     # Σ q̇², phase-gated near upright
+    base_lin_vel_drift: float = 0.5    # ||v||² — trunk linear drift
+    joint_vel_quiet: float = 0.001     # Σ q̇² — joint kinetic activity
     action_smoothness: float = 0.1     # (a - a_{-1})² — first derivative
-    action_jerk: float = 0.1           # (a - 2 a_{-1} + a_{-2})² — second der.
+    action_jerk: float = 0.1           # (a - 2 a_{-1} + a_{-2})² — jitter
 
     # Speed signal — exactly one dense term + one terminal pulse.
     # The bonus is steep: τ=40 steps (0.8 s) means a 0.5 s stand pays

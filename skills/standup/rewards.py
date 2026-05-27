@@ -33,17 +33,13 @@ def upright_signal(quat: np.ndarray) -> np.ndarray:
 
 
 def height_signal(root_z: np.ndarray, target: float = 0.55,
-                  sigma: float = 0.15) -> np.ndarray:
+                  sigma: float = 0.3) -> np.ndarray:
+    """Gaussian on trunk height. σ=0.3 keeps the gradient meaningful
+    even from a fallen pose (z≈0.15 still gives ~0.17 of signal); the
+    previous σ=0.15 was numerically flat for any z below ~0.4 — the
+    policy got no height gradient until it was already half-up."""
     err = root_z - target
     return np.exp(-(err ** 2) / (sigma ** 2)).astype(np.float32)
-
-
-def gravity_horizontal_penalty(quat: np.ndarray) -> np.ndarray:
-    """gx² + gy² — symmetric tilt-from-vertical measure independent of
-    yaw. Zero at upright, grows quadratically with tilt. Cleaner than
-    the upright signal near small tilts (no asymmetry from the clamp)."""
-    g = projected_gravity(quat)
-    return (g[:, 0] ** 2 + g[:, 1] ** 2).astype(np.float32)
 
 
 # ─── stability penalties ──────────────────────────────────────────────
@@ -140,19 +136,26 @@ def compute_standup_reward(
     up = upright_signal(root_quat)
     h = height_signal(root_pos[:, 2], target=target_height)
 
-    # Positive shaping (bounded [0, 1])
-    up_pos = np.clip(up, 0.0, 1.0)
-    grav_h_pen = gravity_horizontal_penalty(root_quat)
+    # Smooth orientation reward in [0, 1] EVERYWHERE — un-clipped so the
+    # policy gets a monotonic gradient from upside-down → sideways →
+    # upright. The previous `clip(up, 0, 1)` made the reward flat for
+    # any pose worse than horizontal and produced a "stay still" local
+    # optimum the policy couldn't escape.
+    up_pos = ((up + 1.0) * 0.5).astype(np.float32)
 
-    # Phase gate — most drift/quietness penalties only meaningful near upright.
+    # Phase gate — ALL motion penalties are gated on near-upright. During
+    # deep recovery the policy MUST be free to make big motions to stand
+    # up; once near upright, jitter/sway becomes meaningful and the gate
+    # opens. (gravity_horizontal was dropped — it rewarded upside-down
+    # over sideways since g_x² + g_y² is 0 at both upright AND inverted.)
     gate = near_upright_gate(up)
 
-    ang_sway = base_ang_vel_sway(root_ang_vel)
+    ang_sway = base_ang_vel_sway(root_ang_vel) * gate
     lin_drift = base_lin_vel_drift(root_lin_vel) * gate
     q_quiet = joint_vel_quiet(joint_vel) * gate
 
-    smooth = action_smoothness(action, prev_action)
-    jerk = action_jerk(action, prev_action, prev_prev_action)
+    smooth = action_smoothness(action, prev_action) * gate
+    jerk = action_jerk(action, prev_action, prev_prev_action) * gate
 
     # Per-frame "looks standing" — env will count consecutive frames.
     frame_success = success_frame_mask(
@@ -183,7 +186,6 @@ def compute_standup_reward(
     r = (
         w.upright * up_pos
         + w.height * h
-        - w.gravity_horizontal * grav_h_pen
         - w.base_ang_vel_sway * ang_sway
         - w.base_lin_vel_drift * lin_drift
         - w.joint_vel_quiet * q_quiet
@@ -198,7 +200,6 @@ def compute_standup_reward(
         "upright": float(np.mean(up_pos)),
         "upright_raw": float(np.mean(up)),
         "height": float(np.mean(h)),
-        "grav_horizontal": float(np.mean(grav_h_pen)),
         "ang_vel_sway": float(np.mean(ang_sway)),
         "lin_vel_drift": float(np.mean(lin_drift)),
         "joint_vel_quiet": float(np.mean(q_quiet)),
