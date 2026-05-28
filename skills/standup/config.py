@@ -25,13 +25,13 @@ class StandupRewardWeights:
     upright_progress: float = 5.0      # weight on max(0, up_t - up_{t-1})
 
     # Arm-pose deviation penalty — drives the final standing pose to
-    # arms-hanging-at-the-sides (the K1 default rest pose: all 8 arm
-    # joints at 0). The policy otherwise tends to converge on a T-pose
-    # (shoulders rolled out) because it maximises moment of inertia and
-    # is locally stable. Phase-gated on a WIDER band [0.3, 0.7] than the
-    # motion gate, so it ramps in during the upright transition and the
-    # policy has time to tuck arms back. Deep recovery (up<0.3) is free.
-    arm_pose_dev: float = 0.5          # Σ (q_arm - q_arm_rest)² × arm_gate
+    # arms-hanging-at-the-sides (the corrected K1 default with shoulder
+    # rolls at ±π/2). Phase-gated on a [0.5, 0.85] band so arms are
+    # completely free during the entire recovery (up < 0.5) and the
+    # penalty only ramps in as the robot approaches its final pose.
+    # Many standup motions need arm push-off through up≈0.3–0.5, so the
+    # gate has to stay open through that range.
+    arm_pose_dev: float = 0.2          # Σ (q_arm - q_arm_rest)² × arm_gate
 
     # Stability penalties — ALL phase-gated by `near_upright_gate`, so
     # they vanish during deep recovery (the policy needs full motion

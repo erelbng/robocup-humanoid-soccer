@@ -16,9 +16,14 @@ training pipeline end-to-end, including sim2real distillation.
     --total-timesteps 100_000_000 --wandb
 
 # 2. Distill into a proprio-only student that IS deployable.
+#    The teacher checkpoint step won't land exactly on a round number —
+#    PPO saves at multiples of save_interval, so the final file is
+#    something like step99876864.pt. Use $(ls -t … | head -1) to pick
+#    the most recent one automatically.
+TEACHER=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
 ./scripts/run.sh train-skill standup \
     --algorithm ppo --mode student \
-    --teacher-ckpt checkpoints/skill_standup/skill_standup_step100000000.pt \
+    --teacher-ckpt "$TEACHER" \
     --device gpu --vec-num-envs 2048 \
     --total-timesteps 20_000_000 --wandb
 ```
@@ -60,7 +65,7 @@ distillation pipeline reads to size the student.
 | `upright` | 3.0 | `(cos(tilt)+1)/2` — smooth in [0, 1] everywhere, monotonic from upside-down to upright |
 | `height` | 2.0 | Gaussian on trunk z, σ=0.3 (gradient is non-flat from z=0.15 upward) |
 | `upright_progress` | 5.0 | `max(0, Δup)` — pays for active uprightening, not for being-in-state. Kills the side-plank attractor |
-| `arm_pose_dev` | 0.5 | `Σ(q_arm − rest)²` × `arm_gate(up; 0.3 → 0.7)` — pushes the final standing pose to arms-at-the-sides instead of the T-pose the policy otherwise discovers for balance. Recovery is free (gate=0 below up=0.3); penalty ramps in during the transition so the policy has time to tuck arms back. |
+| `arm_pose_dev` | 0.2 | `Σ(q_arm − rest)²` × `arm_gate(up; 0.5 → 0.85)` — pushes the final standing pose to arms-at-the-sides instead of T-pose. Recovery (up < 0.5) is completely free, so the policy can still use arms to push off the floor; penalty ramps in as the robot approaches upright and saturates by up=0.85. |
 | `base_ang_vel_sway` | 0.05 | ωx² + ωy², gated |
 | `base_lin_vel_drift` | 0.5 | ‖v‖², gated |
 | `joint_vel_quiet` | 0.001 | Σ q̇², gated |
@@ -108,9 +113,10 @@ IMU — exactly the sim2real recipe used by RMA, DreamWaQ, and the
 Concurrent Teacher-Student family.
 
 ```bash
+TEACHER=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
 ./scripts/run.sh train-skill standup \
     --algorithm ppo --mode student \
-    --teacher-ckpt checkpoints/skill_standup/skill_standup_step100000000.pt \
+    --teacher-ckpt "$TEACHER" \
     --device gpu --vec-num-envs 2048 \
     --total-timesteps 20_000_000 --wandb
 ```

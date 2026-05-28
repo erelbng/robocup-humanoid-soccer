@@ -175,13 +175,13 @@ def compute_standup_reward(
     progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
 
     # Arm-pose deviation — drives the final standing pose to "arms
-    # hanging at the sides" rather than the T-pose / arms-out balance
-    # tricks the policy otherwise discovers. Phase-gated on a WIDER
-    # band [0.3, 0.7] than the motion gate so it ramps in earlier,
-    # giving the policy time to tuck arms back DURING the transition
-    # to upright instead of only after it's already standing. During
-    # deep recovery (up < 0.3) arm use is fully free.
-    arm_gate = near_upright_gate(up, lo=0.3, hi=0.7)
+    # hanging at the sides" (the corrected K1 default with shoulder
+    # rolls at ±π/2). Phase-gated on [0.5, 0.85] so arms stay free
+    # through the entire recovery (up<0.5) and the penalty only ramps
+    # in as the robot approaches its final pose. Many standup motions
+    # need arm push-off through up≈0.3–0.5; the gate must stay open
+    # there.
+    arm_gate = near_upright_gate(up, lo=0.5, hi=0.85)
     arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
     if len(arm_joint_indices) > 0 and default_joint_pos is not None:
         arm_dev = joint_pose_deviation(joint_pos, arm_joint_indices,
