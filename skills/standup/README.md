@@ -60,7 +60,7 @@ distillation pipeline reads to size the student.
 | `upright` | 3.0 | `(cos(tilt)+1)/2` — smooth in [0, 1] everywhere, monotonic from upside-down to upright |
 | `height` | 2.0 | Gaussian on trunk z, σ=0.3 (gradient is non-flat from z=0.15 upward) |
 | `upright_progress` | 5.0 | `max(0, Δup)` — pays for active uprightening, not for being-in-state. Kills the side-plank attractor |
-| `arm_pose_dev` | 0.05 | `Σ(q_arm − rest)²` — light arm use is essentially free, sustained flailing accrues cost |
+| `arm_pose_dev` | 0.5 | `Σ(q_arm − rest)²` × `arm_gate(up; 0.3 → 0.7)` — pushes the final standing pose to arms-at-the-sides instead of the T-pose the policy otherwise discovers for balance. Recovery is free (gate=0 below up=0.3); penalty ramps in during the transition so the policy has time to tuck arms back. |
 | `base_ang_vel_sway` | 0.05 | ωx² + ωy², gated |
 | `base_lin_vel_drift` | 0.5 | ‖v‖², gated |
 | `joint_vel_quiet` | 0.001 | Σ q̇², gated |
@@ -195,7 +195,7 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 ### Things you might reasonably tune
 - `upright_progress` (default 5.0) — bump higher (8–10) if the policy is still getting stuck in side-plank-like local minima.
-- `arm_pose_dev` (default 0.05) — bump up to 0.1 if the policy is using arms more than you'd like; reduce to 0.02 if it can't get up at all on bad starts.
+- `arm_pose_dev` (default 0.5) — bump up to 1.0 if the policy is still converging on a T-pose or wide-arm stance during the hold; reduce to 0.2 if the policy can't get up at all on hard starts (the arm penalty is interfering with recovery push-offs even though it's gated). You can also widen the `arm_gate` range to `[0.5, 0.85]` to give the policy more time to use arms before the penalty kicks in.
 - `pool_max_upright=0.7` — lower (e.g. 0.5) to keep only HARDER fallen starts, harder (e.g. 0.85) for an easier curriculum.
 - `entropy_coef` (default 0.005) — raise to 0.01 if the policy is committing to bad strategies too fast.
 

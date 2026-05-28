@@ -24,13 +24,14 @@ class StandupRewardWeights:
     # exploration through the high-motion transition zone.
     upright_progress: float = 5.0      # weight on max(0, up_t - up_{t-1})
 
-    # Arm-pose deviation penalty — discourages flailing the arms (which
-    # would damage real hardware). Small weight so the policy can still
-    # use arms when truly needed (e.g. pushing off the floor during deep
-    # recovery), but pays a continuous cost for arm displacement from
-    # rest. NOT phase-gated: arm cost is active throughout the episode,
-    # so the policy only uses arms when the time/upright gains exceed it.
-    arm_pose_dev: float = 0.05         # Σ (q_arm - q_arm_rest)²
+    # Arm-pose deviation penalty — drives the final standing pose to
+    # arms-hanging-at-the-sides (the K1 default rest pose: all 8 arm
+    # joints at 0). The policy otherwise tends to converge on a T-pose
+    # (shoulders rolled out) because it maximises moment of inertia and
+    # is locally stable. Phase-gated on a WIDER band [0.3, 0.7] than the
+    # motion gate, so it ramps in during the upright transition and the
+    # policy has time to tuck arms back. Deep recovery (up<0.3) is free.
+    arm_pose_dev: float = 0.5          # Σ (q_arm - q_arm_rest)² × arm_gate
 
     # Stability penalties — ALL phase-gated by `near_upright_gate`, so
     # they vanish during deep recovery (the policy needs full motion

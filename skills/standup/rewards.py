@@ -174,13 +174,18 @@ def compute_standup_reward(
     # only awarded for genuine forward progress.
     progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
 
-    # Arm-pose deviation — discourages flailing the arms (which would
-    # damage real hardware). NOT phase-gated: penalty active throughout
-    # so the policy uses arms only when standup gains exceed the cost.
+    # Arm-pose deviation — drives the final standing pose to "arms
+    # hanging at the sides" rather than the T-pose / arms-out balance
+    # tricks the policy otherwise discovers. Phase-gated on a WIDER
+    # band [0.3, 0.7] than the motion gate so it ramps in earlier,
+    # giving the policy time to tuck arms back DURING the transition
+    # to upright instead of only after it's already standing. During
+    # deep recovery (up < 0.3) arm use is fully free.
+    arm_gate = near_upright_gate(up, lo=0.3, hi=0.7)
     arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
     if len(arm_joint_indices) > 0 and default_joint_pos is not None:
         arm_dev = joint_pose_deviation(joint_pos, arm_joint_indices,
-                                        default_joint_pos)
+                                        default_joint_pos) * arm_gate
 
     # Per-frame "looks standing" — env will count consecutive frames.
     frame_success = success_frame_mask(
@@ -228,6 +233,7 @@ def compute_standup_reward(
         "upright_raw": float(np.mean(up)),
         "upright_progress": float(np.mean(progress)),
         "arm_pose_dev": float(np.mean(arm_dev)),
+        "arm_gate": float(np.mean(arm_gate)),
         "height": float(np.mean(h)),
         "ang_vel_sway": float(np.mean(ang_sway)),
         "lin_vel_drift": float(np.mean(lin_drift)),

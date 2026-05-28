@@ -60,20 +60,27 @@ class K1RobotConfig:
     arm_joint_indices: Tuple[int, ...] = (2, 3, 4, 5, 6, 7, 8, 9)
     head_joint_indices: Tuple[int, ...] = (0, 1)
 
-    # Default standing pose (radians). Aligned with the T1 walking
-    # config (`booster_gym/envs/T1.yaml`) — Booster's well-tested biped
-    # rest pose: slight hip/knee/ankle bend (≈ 11/23/14 deg) for a
-    # natural standing posture, not the deep squat the old defaults
-    # encoded. Arms are zero (hanging at the sides) and the head is
-    # neutral.
+    # Default standing pose (radians). Slight hip/knee/ankle bend
+    # (≈ 11/23/14 deg) for a natural standing posture; arms hanging at
+    # the sides.
+    #
+    # IMPORTANT — the K1 URDF's joint-zero pose is the T-pose (arms
+    # extended straight out to the sides), confirmed by MuJoCo FK. To
+    # actually hang the arms vertically along the body, both shoulder
+    # rolls have to rotate ±π/2 (left negative, right positive). Other
+    # arm joints stay at 0 (no shoulder pitch swing, no elbow bend, no
+    # forearm yaw). Don't put 0 here for shoulder roll unless you want
+    # a T-pose default — which the obs (`jpos − default`), the PD reset
+    # target, and the standup `arm_pose_dev` penalty all read from this
+    # field.
     default_joint_pos: Tuple[float, ...] = (
-        0.0, 0.0,                 # head: yaw, pitch
-        0.0, 0.0, 0.0, 0.0,       # left arm: shoulder pitch/roll, elbow pitch/yaw
-        0.0, 0.0, 0.0, 0.0,       # right arm
-        -0.2, 0.0, 0.0,           # left hip: pitch, roll, yaw
-        0.4, -0.25, 0.0,          # left knee, ankle pitch, ankle roll
-        -0.2, 0.0, 0.0,           # right hip
-        0.4, -0.25, 0.0,          # right knee, ankle pitch, ankle roll
+        0.0, 0.0,                  # head: yaw, pitch
+        0.0, -1.5708, 0.0, 0.0,    # left arm:  shoulder pitch, roll(-π/2), elbow pitch, elbow yaw
+        0.0,  1.5708, 0.0, 0.0,    # right arm: shoulder pitch, roll(+π/2), elbow pitch, elbow yaw
+        -0.2, 0.0, 0.0,            # left hip: pitch, roll, yaw
+        0.4, -0.25, 0.0,           # left knee, ankle pitch, ankle roll
+        -0.2, 0.0, 0.0,            # right hip
+        0.4, -0.25, 0.0,           # right knee, ankle pitch, ankle roll
     )
 
     # PD gains. T1 uses much higher gains on hip+knee (200/5) and lower
