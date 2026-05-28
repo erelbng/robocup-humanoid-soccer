@@ -18,6 +18,19 @@ class StandupRewardWeights:
     # gradient from upside-down → sideways → upright.
     upright: float = 3.0               # (cos(trunk-z, world-z) + 1) / 2
     height: float = 2.0                # gaussian around target_height (σ=0.3)
+    # Progress shaping — paid only for active uprightening (Δup > 0).
+    # Without this, side-plank (up≈0.7) is a stable basin — the marginal
+    # gradient toward standing is too weak to motivate PPO's risk-averse
+    # exploration through the high-motion transition zone.
+    upright_progress: float = 5.0      # weight on max(0, up_t - up_{t-1})
+
+    # Arm-pose deviation penalty — discourages flailing the arms (which
+    # would damage real hardware). Small weight so the policy can still
+    # use arms when truly needed (e.g. pushing off the floor during deep
+    # recovery), but pays a continuous cost for arm displacement from
+    # rest. NOT phase-gated: arm cost is active throughout the episode,
+    # so the policy only uses arms when the time/upright gains exceed it.
+    arm_pose_dev: float = 0.05         # Σ (q_arm - q_arm_rest)²
 
     # Stability penalties — ALL phase-gated by `near_upright_gate`, so
     # they vanish during deep recovery (the policy needs full motion
@@ -66,6 +79,16 @@ class StandupConfig:
     # Small joint noise added on every pool-sample → effectively
     # unlimited per-reset variation on top of the discrete pool.
     joint_jitter_rad: float = 0.03
+
+    # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
+    # require knowing the absolute floor position — privileged info the
+    # real robot doesn't have. Set True to remove the contact dims from
+    # the policy obs: training is slower (no contact signal) but the
+    # resulting policy is directly deployable. Production sim2real path:
+    # leave this False and use the teacher-student pipeline (`--mode
+    # teacher` → `--mode student`) so the student learns to estimate
+    # contact implicitly from proprio.
+    proprio_only: bool = False
 
     # Sustained-success thresholds. A standup is "done" once
     # `success_hold_steps` consecutive frames satisfy both upright and

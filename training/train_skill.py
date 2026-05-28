@@ -274,7 +274,13 @@ def main():
                     "(checkpoint from a prior `--mode teacher` run).")
             import torch
             from training.algorithms.distillation import train_student
-            student_obs_dim = env.obs_dim - env.privileged_dim
+            # Use non_deployable_dim so skills with sim-only addons (e.g.
+            # standup's contact obs) strip those too — not just the DR
+            # tail. Falls back to privileged_dim for skills that don't
+            # override it.
+            non_deployable = getattr(env, "non_deployable_dim",
+                                      env.privileged_dim)
+            student_obs_dim = env.obs_dim - non_deployable
             teacher = create_policy(env.obs_dim, env.act_dim).to(device)
             load_checkpoint(args.teacher_ckpt, teacher)
             train_student(

@@ -30,6 +30,17 @@ from skills.standup.rewards import (compute_standup_reward, success_frame_mask,
                                      upright_signal)
 
 
+# Contact-link names (K1_22dof.urdf). Feet + hands cover the four main
+# standup support modes: push-from-hands, kneel-into-stand, sit-up-and-
+# rise, balance-on-feet. Without these in obs the policy can't reason
+# about its support polygon during the transition.
+_FOOT_LINK_NAMES = ("left_foot_link", "right_foot_link")
+_HAND_LINK_NAMES = ("left_hand_link", "right_hand_link")
+# Soft contact threshold — link z below this is treated as in-contact.
+# 0.05 m matches typical K1 mesh offsets (feet ~0.02, hands a bit higher).
+_CONTACT_Z = 0.05
+
+
 # ─── quaternion helper ────────────────────────────────────────────────
 
 
@@ -50,12 +61,21 @@ def _random_unit_quat(n: int, rng: np.random.Generator) -> np.ndarray:
 class K1StandupEnv(SkillEnv):
 
     SKILL_NAME = "standup"
-    SKILL_OBS_ADDONS = 0
+    # Addon dims are decided per-instance from `cfg.proprio_only` below:
+    # 8 when contact obs is enabled (fast sim training), 0 when stripped
+    # for sim2real-deployable training.
+    SKILL_OBS_ADDONS = 8
     # Standup STARTS below this threshold — don't terminate on it.
     FALL_TERMINATE_Z = -1.0  # disable height termination
 
     def __init__(self, cfg: StandupConfig = None, **kwargs):
         self.cfg = cfg or StandupConfig()
+        # Shadow the class attr at instance scope. 8 addon dims when
+        # contact obs is enabled: [lfoot_z, rfoot_z, lhand_z, rhand_z,
+        # lfoot_contact, rfoot_contact, lhand_contact, rhand_contact].
+        # 0 when `proprio_only` — policy sees only what the real robot
+        # can measure.
+        self.SKILL_OBS_ADDONS = 0 if self.cfg.proprio_only else 8
         kwargs.setdefault("num_envs", self.cfg.num_envs)
         kwargs.setdefault("dt", self.cfg.dt)
         kwargs.setdefault("sim_dt", self.cfg.sim_dt)
@@ -75,6 +95,14 @@ class K1StandupEnv(SkillEnv):
         self._sustained_now = np.zeros(self.num_envs, dtype=bool)
         self._prev_prev_action = np.tile(self._default_action,
                                           (self.num_envs, 1))
+        # Upright signal from the previous step — used by the progress
+        # reward term. Initialised to -1 (fully inverted) so the first
+        # step from any fallen pose produces a positive Δup credit.
+        self._prev_upright = -np.ones(self.num_envs, dtype=np.float32)
+
+        # Contact-link cache — populated lazily after scene.build().
+        self._foot_links = None
+        self._hand_links = None
 
         self.cfg.obs_dim = self.obs_dim
         self.cfg.act_dim = self.act_dim
@@ -83,6 +111,20 @@ class K1StandupEnv(SkillEnv):
 
     def _make_command_spec(self) -> CommandSpec:
         return CommandSpec.empty()
+
+    # ── deployability accounting (used by distillation) ──────────
+
+    @property
+    def non_deployable_dim(self) -> int:
+        """Trailing obs dims to strip when building a sim2real student.
+
+        Standup adds 8 contact dims (foot/hand z + contact bool) that
+        require absolute floor position — privileged in the sim2real
+        sense. They sit AFTER the base proprio and BEFORE the optional
+        DR-privileged tail, but standup has no command/head_cmd so the
+        two non-deployable blocks are contiguous at the tail of the obs
+        and a single trailing-slice removes both."""
+        return self.SKILL_OBS_ADDONS + self.privileged_dim
 
     # ── no extra scene entities ───────────────────────────────────
 
@@ -178,6 +220,59 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
+    # ── contact-link lookup (after scene.build) ───────────────────
+
+    def _ensure_contact_links(self) -> None:
+        if self._foot_links is not None and self._hand_links is not None:
+            return
+        links_by_name = {ln.name: ln
+                         for ln in getattr(self.robot, "links", [])}
+        foot = [links_by_name.get(n) for n in _FOOT_LINK_NAMES]
+        hand = [links_by_name.get(n) for n in _HAND_LINK_NAMES]
+        self._foot_links = foot if all(l is not None for l in foot) else None
+        self._hand_links = hand if all(l is not None for l in hand) else None
+        if self._foot_links is None:
+            print(f"[standup] foot links {_FOOT_LINK_NAMES} not found — "
+                  "contact obs will be zeroed.")
+        if self._hand_links is None:
+            print(f"[standup] hand links {_HAND_LINK_NAMES} not found — "
+                  "contact obs will be zeroed.")
+
+    def _read_contact_state(self) -> np.ndarray:
+        """Returns (N, 8) addon obs:
+        [lf_z, rf_z, lh_z, rh_z, lf_contact, rf_contact, lh_contact, rh_contact].
+        Heights are world-frame; contact is a binary derived from z-threshold."""
+        N = self.num_envs
+        if self._foot_links is None or self._hand_links is None:
+            self._ensure_contact_links()
+        out = np.zeros((N, 8), dtype=np.float32)
+        try:
+            if self._foot_links is not None:
+                lf = _to_np(self._foot_links[0].get_pos())
+                rf = _to_np(self._foot_links[1].get_pos())
+                out[:, 0] = lf[:, 2]
+                out[:, 1] = rf[:, 2]
+                out[:, 4] = (lf[:, 2] < _CONTACT_Z).astype(np.float32)
+                out[:, 5] = (rf[:, 2] < _CONTACT_Z).astype(np.float32)
+            if self._hand_links is not None:
+                lh = _to_np(self._hand_links[0].get_pos())
+                rh = _to_np(self._hand_links[1].get_pos())
+                out[:, 2] = lh[:, 2]
+                out[:, 3] = rh[:, 2]
+                out[:, 6] = (lh[:, 2] < _CONTACT_Z).astype(np.float32)
+                out[:, 7] = (rh[:, 2] < _CONTACT_Z).astype(np.float32)
+        except Exception as e:
+            print(f"[standup] contact read failed: {e}")
+        return out
+
+    def _skill_obs_addons(self) -> np.ndarray:
+        # `proprio_only` → no contact obs; base class checks
+        # SKILL_OBS_ADDONS > 0 before calling this, so the empty-array
+        # return is a defensive fallback.
+        if self.SKILL_OBS_ADDONS == 0:
+            return np.zeros((self.num_envs, 0), dtype=np.float32)
+        return self._read_contact_state()
+
     # ── reset using the pool ──────────────────────────────────────
 
     def _reset_robot_pose(self, envs_idx: np.ndarray) -> None:
@@ -214,6 +309,7 @@ class K1StandupEnv(SkillEnv):
             root_quat = _to_np(self.robot.get_quat())
             root_lin_vel = _to_np(self.robot.get_vel())
             root_ang_vel = _to_np(self.robot.get_ang())
+            jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
         except Exception:
             return np.zeros(self.num_envs, dtype=np.float32), {}
@@ -231,14 +327,17 @@ class K1StandupEnv(SkillEnv):
         reward, _frame_success, components = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
-            joint_vel=jvel,
+            joint_pos=jpos, joint_vel=jvel,
             action=action,
             prev_action=self._last_action,
             prev_prev_action=self._prev_prev_action,
+            prev_upright=self._prev_upright,
             success_streak=new_streak,
             sustained_now=sustained_now,
             step_count=self.step_count,
             weights=self.cfg.rewards,
+            arm_joint_indices=self.robot_cfg.arm_joint_indices,
+            default_joint_pos=self._default_action,
             target_height=self.cfg.target_height,
             upright_threshold=self.cfg.upright_threshold,
             hold_steps=self.cfg.success_hold_steps,
@@ -250,6 +349,7 @@ class K1StandupEnv(SkillEnv):
         self._sustained_now = sustained_now
         self._frame_success = frame_now
         self._prev_prev_action = self._last_action.copy()
+        self._prev_upright = upright_signal(root_quat).astype(np.float32)
         return reward, components
 
     # ── termination: sustained success OR timeout ─────────────────
@@ -265,3 +365,13 @@ class K1StandupEnv(SkillEnv):
         self._success_streak[envs_idx] = 0
         self._sustained_now[envs_idx] = False
         self._prev_prev_action[envs_idx] = self._default_action
+        # Initialise prev_upright from the just-reset robot's actual
+        # orientation, so the first-step progress reward is 0 instead of
+        # the +(up+1) freebie we'd get by comparing against a fake -1
+        # baseline. Progress credit kicks in genuinely from step 2 onward.
+        try:
+            quat = _to_np(self.robot.get_quat())
+            self._prev_upright[envs_idx] = upright_signal(
+                quat[envs_idx]).astype(np.float32)
+        except Exception:
+            self._prev_upright[envs_idx] = -1.0

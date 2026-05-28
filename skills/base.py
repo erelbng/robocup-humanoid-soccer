@@ -196,6 +196,20 @@ class SkillEnv(ABC):
         return DRSample.PRIVILEGED_DIM if self.include_privileged else 0
 
     @property
+    def non_deployable_dim(self) -> int:
+        """Trailing obs dims a deployable (real-robot) student must strip.
+
+        Defaults to `privileged_dim` (just the DR channel). Skills that
+        include sim-only addons in `SKILL_OBS_ADDONS` (e.g. standup's
+        contact obs, which requires absolute floor position) should
+        override this to add those dims, so the distillation pipeline
+        slices them off when computing `student_obs_dim`. The skill is
+        responsible for making sure the non-deployable dims sit at the
+        TAIL of the obs vector so a leading-prefix slice gives the
+        deployable proprio."""
+        return self.privileged_dim
+
+    @property
     def act_dim(self) -> int:
         return int(self.robot_cfg.num_dofs)
 

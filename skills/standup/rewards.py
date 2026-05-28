@@ -21,6 +21,7 @@ from typing import Tuple
 import numpy as np
 
 from skills.common_obs import projected_gravity
+from skills.common_rewards import joint_pose_deviation
 
 
 # ─── primary signals ──────────────────────────────────────────────────
@@ -83,10 +84,14 @@ def action_jerk(action: np.ndarray, prev_action: np.ndarray,
 
 
 def near_upright_gate(upright: np.ndarray,
-                      lo: float = 0.5, hi: float = 0.8) -> np.ndarray:
+                      lo: float = 0.7, hi: float = 0.95) -> np.ndarray:
     """Linear ramp in [lo, hi] of the upright signal, clipped to [0, 1].
     Returns the soft 'how near upright are we' mask used to phase-gate
-    drift / quiet-joint penalties — smooth, no discontinuity."""
+    motion penalties — smooth, no discontinuity. Defaults [0.7, 0.95]
+    deliberately push the activation zone into the final balancing range
+    (cos(tilt) ∈ [0.7, 0.95] = tilt 18°–45°): the policy gets a fully
+    motion-free recovery, and stability shaping only kicks in once it's
+    essentially balancing in place."""
     return np.clip((upright - lo) / max(hi - lo, 1e-6), 0.0, 1.0
                    ).astype(np.float32)
 
@@ -112,14 +117,18 @@ def compute_standup_reward(
     root_quat: np.ndarray,           # (N, 4) wxyz
     root_lin_vel: np.ndarray,        # (N, 3) world frame
     root_ang_vel: np.ndarray,        # (N, 3) body frame
+    joint_pos: np.ndarray,           # (N, n_dof)
     joint_vel: np.ndarray,           # (N, n_dof)
     action: np.ndarray,              # (N, n_dof)
     prev_action: np.ndarray,         # (N, n_dof)
     prev_prev_action: np.ndarray,    # (N, n_dof)
+    prev_upright: np.ndarray,        # (N,) upright_signal from last step
     success_streak: np.ndarray,      # (N,) int — consecutive success-frames
     sustained_now: np.ndarray,       # (N,) bool — streak reached threshold this step
     step_count: np.ndarray,          # (N,) int — control steps since reset
     weights,
+    arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
+    default_joint_pos: np.ndarray = None,
     target_height: float = 0.55,
     upright_threshold: float = 0.92,
     hold_steps: int = 30,
@@ -157,6 +166,22 @@ def compute_standup_reward(
     smooth = action_smoothness(action, prev_action) * gate
     jerk = action_jerk(action, prev_action, prev_prev_action) * gate
 
+    # Progress shaping — pay the policy for *active* uprightening, not
+    # just for being-in-state. Without this, side-plank (up≈0.7) is a
+    # stable basin worth +1.9/step; the marginal gradient toward standing
+    # is too weak for PPO to commit to the risky transition. The positive-
+    # only clip avoids paying for backsliding being undone — credit is
+    # only awarded for genuine forward progress.
+    progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
+
+    # Arm-pose deviation — discourages flailing the arms (which would
+    # damage real hardware). NOT phase-gated: penalty active throughout
+    # so the policy uses arms only when standup gains exceed the cost.
+    arm_dev = np.zeros(root_pos.shape[0], dtype=np.float32)
+    if len(arm_joint_indices) > 0 and default_joint_pos is not None:
+        arm_dev = joint_pose_deviation(joint_pos, arm_joint_indices,
+                                        default_joint_pos)
+
     # Per-frame "looks standing" — env will count consecutive frames.
     frame_success = success_frame_mask(
         root_quat, root_pos[:, 2],
@@ -186,6 +211,8 @@ def compute_standup_reward(
     r = (
         w.upright * up_pos
         + w.height * h
+        + w.upright_progress * progress
+        - w.arm_pose_dev * arm_dev
         - w.base_ang_vel_sway * ang_sway
         - w.base_lin_vel_drift * lin_drift
         - w.joint_vel_quiet * q_quiet
@@ -199,6 +226,8 @@ def compute_standup_reward(
     components = {
         "upright": float(np.mean(up_pos)),
         "upright_raw": float(np.mean(up)),
+        "upright_progress": float(np.mean(progress)),
+        "arm_pose_dev": float(np.mean(arm_dev)),
         "height": float(np.mean(h)),
         "ang_vel_sway": float(np.mean(ang_sway)),
         "lin_vel_drift": float(np.mean(lin_drift)),
