@@ -100,6 +100,13 @@ class SkillEnv(ABC):
     SKILL_NAME: str = "skill"
     SKILL_OBS_ADDONS: int = 0
     MAX_EPISODE_STEPS: int = 1000
+    # Policy outputs are interpreted as RESIDUAL deltas from the default
+    # joint pose, clipped to ±ACTION_DELTA_MAX radians per control step.
+    # This ensures a near-zero-initialised network holds the default
+    # standing pose (rather than commanding all joints to 0), which is
+    # critical for skills that start near the desired pose (standup easy
+    # pool, walk). Subclasses can tighten this for fine-grained skills.
+    ACTION_DELTA_MAX: float = 0.5
 
     # Episode-termination thresholds (override in subclasses if needed).
     FALL_TERMINATE_Z: float = 0.10   # trunk below this → done
@@ -139,8 +146,11 @@ class SkillEnv(ABC):
         self.step_count = np.zeros(self.num_envs, dtype=np.int64)
         self._default_action = np.asarray(self.robot_cfg.default_joint_pos,
                                           dtype=np.float32)
-        self._last_action = np.tile(self._default_action,
-                                    (self.num_envs, 1))
+        # Residual-action convention: _last_action stores the DELTA that
+        # was commanded last step (not the absolute PD target). Zero at
+        # init / reset means "hold default pose."
+        self._last_action = np.zeros((self.num_envs, len(self._default_action)),
+                                     dtype=np.float32)
         self._episode_reward = np.zeros(self.num_envs, dtype=np.float32)
         self.rng = np.random.default_rng(seed)
 
@@ -483,7 +493,7 @@ class SkillEnv(ABC):
 
         self.step_count[envs_idx] = 0
         self._episode_reward[envs_idx] = 0.0
-        self._last_action[envs_idx] = self._default_action
+        self._last_action[envs_idx] = 0.0  # zero delta = hold default pose
 
         if self.command_spec.dim > 0:
             self.commands[envs_idx] = self.command_spec.sample(
@@ -504,10 +514,21 @@ class SkillEnv(ABC):
         action = np.asarray(action, dtype=np.float32)
         if action.ndim == 1:
             action = action[None, :].repeat(self.num_envs, axis=0)
-        action = np.clip(action, -math.pi, math.pi)
+
+        # Residual-action convention: policy output is a DELTA from the
+        # default joint pose. Clip the delta, then add to default to get
+        # the absolute PD target. A near-zero-initialised policy therefore
+        # holds the default standing pose on step 0 instead of collapsing
+        # to all-zeros, which was the cause of the floor local optimum in
+        # early standup training.
+        action = np.clip(action, -self.ACTION_DELTA_MAX, self.ACTION_DELTA_MAX)
+        targets = np.clip(
+            self._default_action[None, :] + action,
+            -math.pi, math.pi,
+        )
 
         try:
-            self.robot.control_dofs_position(action, self.dof_indices)
+            self.robot.control_dofs_position(targets, self.dof_indices)
         except Exception:
             pass
 
@@ -532,7 +553,7 @@ class SkillEnv(ABC):
         done = self._check_skill_done()
 
         self._episode_reward += reward
-        self._last_action = action
+        self._last_action = action  # delta (residual), not absolute target
 
         if done.any():
             self.reset(envs_idx=np.where(done)[0])

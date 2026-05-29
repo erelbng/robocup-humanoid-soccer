@@ -51,7 +51,9 @@ class StandupRewardWeights:
     # realistic standup time range: a 1 s stand pays ~330, a 2 s stand
     # ~150, a 3 s stand ~100, a 4 s stand ~55. Sub-second standups still
     # get the largest pulse but slow ones are no longer disqualified.
-    time_penalty: float = 1.0          # per step until sustained-success
+    time_penalty: float = 3.0          # per step until sustained-success
+                                       # (≥2.5 to make floor net-negative:
+                                       #  upright≈0.5×3 + height≈0.3 − 3.0 < 0)
     success_bonus: float = 400.0       # paid on streak completion, scaled
                                        #   by exp(-t_first / tau)
     success_persistence: float = 5.0   # per step while in the hold window
@@ -131,7 +133,14 @@ class StandupConfig:
     easy_pool_tilt_max: float = 0.15            # rad (~8°) — small initial tilt
     easy_pool_min_height: float = 0.40          # filter: keep only standing-ish
     easy_pool_min_upright: float = 0.70         # filter: cos(tilt) ≥ 0.70
-    start_curriculum_env_steps: int = 25_000_000  # ramp easy_frac 1.0 → 0.0
+    start_curriculum_env_steps: int = 50_000_000  # ramp easy_frac 1.0 → 0.0
+    # Performance gate: easy_frac only decays when the EMA success rate
+    # exceeds this threshold. Below it, the fraction is held at
+    # `start_curriculum_min_easy_frac` to keep training viable. This
+    # prevents the time-only curriculum from reaching 0% easy starts while
+    # the policy still has 0% success rate.
+    start_curriculum_min_success: float = 0.05  # minimum EMA frame_success_rate
+    start_curriculum_min_easy_frac: float = 0.30  # clamp easy_frac here if stuck
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the

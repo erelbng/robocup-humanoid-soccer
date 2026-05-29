@@ -126,11 +126,16 @@ class K1StandupEnv(SkillEnv):
         # window — preventing accidental "stood for a few frames then
         # collapsed" trajectories from collecting the same reward.
         self._achieved_sustained = np.zeros(self.num_envs, dtype=bool)
-        self._prev_prev_action = np.tile(self._default_action,
-                                          (self.num_envs, 1))
+        self._prev_prev_action = np.zeros((self.num_envs, self.act_dim),
+                                          dtype=np.float32)
         # Cumulative env-steps seen by the policy (sum over all parallel
         # envs of every `step()` call). Drives the hold_steps curriculum.
         self._total_env_steps_seen: int = 0
+        # EMA of frame_success_rate — used to gate curriculum advancement.
+        # The easy-start curriculum only advances when the policy shows
+        # real performance, preventing time-only advancement while stuck.
+        self._success_rate_ema: float = 0.0
+        self._success_ema_alpha: float = 0.005  # ~200-step window
         # Upright signal from the previous step — used by the progress
         # reward term. Initialised to -1 (fully inverted) so the first
         # step from any fallen pose produces a positive Δup credit.
@@ -474,14 +479,25 @@ class K1StandupEnv(SkillEnv):
                      + (c.target_height - c.target_height_start) * p)
 
     def _current_easy_fraction(self) -> float:
-        """Fraction of episodes that should start from the EASY (near-
-        standing) pool. 1.0 at env-step 0, ramping to 0.0 at the end of
-        the start curriculum. After that, all starts are fully fallen
-        — same distribution as before the reverse curriculum existed."""
+        """Fraction of episodes starting from the EASY (near-standing) pool.
+
+        Combines time-based decay with a performance gate: if the policy
+        hasn't demonstrated minimum performance (`start_curriculum_min_success`
+        EMA success rate), the easy fraction is held at its current level and
+        only allowed to decay further once performance recovers. This prevents
+        the curriculum from advancing during a stuck phase — the previous
+        purely-time-based advancement left the policy on 0% easy starts with
+        0% success rate by step 25M."""
         if not self.cfg.easy_pool_enabled or self._easy_pool_size == 0:
             return 0.0
         p = self._curriculum_progress(self.cfg.start_curriculum_env_steps)
-        return float(1.0 - p)
+        time_frac = float(1.0 - p)
+        # Only allow further decay if the policy is meeting minimum performance.
+        # If below the threshold, clamp to the minimum easy fraction that
+        # keeps training viable.
+        if self._success_rate_ema < self.cfg.start_curriculum_min_success:
+            return max(time_frac, self.cfg.start_curriculum_min_easy_frac)
+        return time_frac
 
     # ── reward + sustained-success bookkeeping ────────────────────
 
@@ -548,6 +564,14 @@ class K1StandupEnv(SkillEnv):
         components["target_height_current"] = float(target_h)
         components["easy_start_fraction"] = float(self._current_easy_fraction())
 
+        # Update EMA of frame success rate — used to gate curriculum.
+        current_success_rate = float(np.mean(frame_now))
+        self._success_rate_ema = (
+            (1.0 - self._success_ema_alpha) * self._success_rate_ema
+            + self._success_ema_alpha * current_success_rate
+        )
+        components["success_rate_ema"] = self._success_rate_ema
+
         self._success_streak = new_streak
         self._sustained_now = sustained_now
         self._achieved_sustained = achieved_sustained
@@ -577,7 +601,7 @@ class K1StandupEnv(SkillEnv):
         self._success_streak[envs_idx] = 0
         self._sustained_now[envs_idx] = False
         self._achieved_sustained[envs_idx] = False
-        self._prev_prev_action[envs_idx] = self._default_action
+        self._prev_prev_action[envs_idx] = 0.0  # zero delta = hold default pose
         # Initialise prev_upright from the just-reset robot's actual
         # orientation, so the first-step progress reward is 0 instead of
         # the +(up+1) freebie we'd get by comparing against a fake -1
