@@ -21,8 +21,11 @@ class StandupRewardWeights:
     # Progress shaping — paid only for active uprightening (Δup > 0).
     # Without this, side-plank (up≈0.7) is a stable basin — the marginal
     # gradient toward standing is too weak to motivate PPO's risk-averse
-    # exploration through the high-motion transition zone.
-    upright_progress: float = 5.0      # weight on max(0, up_t - up_{t-1})
+    # exploration through the high-motion transition zone. Bumped from
+    # 5.0 to 10.0 because the policy got stuck in a sit/kneel attractor
+    # (z ≈ 0.25, up ≈ 0.85) where Δup ≈ 0; a stronger progress weight
+    # amplifies the tiny gradient that pulls the policy onward.
+    upright_progress: float = 10.0     # weight on max(0, up_t - up_{t-1})
 
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
@@ -102,22 +105,35 @@ class StandupConfig:
     # contact implicitly from proprio.
     proprio_only: bool = False
 
-    # Sustained-success thresholds. A standup is "done" once
-    # `success_hold_steps` consecutive frames satisfy both upright and
-    # height conditions.
+    # Sustained-success thresholds (END of curriculum — see _start values
+    # below). A standup is "done" once `success_hold_steps` consecutive
+    # frames satisfy both upright and height conditions.
     target_height: float = 0.55
     upright_threshold: float = 0.92            # cosine ~23° tilt max
-    success_hold_steps: int = 50               # 1.0 s at 50 Hz — END of curriculum
+    success_hold_steps: int = 50               # 1.0 s at 50 Hz
 
-    # Curriculum on the hold-window length. Starts at `hold_start` (easier
-    # to register a success → policy can discover partial standups and
-    # bootstrap into the full motion) and ramps linearly to
-    # `success_hold_steps` over `hold_curriculum_env_steps` cumulative
-    # env-steps. Without this the 1.0 s requirement is so far from the
-    # initial policy's capability that the terminal bonus is effectively
-    # never paid → flat learning curve.
+    # Curricula on the success criteria. All three independently ramp
+    # from their `_start` value to the final value over
+    # `*_curriculum_env_steps` cumulative env-steps.
+    #
+    # Why three curricula:
+    #   * hold_steps tightens HOW LONG you must hold (1 s = real stability)
+    #   * upright_threshold tightens HOW UPRIGHT (0.92 = deployment quality)
+    #   * target_height tightens HOW TALL (0.55 = K1 standing height)
+    #
+    # Without the threshold curricula the policy commonly gets stuck in a
+    # sit/kneel attractor at z ≈ 0.25, up ≈ 0.85 that pays well from the
+    # dense terms but never triggers `frame_success` (which requires
+    # up > 0.92 AND z > 0.45), so the terminal bonus and post-success
+    # standing reward never fire. The looser starting criteria give the
+    # policy partial credit at intermediate poses, then tighten as it
+    # masters the harder ones.
     success_hold_steps_start: int = 15         # 0.3 s at 50 Hz
     hold_curriculum_env_steps: int = 25_000_000
+
+    upright_threshold_start: float = 0.80      # cosine ~37° tilt — kneel-ish
+    target_height_start: float = 0.40          # frame_success at z > 0.30
+    threshold_curriculum_env_steps: int = 25_000_000
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
     # τ=150 steps (3.0 s) keeps the bonus meaningful for realistic

@@ -314,20 +314,36 @@ class K1StandupEnv(SkillEnv):
         except Exception as e:
             print(f"[standup] _reset_robot_pose failed: {e}")
 
-    # ── hold-steps curriculum ─────────────────────────────────────
+    # ── curricula ─────────────────────────────────────────────────
+    #
+    # Three independent linear ramps from `_start` → final values over
+    # their respective horizon, all driven by `_total_env_steps_seen`.
+    # Together they let the policy discover a partial standup at loose
+    # criteria, then tighten toward deployment quality without ever
+    # losing the gradient.
+
+    def _curriculum_progress(self, horizon_env_steps: int) -> float:
+        return min(self._total_env_steps_seen / max(int(horizon_env_steps), 1),
+                   1.0)
 
     def _current_hold_steps(self) -> int:
-        """Linear ramp from `success_hold_steps_start` → `success_hold_steps`
-        over `hold_curriculum_env_steps` cumulative env-steps. Lets the
-        policy bootstrap on a 0.3 s "looks standing" criterion (where
-        first-success is reachable inside a few M env-steps) and then
-        tightens to the full 1.0 s deployment criterion."""
         c = self.cfg
-        end = int(c.success_hold_steps)
-        start = int(c.success_hold_steps_start)
-        horizon = max(int(c.hold_curriculum_env_steps), 1)
-        progress = min(self._total_env_steps_seen / horizon, 1.0)
-        return int(round(start + (end - start) * progress))
+        p = self._curriculum_progress(c.hold_curriculum_env_steps)
+        return int(round(c.success_hold_steps_start
+                         + (c.success_hold_steps - c.success_hold_steps_start)
+                           * p))
+
+    def _current_upright_threshold(self) -> float:
+        c = self.cfg
+        p = self._curriculum_progress(c.threshold_curriculum_env_steps)
+        return float(c.upright_threshold_start
+                     + (c.upright_threshold - c.upright_threshold_start) * p)
+
+    def _current_target_height(self) -> float:
+        c = self.cfg
+        p = self._curriculum_progress(c.threshold_curriculum_env_steps)
+        return float(c.target_height_start
+                     + (c.target_height - c.target_height_start) * p)
 
     # ── reward + sustained-success bookkeeping ────────────────────
 
@@ -344,12 +360,14 @@ class K1StandupEnv(SkillEnv):
 
         self._total_env_steps_seen += self.num_envs
         hold_steps = self._current_hold_steps()
+        upright_thresh = self._current_upright_threshold()
+        target_h = self._current_target_height()
 
         prev_streak = self._success_streak.copy()
         frame_now = success_frame_mask(
             root_quat, root_pos[:, 2],
-            target_h=self.cfg.target_height,
-            upright_threshold=self.cfg.upright_threshold,
+            target_h=target_h,
+            upright_threshold=upright_thresh,
         )
         new_streak = np.where(frame_now, prev_streak + 1, 0).astype(np.int32)
         sustained_now = (new_streak == hold_steps) \
@@ -374,14 +392,16 @@ class K1StandupEnv(SkillEnv):
             weights=self.cfg.rewards,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
             default_joint_pos=self._default_action,
-            target_height=self.cfg.target_height,
-            upright_threshold=self.cfg.upright_threshold,
+            target_height=target_h,
+            upright_threshold=upright_thresh,
             hold_steps=hold_steps,
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
             control_dt=self.dt,
         )
 
         components["hold_steps_current"] = float(hold_steps)
+        components["upright_threshold_current"] = float(upright_thresh)
+        components["target_height_current"] = float(target_h)
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now

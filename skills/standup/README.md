@@ -64,7 +64,7 @@ distillation pipeline reads to size the student.
 |------|--------|-------|
 | `upright` | 3.0 | `(cos(tilt)+1)/2` — smooth in [0, 1] everywhere, monotonic from upside-down to upright |
 | `height` | 2.0 | Gaussian on trunk z, σ=0.3 (gradient is non-flat from z=0.15 upward) |
-| `upright_progress` | 5.0 | `max(0, Δup)` — pays for active uprightening, not for being-in-state. Kills the side-plank attractor |
+| `upright_progress` | 10.0 | `max(0, Δup)` — pays for active uprightening, not for being-in-state. Kills the side-plank / kneel attractor |
 | `arm_pose_dev` | 0.2 | `Σ(q_arm − rest)²` × `arm_gate(up; 0.5 → 0.85)` — pushes the final standing pose to arms-at-the-sides instead of T-pose. Recovery (up < 0.5) is completely free, so the policy can still use arms to push off the floor; penalty ramps in as the robot approaches upright and saturates by up=0.85. |
 | `base_ang_vel_sway` | 0.05 | ωx² + ωy², gated |
 | `base_lin_vel_drift` | 0.5 | ‖v‖², gated |
@@ -194,7 +194,7 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 6. **`rewards/near_upright_gate`** — average gate activation. Rises with `mean_robot_z`; useful to confirm motion penalties are actually firing once balancing is reached.
 
-7. **`rewards/hold_steps_current`** — current hold-window length under the curriculum. Starts at 15 and ramps linearly to 50 over `hold_curriculum_env_steps` (default 25M). Use it to confirm the curriculum is advancing as expected.
+7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** — the three curriculum knobs. Should ramp linearly 15→50, 0.80→0.92, and 0.40→0.55 over the first ~25M env-steps. Use them to confirm the curricula are advancing as expected.
 
 8. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
 
@@ -203,10 +203,16 @@ Key signals, in order of "if this isn't trending right, something is broken":
 ## Hyperparameters worth tuning (and ones not to)
 
 ### Don't touch unless you have a strong reason
-- `success_hold_steps=50` (1 s hold) — defines what "stable" means at the **end** of the curriculum. Lowering it makes standups easier to mark successful but reduces deployment quality.
-- `success_hold_steps_start=15` (0.3 s) — initial criterion that ramps to `success_hold_steps` over `hold_curriculum_env_steps`. The curriculum lets the policy bootstrap on a discoverable target; without it the 1.0 s requirement is far enough from a fresh policy that the terminal bonus is effectively never paid.
-- `hold_curriculum_env_steps=25_000_000` — env-steps over which the hold criterion tightens. Tune up if you have plenty of compute (slower ramp = more time at the easy criterion), down if you want full strictness sooner.
-- `upright_threshold=0.92` (cos, ≈ 23° tilt) — defines what "upright" means.
+
+Three independent curricula tighten the success criteria from "reachable from a kneel" to "deployment quality" over ~25M env-steps. End values are the deployment criteria; `_start` values define what the policy is judged against early in training.
+
+- `success_hold_steps=50` (1 s hold) — END value: defines what "stable" means.
+- `success_hold_steps_start=15` (0.3 s) — START value: discoverable hold length for a fresh policy.
+- `upright_threshold=0.92` (cos, ≈ 23° tilt) — END value: defines what "upright" means.
+- `upright_threshold_start=0.80` (cos, ≈ 37° tilt) — START value: roughly the orientation the policy reaches in a kneel.
+- `target_height=0.55` — END value: K1 standing trunk height. `frame_success` requires `z > target_h − 0.10`.
+- `target_height_start=0.40` — START value: `frame_success` triggers at `z > 0.30`, just out of reach of the kneel attractor at z ≈ 0.25.
+- `hold_curriculum_env_steps=25_000_000` and `threshold_curriculum_env_steps=25_000_000` — horizons over which each curriculum tightens. Lengthen if you have plenty of compute, shorten for faster convergence to full strictness.
 - `time_to_stand_tau_steps=150` (3.0 s) — sets the shape of the terminal speed bonus. With τ=150 a 1 s stand pays ~330, 2 s ~150, 3 s ~100. The previous τ=40 decayed so fast that 3 s standups paid only ~9, less than the side-plank attractor.
 - Settle-pool params (`spawn_height_*`, `settle_steps`, `settle_pool_rounds`) — already tuned to give ~120 diverse fallen states at `vec_num_envs=32` and ~3800 at 1024.
 
@@ -222,9 +228,10 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 ### "The policy is stuck at side-plank / lying still"
 
-Check `rewards/upright_progress`:
-- If it's near zero → the policy never moves upward. Either the reward gradient is too weak (bump `upright_progress` to 8–10) or exploration is too narrow (bump entropy to 0.01).
-- If it's positive but the policy isn't completing standups → it lurches forward in one step then falls back. The hold-steps curriculum (start=15, ramp over 25M env-steps) already gives partial credit early; if you still see no `sustained_rate` rise by ~5M env-steps, lengthen the ramp (`hold_curriculum_env_steps`) or lower `success_hold_steps_start` to 10.
+Check `rewards/upright_progress` AND `rewards/mean_robot_z`:
+- If `upright_progress` rises early then **decays back toward 0** AND `mean_robot_z` plateaus below ~0.3 → the policy is stuck in a sit/kneel partial pose. The threshold curricula are designed to break this: at t=0 the policy can succeed at z>0.30, up>0.80 (reachable from a kneel). If you still see no `frame_success_rate` rise by ~5M env-steps, lower `target_height_start` to 0.30 or `upright_threshold_start` to 0.75.
+- If `upright_progress` is near zero from the start → the policy never moves upward. Bump `upright_progress` further (to 15–20) or raise entropy to 0.01.
+- If `frame_success_rate` rises but `achieved_sustained_rate` stays low → the policy is wobbling through the success window without sustaining. Lower `success_hold_steps_start` to 10 or lengthen `hold_curriculum_env_steps`.
 
 ### "Training crashes during the settle-pool build"
 
