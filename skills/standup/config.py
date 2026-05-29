@@ -114,6 +114,25 @@ class StandupConfig:
     # unlimited per-reset variation on top of the discrete pool.
     joint_jitter_rad: float = 0.03
 
+    # Reverse curriculum on initial pose distribution. Build a second
+    # pool of near-standing starts (default pose + small jitter, brief
+    # settle) and mix it with the fallen pool. Early in training the
+    # policy mostly trains on easy starts (already standing → just
+    # don't fall) so it learns what standing LOOKS like and gets the
+    # success bonus regularly. As `_total_env_steps_seen` advances, the
+    # mix shifts to fully fallen starts. This addresses the actual
+    # blocker (PPO can't randomly discover the standup trajectory) by
+    # giving the policy reachable "good states" to learn from before
+    # asking it to recover from arbitrary fallen poses.
+    easy_pool_enabled: bool = True
+    easy_pool_settle_steps: int = 30            # brief — robot is already up
+    easy_pool_height: float = 0.60              # spawn just above standing
+    easy_pool_joint_jitter: float = 0.10        # rad — bigger than reset jitter
+    easy_pool_tilt_max: float = 0.15            # rad (~8°) — small initial tilt
+    easy_pool_min_height: float = 0.40          # filter: keep only standing-ish
+    easy_pool_min_upright: float = 0.70         # filter: cos(tilt) ≥ 0.70
+    start_curriculum_env_steps: int = 25_000_000  # ramp easy_frac 1.0 → 0.0
+
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
     # real robot doesn't have. Set True to remove the contact dims from

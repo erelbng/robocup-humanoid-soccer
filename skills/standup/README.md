@@ -39,6 +39,7 @@ policy and works in eval).
 | Component | Purpose | Where it lives |
 |-----------|---------|----------------|
 | Settle pool | Physically-realistic fallen starts (no hand-coded poses) | `env._build_settle_pool` |
+| Easy pool + reverse curriculum | Near-standing starts that ramp out as training progresses — addresses the exploration problem (PPO can't randomly discover the standup trajectory) by giving the policy reachable "good states" to learn from before the harder ones | `env._build_easy_pool`, `env._current_easy_fraction` |
 | Contact obs (8 dims) | Foot/hand z + contact bool — tells the policy what's on the floor. **Privileged in sim2real.** | `env._read_contact_state` |
 | `upright_progress` reward | Pays per step for `Δup > 0` — breaks the side-plank attractor | `rewards.compute_standup_reward` |
 | `near_upright_gate` | Motion penalties only fire in the final balancing zone (up ∈ [0.7, 0.95]) | `rewards.near_upright_gate` |
@@ -196,7 +197,7 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 6. **`rewards/near_upright_gate`** — average gate activation. Rises with `mean_robot_z`; useful to confirm motion penalties are actually firing once balancing is reached.
 
-7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** — the three curriculum knobs. Should ramp linearly 15→50, 0.80→0.92, and 0.40→0.55 over the first ~25M env-steps. Use them to confirm the curricula are advancing as expected.
+7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** / **`rewards/easy_start_fraction`** — the four curriculum knobs. Should ramp linearly 15→50, 0.80→0.92, 0.40→0.55, and 1.0→0.0 over the first ~25M env-steps. Use them to confirm the curricula are advancing as expected. Early in training `mean_robot_z` should be HIGH (~0.55) because most episodes start standing — this is the expected curriculum effect, not the policy succeeding from fallen starts. Watch for `mean_robot_z` and `upright_raw` STAYING high as `easy_start_fraction` drops; that's the signal the policy has learned to stand up.
 
 8. **`rewards/foot_grounded_up`** / **`rewards/mean_foot_z`** — anti-gaming signal in [0, 1]. Should climb from 0 toward 1.0 as the policy learns to put feet down with trunk lifted. If it stays near 0 while `upright` and `height` rise, the policy is gaming the dense terms with a bridge / sprawled pose — exactly the failure this term is designed to close. `mean_foot_z` is the mean of both feet z; should drop toward `foot_grounded_max_z` (0.10) and stay there once standing.
 
@@ -221,6 +222,15 @@ Three independent curricula tighten the success criteria from "reachable from a 
 - `hold_curriculum_env_steps=25_000_000` and `threshold_curriculum_env_steps=25_000_000` — horizons over which each curriculum tightens. Lengthen if you have plenty of compute, shorten for faster convergence to full strictness.
 - `time_to_stand_tau_steps=150` (3.0 s) — sets the shape of the terminal speed bonus. With τ=150 a 1 s stand pays ~330, 2 s ~150, 3 s ~100. The previous τ=40 decayed so fast that 3 s standups paid only ~9, less than the side-plank attractor.
 - Settle-pool params (`spawn_height_*`, `settle_steps`, `settle_pool_rounds`) — already tuned to give ~120 diverse fallen states at `vec_num_envs=32` and ~3800 at 1024.
+
+### Reverse curriculum on initial pose distribution
+
+- `easy_pool_enabled=True` — toggles the second initial-pose pool.
+- `start_curriculum_env_steps=25_000_000` — env-steps over which the easy-start fraction ramps from 1.0 → 0.0. Tune up (e.g. 50M) if you want the policy to spend more time learning "maintain standing" before recovering from harder falls.
+- `easy_pool_height=0.60` — spawn height for the easy pool; let it settle to standing.
+- `easy_pool_tilt_max=0.15` (rad, ~8°) — max initial trunk tilt.
+- `easy_pool_joint_jitter=0.10` (rad) — joint perturbation around the default standing pose.
+- `easy_pool_min_height=0.40` / `easy_pool_min_upright=0.70` — pool filter: only keep states that DIDN'T fall during the brief settle. Loosen if too many states get filtered out.
 
 ### Things you might reasonably tune
 - `upright_progress` (default 5.0) — bump higher (8–10) if the policy is still getting stuck in side-plank-like local minima.

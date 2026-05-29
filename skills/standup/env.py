@@ -62,6 +62,23 @@ def _random_unit_quat(n: int, rng: np.random.Generator) -> np.ndarray:
     ], axis=-1).astype(np.float32)
 
 
+def _small_tilt_quat(n: int, max_angle: float,
+                      rng: np.random.Generator) -> np.ndarray:
+    """Quat for a small rotation (≤ max_angle radians) around a random
+    horizontal axis — used to add a small initial tilt to a standing
+    robot without completely re-orienting it."""
+    angles = rng.uniform(0.0, max_angle, size=n).astype(np.float32)
+    # Axis chosen in the xy plane (no yaw component) → pitch/roll only.
+    theta = rng.uniform(0.0, 2.0 * np.pi, size=n).astype(np.float32)
+    ax = np.cos(theta)
+    ay = np.sin(theta)
+    half = angles * 0.5
+    sin_h = np.sin(half)
+    cos_h = np.cos(half)
+    return np.stack([cos_h, ax * sin_h, ay * sin_h,
+                     np.zeros_like(cos_h)], axis=-1).astype(np.float32)
+
+
 class K1StandupEnv(SkillEnv):
 
     SKILL_NAME = "standup"
@@ -92,6 +109,12 @@ class K1StandupEnv(SkillEnv):
         self._pool_quat: Optional[np.ndarray] = None
         self._pool_jpos: Optional[np.ndarray] = None
         self._pool_size: int = 0
+
+        # Easy pool — near-standing starts for the reverse curriculum.
+        self._easy_pool_pos: Optional[np.ndarray] = None
+        self._easy_pool_quat: Optional[np.ndarray] = None
+        self._easy_pool_jpos: Optional[np.ndarray] = None
+        self._easy_pool_size: int = 0
 
         # Per-env reward / termination state.
         self._frame_success = np.zeros(self.num_envs, dtype=bool)
@@ -233,6 +256,66 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
+    def _build_easy_pool(self) -> None:
+        """Build pool of near-standing initial poses for the reverse
+        curriculum. Spawn at standing default pose with small joint
+        jitter and a small initial tilt, brief settle so physics relaxes,
+        snapshot. The policy uses these starts early in training to
+        learn 'what standing looks like' before recovering from harder
+        fallen poses."""
+        c = self.cfg
+        N = self.num_envs
+        all_idx = np.arange(N)
+
+        pos = np.zeros((N, 3), dtype=np.float32)
+        pos[:, 2] = c.easy_pool_height
+        quat = _small_tilt_quat(N, c.easy_pool_tilt_max, self.rng)
+        # If tilt_max is zero, the helper returns identity quats — but
+        # _small_tilt_quat with max_angle=0 gives [1,0,0,0] for all,
+        # which is what we want.
+        jpos_target = (self._default_action[None, :]
+                       + self.rng.standard_normal((N, self.act_dim))
+                          .astype(np.float32) * c.easy_pool_joint_jitter)
+
+        try:
+            self.robot.set_pos(pos, envs_idx=all_idx)
+            self.robot.set_quat(quat, envs_idx=all_idx)
+            self.robot.set_dofs_position(jpos_target, self.dof_indices,
+                                          envs_idx=all_idx,
+                                          zero_velocity=True)
+            # Hold PD at the spawn pose during settle so the robot
+            # actively maintains standing posture (instead of flopping).
+            self.robot.control_dofs_position(jpos_target, self.dof_indices)
+        except Exception as e:
+            print(f"[standup] easy pool spawn failed: {e}")
+            self._easy_pool_size = 0
+            return
+
+        for _ in range(c.easy_pool_settle_steps):
+            self.scene.step()
+
+        try:
+            p = _to_np(self.robot.get_pos()).copy()
+            q = _to_np(self.robot.get_quat()).copy()
+            j = _to_np(self.robot.get_dofs_position(self.dof_indices)).copy()
+        except Exception as e:
+            print(f"[standup] easy pool snapshot failed: {e}")
+            self._easy_pool_size = 0
+            return
+
+        # Filter: keep only states that are still standing-ish (robot
+        # didn't fall during the brief settle).
+        up = upright_signal(q)
+        ok = (p[:, 2] > c.easy_pool_min_height) & (up > c.easy_pool_min_upright)
+        # Re-center horizontally so spawn is always at the origin.
+        p[:, 0:2] = 0.0
+        self._easy_pool_pos = p[ok].astype(np.float32)
+        self._easy_pool_quat = q[ok].astype(np.float32)
+        self._easy_pool_jpos = j[ok].astype(np.float32)
+        self._easy_pool_size = int(ok.sum())
+        print(f"[standup] easy pool built: {self._easy_pool_size} states "
+              f"(of {N} attempts) — used for reverse curriculum")
+
     # ── contact-link lookup (after scene.build) ───────────────────
 
     def _ensure_contact_links(self) -> None:
@@ -307,14 +390,41 @@ class K1StandupEnv(SkillEnv):
     # ── reset using the pool ──────────────────────────────────────
 
     def _reset_robot_pose(self, envs_idx: np.ndarray) -> None:
+        # Build pools on first reset (lazy — needs scene + robot ready).
+        # IMPORTANT: build the easy pool FIRST. Both builders set state
+        # across all envs and step physics, so the second build overwrites
+        # the first build's state — but only the FINAL state matters here
+        # because the snapshots have already been taken and stored.
         if self._pool_pos is None:
+            if self.cfg.easy_pool_enabled:
+                self._build_easy_pool()
             self._build_settle_pool()
 
         n = envs_idx.shape[0]
-        idx = self.rng.integers(0, self._pool_size, size=n)
-        pos = self._pool_pos[idx].copy()
-        quat = self._pool_quat[idx].copy()
-        jpos = self._pool_jpos[idx].copy()
+        # Reverse curriculum: pick a fraction of envs to start from the
+        # easy (near-standing) pool. Fraction ramps from 1.0 → 0.0 as
+        # training progresses; once curriculum ends, all starts are
+        # fallen (same as before).
+        easy_frac = self._current_easy_fraction()
+        use_easy = (self.rng.uniform(0.0, 1.0, size=n) < easy_frac) \
+                   & (self._easy_pool_size > 0)
+        n_easy = int(use_easy.sum())
+        n_hard = n - n_easy
+
+        pos = np.empty((n, 3), dtype=np.float32)
+        quat = np.empty((n, 4), dtype=np.float32)
+        jpos = np.empty((n, self.act_dim), dtype=np.float32)
+
+        if n_easy > 0:
+            ei = self.rng.integers(0, self._easy_pool_size, size=n_easy)
+            pos[use_easy] = self._easy_pool_pos[ei]
+            quat[use_easy] = self._easy_pool_quat[ei]
+            jpos[use_easy] = self._easy_pool_jpos[ei]
+        if n_hard > 0:
+            hi = self.rng.integers(0, self._pool_size, size=n_hard)
+            pos[~use_easy] = self._pool_pos[hi]
+            quat[~use_easy] = self._pool_quat[hi]
+            jpos[~use_easy] = self._pool_jpos[hi]
 
         # Small Gaussian joint jitter on top of the pool sample — adds
         # continuous variation across (pool_size × ∞) effective starts.
@@ -362,6 +472,16 @@ class K1StandupEnv(SkillEnv):
         p = self._curriculum_progress(c.threshold_curriculum_env_steps)
         return float(c.target_height_start
                      + (c.target_height - c.target_height_start) * p)
+
+    def _current_easy_fraction(self) -> float:
+        """Fraction of episodes that should start from the EASY (near-
+        standing) pool. 1.0 at env-step 0, ramping to 0.0 at the end of
+        the start curriculum. After that, all starts are fully fallen
+        — same distribution as before the reverse curriculum existed."""
+        if not self.cfg.easy_pool_enabled or self._easy_pool_size == 0:
+            return 0.0
+        p = self._curriculum_progress(self.cfg.start_curriculum_env_steps)
+        return float(1.0 - p)
 
     # ── reward + sustained-success bookkeeping ────────────────────
 
@@ -426,6 +546,7 @@ class K1StandupEnv(SkillEnv):
         components["hold_steps_current"] = float(hold_steps)
         components["upright_threshold_current"] = float(upright_thresh)
         components["target_height_current"] = float(target_h)
+        components["easy_start_fraction"] = float(self._current_easy_fraction())
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now
