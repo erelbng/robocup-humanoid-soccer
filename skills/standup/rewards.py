@@ -83,6 +83,16 @@ def action_jerk(action: np.ndarray, prev_action: np.ndarray,
 # ─── anti-gaming "stand on feet" signal ───────────────────────────────
 
 
+def _feet_grounded_score(foot_z: np.ndarray,
+                          foot_max_z: float) -> np.ndarray:
+    """Multiplicative AND of per-foot ground proximity in [0, 1]."""
+    foot_l = np.clip(1.0 - foot_z[:, 0] / max(foot_max_z, 1e-6),
+                     0.0, 1.0)
+    foot_r = np.clip(1.0 - foot_z[:, 1] / max(foot_max_z, 1e-6),
+                     0.0, 1.0)
+    return foot_l * foot_r
+
+
 def foot_grounded_up_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
                              foot_max_z: float = 0.10,
                              trunk_min_z: float = 0.30) -> np.ndarray:
@@ -93,16 +103,30 @@ def foot_grounded_up_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
     ground without putting feet down) all evaluate to ~0 here.
 
     Smooth ramps instead of hard step functions so PPO gets a gradient
-    toward the threshold even before satisfying it.
+    toward the threshold even before satisfying it. Saturates at
+    trunk_z ≥ trunk_min_z — see `standing_tall_signal` for the term
+    that continues past saturation.
     """
-    # Each foot: 1.0 when at the ground, 0 when at/above foot_max_z.
-    foot_l = np.clip(1.0 - foot_z[:, 0] / max(foot_max_z, 1e-6),
-                     0.0, 1.0)
-    foot_r = np.clip(1.0 - foot_z[:, 1] / max(foot_max_z, 1e-6),
-                     0.0, 1.0)
-    feet = foot_l * foot_r  # multiplicative AND
+    feet = _feet_grounded_score(foot_z, foot_max_z)
     # Trunk: 0 at z=0.10 (still essentially flat), 1 at z=trunk_min_z.
     trunk = np.clip((trunk_z - 0.10) / max(trunk_min_z - 0.10, 1e-6),
+                    0.0, 1.0)
+    return (feet * trunk).astype(np.float32)
+
+
+def standing_tall_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
+                          foot_max_z: float = 0.10,
+                          trunk_min_z: float = 0.30,
+                          trunk_max_z: float = 0.55) -> np.ndarray:
+    """Picks up where `foot_grounded_up` saturates: same feet-grounded
+    gate × trunk ramp in [trunk_min_z, trunk_max_z]. 0 at squat
+    (trunk_z = trunk_min_z), 1.0 at full standing height. Stacks
+    additively on top of foot_grounded_up so the squat reward isn't
+    altered, but full extension pays significantly more — pulls the
+    policy out of the squat local optimum without destabilising it."""
+    feet = _feet_grounded_score(foot_z, foot_max_z)
+    trunk = np.clip((trunk_z - trunk_min_z)
+                    / max(trunk_max_z - trunk_min_z, 1e-6),
                     0.0, 1.0)
     return (feet * trunk).astype(np.float32)
 
@@ -164,6 +188,8 @@ def compute_standup_reward(
     time_to_stand_tau_steps: float = 100.0,
     foot_grounded_max_z: float = 0.10,
     trunk_up_min_z: float = 0.30,
+    standing_tall_min_z: float = 0.30,
+    standing_tall_max_z: float = 0.55,
     control_dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Returns (reward[N], frame_success[N] bool, components_dict).
@@ -264,6 +290,12 @@ def compute_standup_reward(
         foot_max_z=foot_grounded_max_z,
         trunk_min_z=trunk_up_min_z,
     )
+    tall = standing_tall_signal(
+        foot_z, root_pos[:, 2],
+        foot_max_z=foot_grounded_max_z,
+        trunk_min_z=standing_tall_min_z,
+        trunk_max_z=standing_tall_max_z,
+    )
 
     w = weights
     r = (
@@ -281,6 +313,7 @@ def compute_standup_reward(
         + w.success_bonus * sustained_bonus
         + w.post_success_standing * post_success
         + w.foot_grounded_up * foot_up
+        + w.standing_tall * tall
     ).astype(np.float32)
 
     components = {
@@ -302,6 +335,7 @@ def compute_standup_reward(
         "achieved_sustained_rate": float(np.mean(achieved_sustained)),
         "post_success_standing": float(np.mean(post_success)),
         "foot_grounded_up": float(np.mean(foot_up)),
+        "standing_tall": float(np.mean(tall)),
         "mean_foot_z": float(np.mean(foot_z)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),
         "mean_robot_z": float(np.mean(root_pos[:, 2])),

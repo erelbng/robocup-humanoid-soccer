@@ -73,9 +73,17 @@ class StandupRewardWeights:
     # Smooth multiplicative gate (left_foot_proximity × right_foot_proximity
     # × trunk_lift_score) so PPO gets gradient toward the threshold even
     # before satisfying it. At a fallen pose: 0 (trunk down). At any
-    # bridge / sprawl: 0 (feet not grounded). At an actual standup:
-    # ~1.0 per step → 1250 over a 250-step episode, dominant signal.
+    # bridge / sprawl: 0 (feet not grounded). At a squat (trunk ≥ 0.30):
+    # saturated at ~1.0. Doesn't distinguish squat from full standing.
     foot_grounded_up: float = 5.0
+
+    # Continues where `foot_grounded_up` saturates. Same feet-grounded
+    # gate × trunk ramp on [0.30, 0.55] — 0 at squat, 1.0 at full stand
+    # height. Stacks ADDITIVELY on top of foot_grounded_up so the squat
+    # reward is unchanged (no destabilising regression), but full
+    # extension pays an extra ~5/step → ~1250 over the post-squat
+    # trajectory. Pulls the policy out of the squat local optimum.
+    standing_tall: float = 5.0
 
 
 @dataclass
@@ -149,6 +157,11 @@ class StandupConfig:
     # Thresholds for the `foot_grounded_up` anti-gaming reward.
     foot_grounded_max_z: float = 0.10          # feet "on ground" when z < this
     trunk_up_min_z: float = 0.30               # trunk "lifted" when z > this
+
+    # Thresholds for the `standing_tall` reward — pulls the policy from
+    # squat (trunk ~0.30) to full standing (trunk ~0.55).
+    standing_tall_min_z: float = 0.30          # signal starts ramping here
+    standing_tall_max_z: float = 0.55          # signal saturates at K1 standing height
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
     # τ=150 steps (3.0 s) keeps the bonus meaningful for realistic

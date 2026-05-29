@@ -75,7 +75,8 @@ distillation pipeline reads to size the student.
 | `success_persistence` | 5.0 | +5/step during the hold window |
 | `success_bonus` | 400.0 | One-shot pulse on streak completion, scaled `× exp(−t_first / 150)` (τ=3.0 s) — 1 s stand pays ~330, 2 s ~150, 3 s ~100 |
 | `post_success_standing` | 10.0 | +10/step for every frame still standing AFTER the episode's first sustained success. Episode runs to MAX_EPISODE_STEPS so a fast standup that falls forfeits ~1500–2000 of opportunity cost — the dominant gradient for "stand fast AND stay up" |
-| `foot_grounded_up` | 5.0 | Anti-gaming: pays only when BOTH feet z < `foot_grounded_max_z` (0.10 m) AND trunk z > `trunk_up_min_z` (0.30 m). Smooth multiplicative gate. Closes the bridge / shoulder-stand / sprawled-on-back local optima where the policy gets partial upright + height credit without putting feet on the floor. |
+| `foot_grounded_up` | 5.0 | Anti-gaming: pays only when BOTH feet z < `foot_grounded_max_z` (0.10 m) AND trunk z > `trunk_up_min_z` (0.30 m). Smooth multiplicative gate. Closes the bridge / shoulder-stand / sprawled-on-back local optima where the policy gets partial upright + height credit without putting feet on the floor. Saturates at the squat. |
+| `standing_tall` | 5.0 | Continues where `foot_grounded_up` saturates: same feet-grounded gate × trunk ramp on [`standing_tall_min_z`, `standing_tall_max_z`] = [0.30, 0.55]. 0 at squat, 1.0 at full K1 standing height. Stacks ADDITIVELY on top of `foot_grounded_up` so the squat reward is unchanged but full extension pays ~5/step extra (~1250 over the post-squat trajectory). Pulls the policy out of the squat local optimum. |
 
 All "gated" penalties are scaled by `near_upright_gate(up)` which ramps
 from 0 at up=0.7 to 1 at up=0.95. The intent: the recovery itself is
@@ -199,7 +200,9 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 8. **`rewards/foot_grounded_up`** / **`rewards/mean_foot_z`** — anti-gaming signal in [0, 1]. Should climb from 0 toward 1.0 as the policy learns to put feet down with trunk lifted. If it stays near 0 while `upright` and `height` rise, the policy is gaming the dense terms with a bridge / sprawled pose — exactly the failure this term is designed to close. `mean_foot_z` is the mean of both feet z; should drop toward `foot_grounded_max_z` (0.10) and stay there once standing.
 
-9. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
+9. **`rewards/standing_tall`** — full-extension signal in [0, 1]. Lags behind `foot_grounded_up` because it only kicks in past the squat (trunk_z > 0.30). Should climb later in training as the policy learns to extend out of the squat into full standing. If `foot_grounded_up` saturates high (~0.8+) but `standing_tall` stays near 0, the policy is stuck in the squat attractor — train longer or bump `standing_tall` weight to 8–10.
+
+10. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
 
 ---
 

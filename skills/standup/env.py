@@ -418,6 +418,8 @@ class K1StandupEnv(SkillEnv):
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
             foot_grounded_max_z=self.cfg.foot_grounded_max_z,
             trunk_up_min_z=self.cfg.trunk_up_min_z,
+            standing_tall_min_z=self.cfg.standing_tall_min_z,
+            standing_tall_max_z=self.cfg.standing_tall_max_z,
             control_dt=self.dt,
         )
 
