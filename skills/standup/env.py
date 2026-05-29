@@ -95,6 +95,9 @@ class K1StandupEnv(SkillEnv):
         self._sustained_now = np.zeros(self.num_envs, dtype=bool)
         self._prev_prev_action = np.tile(self._default_action,
                                           (self.num_envs, 1))
+        # Cumulative env-steps seen by the policy (sum over all parallel
+        # envs of every `step()` call). Drives the hold_steps curriculum.
+        self._total_env_steps_seen: int = 0
         # Upright signal from the previous step — used by the progress
         # reward term. Initialised to -1 (fully inverted) so the first
         # step from any fallen pose produces a positive Δup credit.
@@ -301,6 +304,21 @@ class K1StandupEnv(SkillEnv):
         except Exception as e:
             print(f"[standup] _reset_robot_pose failed: {e}")
 
+    # ── hold-steps curriculum ─────────────────────────────────────
+
+    def _current_hold_steps(self) -> int:
+        """Linear ramp from `success_hold_steps_start` → `success_hold_steps`
+        over `hold_curriculum_env_steps` cumulative env-steps. Lets the
+        policy bootstrap on a 0.3 s "looks standing" criterion (where
+        first-success is reachable inside a few M env-steps) and then
+        tightens to the full 1.0 s deployment criterion."""
+        c = self.cfg
+        end = int(c.success_hold_steps)
+        start = int(c.success_hold_steps_start)
+        horizon = max(int(c.hold_curriculum_env_steps), 1)
+        progress = min(self._total_env_steps_seen / horizon, 1.0)
+        return int(round(start + (end - start) * progress))
+
     # ── reward + sustained-success bookkeeping ────────────────────
 
     def _compute_skill_reward(self, action: np.ndarray):
@@ -314,6 +332,9 @@ class K1StandupEnv(SkillEnv):
         except Exception:
             return np.zeros(self.num_envs, dtype=np.float32), {}
 
+        self._total_env_steps_seen += self.num_envs
+        hold_steps = self._current_hold_steps()
+
         prev_streak = self._success_streak.copy()
         frame_now = success_frame_mask(
             root_quat, root_pos[:, 2],
@@ -321,8 +342,8 @@ class K1StandupEnv(SkillEnv):
             upright_threshold=self.cfg.upright_threshold,
         )
         new_streak = np.where(frame_now, prev_streak + 1, 0).astype(np.int32)
-        sustained_now = (new_streak == self.cfg.success_hold_steps) \
-                        & (prev_streak < self.cfg.success_hold_steps)
+        sustained_now = (new_streak == hold_steps) \
+                        & (prev_streak < hold_steps)
 
         reward, _frame_success, components = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
@@ -340,10 +361,12 @@ class K1StandupEnv(SkillEnv):
             default_joint_pos=self._default_action,
             target_height=self.cfg.target_height,
             upright_threshold=self.cfg.upright_threshold,
-            hold_steps=self.cfg.success_hold_steps,
+            hold_steps=hold_steps,
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
             control_dt=self.dt,
         )
+
+        components["hold_steps_current"] = float(hold_steps)
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now

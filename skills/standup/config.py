@@ -44,9 +44,10 @@ class StandupRewardWeights:
     action_jerk: float = 0.1           # (a - 2 a_{-1} + a_{-2})² — jitter
 
     # Speed signal — exactly one dense term + one terminal pulse.
-    # The bonus is steep: τ=40 steps (0.8 s) means a 0.5 s stand pays
-    # ~214 (0.54 × 400), a 1 s stand pays ~115, a 2 s stand pays ~33,
-    # a 3 s stand pays ~9. Sub-second standups become massively rewarded.
+    # Default τ=150 steps (3.0 s) keeps the bonus meaningful across the
+    # realistic standup time range: a 1 s stand pays ~330, a 2 s stand
+    # ~150, a 3 s stand ~100, a 4 s stand ~55. Sub-second standups still
+    # get the largest pulse but slow ones are no longer disqualified.
     time_penalty: float = 1.0          # per step until sustained-success
     success_bonus: float = 400.0       # paid on streak completion, scaled
                                        #   by exp(-t_first / tau)
@@ -96,13 +97,24 @@ class StandupConfig:
     # height conditions.
     target_height: float = 0.55
     upright_threshold: float = 0.92            # cosine ~23° tilt max
-    success_hold_steps: int = 50               # 1.0 s at 50 Hz
+    success_hold_steps: int = 50               # 1.0 s at 50 Hz — END of curriculum
+
+    # Curriculum on the hold-window length. Starts at `hold_start` (easier
+    # to register a success → policy can discover partial standups and
+    # bootstrap into the full motion) and ramps linearly to
+    # `success_hold_steps` over `hold_curriculum_env_steps` cumulative
+    # env-steps. Without this the 1.0 s requirement is so far from the
+    # initial policy's capability that the terminal bonus is effectively
+    # never paid → flat learning curve.
+    success_hold_steps_start: int = 15         # 0.3 s at 50 Hz
+    hold_curriculum_env_steps: int = 25_000_000
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
-    # τ=40 steps (0.8 s) gives a steep curve so sub-second standups
-    # dominate the return — see the explanatory comment on
-    # `success_bonus` above for example payouts.
-    time_to_stand_tau_steps: float = 40.0
+    # τ=150 steps (3.0 s) keeps the bonus meaningful for realistic
+    # standups: a 1 s standup pays ~330, a 2 s standup ~150, a 3 s
+    # standup ~100. The previous τ=40 (0.8 s) decayed so fast that
+    # 3 s standups paid only ~9 — less than the side-plank attractor.
+    time_to_stand_tau_steps: float = 150.0
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000

@@ -187,16 +187,20 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 6. **`rewards/near_upright_gate`** — average gate activation. Rises with `mean_robot_z`; useful to confirm motion penalties are actually firing once balancing is reached.
 
-7. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
+7. **`rewards/hold_steps_current`** — current hold-window length under the curriculum. Starts at 15 and ramps linearly to 50 over `hold_curriculum_env_steps` (default 25M). Use it to confirm the curriculum is advancing as expected.
+
+8. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
 
 ---
 
 ## Hyperparameters worth tuning (and ones not to)
 
 ### Don't touch unless you have a strong reason
-- `success_hold_steps=50` (1 s hold) — defines what "stable" means. Lowering it makes standups easier to mark successful but reduces deployment quality.
+- `success_hold_steps=50` (1 s hold) — defines what "stable" means at the **end** of the curriculum. Lowering it makes standups easier to mark successful but reduces deployment quality.
+- `success_hold_steps_start=15` (0.3 s) — initial criterion that ramps to `success_hold_steps` over `hold_curriculum_env_steps`. The curriculum lets the policy bootstrap on a discoverable target; without it the 1.0 s requirement is far enough from a fresh policy that the terminal bonus is effectively never paid.
+- `hold_curriculum_env_steps=25_000_000` — env-steps over which the hold criterion tightens. Tune up if you have plenty of compute (slower ramp = more time at the easy criterion), down if you want full strictness sooner.
 - `upright_threshold=0.92` (cos, ≈ 23° tilt) — defines what "upright" means.
-- `time_to_stand_tau_steps=40` (0.8 s) — sets the shape of the speed bonus.
+- `time_to_stand_tau_steps=150` (3.0 s) — sets the shape of the terminal speed bonus. With τ=150 a 1 s stand pays ~330, 2 s ~150, 3 s ~100. The previous τ=40 decayed so fast that 3 s standups paid only ~9, less than the side-plank attractor.
 - Settle-pool params (`spawn_height_*`, `settle_steps`, `settle_pool_rounds`) — already tuned to give ~120 diverse fallen states at `vec_num_envs=32` and ~3800 at 1024.
 
 ### Things you might reasonably tune
@@ -213,7 +217,7 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 Check `rewards/upright_progress`:
 - If it's near zero → the policy never moves upward. Either the reward gradient is too weak (bump `upright_progress` to 8–10) or exploration is too narrow (bump entropy to 0.01).
-- If it's positive but the policy isn't completing standups → it lurches forward in one step then falls back; lower `success_hold_steps` to 30 temporarily as a curriculum to give the policy partial credit, then raise it back.
+- If it's positive but the policy isn't completing standups → it lurches forward in one step then falls back. The hold-steps curriculum (start=15, ramp over 25M env-steps) already gives partial credit early; if you still see no `sustained_rate` rise by ~5M env-steps, lengthen the ramp (`hold_curriculum_env_steps`) or lower `success_hold_steps_start` to 10.
 
 ### "Training crashes during the settle-pool build"
 
