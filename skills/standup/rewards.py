@@ -80,6 +80,33 @@ def action_jerk(action: np.ndarray, prev_action: np.ndarray,
     return np.sum(second_diff ** 2, axis=1).astype(np.float32)
 
 
+# ─── anti-gaming "stand on feet" signal ───────────────────────────────
+
+
+def foot_grounded_up_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
+                             foot_max_z: float = 0.10,
+                             trunk_min_z: float = 0.30) -> np.ndarray:
+    """Smooth multiplicative gate in [0, 1] that pays only for the joint
+    condition "both feet on the floor AND trunk lifted". Forces the
+    policy to stand on its feet — bridge / shoulder-stand / sprawled
+    poses (which can game upright + height by lifting the trunk off the
+    ground without putting feet down) all evaluate to ~0 here.
+
+    Smooth ramps instead of hard step functions so PPO gets a gradient
+    toward the threshold even before satisfying it.
+    """
+    # Each foot: 1.0 when at the ground, 0 when at/above foot_max_z.
+    foot_l = np.clip(1.0 - foot_z[:, 0] / max(foot_max_z, 1e-6),
+                     0.0, 1.0)
+    foot_r = np.clip(1.0 - foot_z[:, 1] / max(foot_max_z, 1e-6),
+                     0.0, 1.0)
+    feet = foot_l * foot_r  # multiplicative AND
+    # Trunk: 0 at z=0.10 (still essentially flat), 1 at z=trunk_min_z.
+    trunk = np.clip((trunk_z - 0.10) / max(trunk_min_z - 0.10, 1e-6),
+                    0.0, 1.0)
+    return (feet * trunk).astype(np.float32)
+
+
 # ─── phase gating ─────────────────────────────────────────────────────
 
 
@@ -127,6 +154,7 @@ def compute_standup_reward(
     sustained_now: np.ndarray,       # (N,) bool — streak reached threshold this step
     achieved_sustained: np.ndarray,  # (N,) bool — streak has reached threshold at some point this episode
     step_count: np.ndarray,          # (N,) int — control steps since reset
+    foot_z: np.ndarray,              # (N, 2) world-frame z of left/right foot
     weights,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
     default_joint_pos: np.ndarray = None,
@@ -134,6 +162,8 @@ def compute_standup_reward(
     upright_threshold: float = 0.92,
     hold_steps: int = 30,
     time_to_stand_tau_steps: float = 100.0,
+    foot_grounded_max_z: float = 0.10,
+    trunk_up_min_z: float = 0.30,
     control_dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Returns (reward[N], frame_success[N] bool, components_dict).
@@ -223,6 +253,18 @@ def compute_standup_reward(
     # forfeits all of it — exactly the "fast AND stable" pressure we want.
     post_success = (achieved_sustained & frame_success).astype(np.float32)
 
+    # Anti-gaming "stand on feet" reward — only pays for the joint
+    # condition (both feet grounded AND trunk lifted). Closes the bridge
+    # / shoulder-stand / sprawled-on-back local optima where the policy
+    # gets partial upright + height credit without putting its feet on
+    # the floor. Smooth multiplicative gate provides gradient toward the
+    # threshold even before satisfying it.
+    foot_up = foot_grounded_up_signal(
+        foot_z, root_pos[:, 2],
+        foot_max_z=foot_grounded_max_z,
+        trunk_min_z=trunk_up_min_z,
+    )
+
     w = weights
     r = (
         w.upright * up_pos
@@ -238,6 +280,7 @@ def compute_standup_reward(
         - w.time_penalty * time_pen
         + w.success_bonus * sustained_bonus
         + w.post_success_standing * post_success
+        + w.foot_grounded_up * foot_up
     ).astype(np.float32)
 
     components = {
@@ -258,6 +301,8 @@ def compute_standup_reward(
         "sustained_rate": float(np.mean(sustained_now)),
         "achieved_sustained_rate": float(np.mean(achieved_sustained)),
         "post_success_standing": float(np.mean(post_success)),
+        "foot_grounded_up": float(np.mean(foot_up)),
+        "mean_foot_z": float(np.mean(foot_z)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),
         "mean_robot_z": float(np.mean(root_pos[:, 2])),
         "mean_reward": float(np.mean(r)),

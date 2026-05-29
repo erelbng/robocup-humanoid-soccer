@@ -75,6 +75,7 @@ distillation pipeline reads to size the student.
 | `success_persistence` | 5.0 | +5/step during the hold window |
 | `success_bonus` | 400.0 | One-shot pulse on streak completion, scaled `× exp(−t_first / 150)` (τ=3.0 s) — 1 s stand pays ~330, 2 s ~150, 3 s ~100 |
 | `post_success_standing` | 10.0 | +10/step for every frame still standing AFTER the episode's first sustained success. Episode runs to MAX_EPISODE_STEPS so a fast standup that falls forfeits ~1500–2000 of opportunity cost — the dominant gradient for "stand fast AND stay up" |
+| `foot_grounded_up` | 5.0 | Anti-gaming: pays only when BOTH feet z < `foot_grounded_max_z` (0.10 m) AND trunk z > `trunk_up_min_z` (0.30 m). Smooth multiplicative gate. Closes the bridge / shoulder-stand / sprawled-on-back local optima where the policy gets partial upright + height credit without putting feet on the floor. |
 
 All "gated" penalties are scaled by `near_upright_gate(up)` which ramps
 from 0 at up=0.7 to 1 at up=0.95. The intent: the recovery itself is
@@ -196,7 +197,9 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** — the three curriculum knobs. Should ramp linearly 15→50, 0.80→0.92, and 0.40→0.55 over the first ~25M env-steps. Use them to confirm the curricula are advancing as expected.
 
-8. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
+8. **`rewards/foot_grounded_up`** / **`rewards/mean_foot_z`** — anti-gaming signal in [0, 1]. Should climb from 0 toward 1.0 as the policy learns to put feet down with trunk lifted. If it stays near 0 while `upright` and `height` rise, the policy is gaming the dense terms with a bridge / sprawled pose — exactly the failure this term is designed to close. `mean_foot_z` is the mean of both feet z; should drop toward `foot_grounded_max_z` (0.10) and stay there once standing.
+
+9. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
 
 ---
 

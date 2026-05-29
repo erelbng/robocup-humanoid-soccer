@@ -286,6 +286,24 @@ class K1StandupEnv(SkillEnv):
             return np.zeros((self.num_envs, 0), dtype=np.float32)
         return self._read_contact_state()
 
+    def _read_foot_z(self) -> np.ndarray:
+        """Return (N, 2) world-frame z of left and right foot. Used by
+        the `foot_grounded_up` reward term regardless of `proprio_only`
+        — reward signals can use privileged data; only the policy obs
+        respects the proprio constraint."""
+        N = self.num_envs
+        if self._foot_links is None:
+            self._ensure_contact_links()
+        out = np.zeros((N, 2), dtype=np.float32)
+        if self._foot_links is None:
+            return out
+        try:
+            out[:, 0] = _to_np(self._foot_links[0].get_pos())[:, 2]
+            out[:, 1] = _to_np(self._foot_links[1].get_pos())[:, 2]
+        except Exception as e:
+            print(f"[standup] foot z read failed: {e}")
+        return out
+
     # ── reset using the pool ──────────────────────────────────────
 
     def _reset_robot_pose(self, envs_idx: np.ndarray) -> None:
@@ -355,6 +373,7 @@ class K1StandupEnv(SkillEnv):
             root_ang_vel = _to_np(self.robot.get_ang())
             jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
+            foot_z = self._read_foot_z()
         except Exception:
             return np.zeros(self.num_envs, dtype=np.float32), {}
 
@@ -389,6 +408,7 @@ class K1StandupEnv(SkillEnv):
             sustained_now=sustained_now,
             achieved_sustained=achieved_sustained,
             step_count=self.step_count,
+            foot_z=foot_z,
             weights=self.cfg.rewards,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
             default_joint_pos=self._default_action,
@@ -396,6 +416,8 @@ class K1StandupEnv(SkillEnv):
             upright_threshold=upright_thresh,
             hold_steps=hold_steps,
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
+            foot_grounded_max_z=self.cfg.foot_grounded_max_z,
+            trunk_up_min_z=self.cfg.trunk_up_min_z,
             control_dt=self.dt,
         )
 

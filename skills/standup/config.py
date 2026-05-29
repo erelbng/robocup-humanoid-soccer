@@ -66,6 +66,17 @@ class StandupRewardWeights:
     # of post-success reward, easily dominating any other term).
     post_success_standing: float = 10.0
 
+    # Anti-gaming term — pays only when BOTH feet are on the ground AND
+    # the trunk is lifted. Closes the local-optima loophole where the
+    # policy gets partial upright/height credit from bridge / shoulder-
+    # stand / sprawled poses that never touch its feet to the floor.
+    # Smooth multiplicative gate (left_foot_proximity × right_foot_proximity
+    # × trunk_lift_score) so PPO gets gradient toward the threshold even
+    # before satisfying it. At a fallen pose: 0 (trunk down). At any
+    # bridge / sprawl: 0 (feet not grounded). At an actual standup:
+    # ~1.0 per step → 1250 over a 250-step episode, dominant signal.
+    foot_grounded_up: float = 5.0
+
 
 @dataclass
 class StandupConfig:
@@ -134,6 +145,10 @@ class StandupConfig:
     upright_threshold_start: float = 0.80      # cosine ~37° tilt — kneel-ish
     target_height_start: float = 0.40          # frame_success at z > 0.30
     threshold_curriculum_env_steps: int = 25_000_000
+
+    # Thresholds for the `foot_grounded_up` anti-gaming reward.
+    foot_grounded_max_z: float = 0.10          # feet "on ground" when z < this
+    trunk_up_min_z: float = 0.30               # trunk "lifted" when z > this
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
     # τ=150 steps (3.0 s) keeps the bonus meaningful for realistic
