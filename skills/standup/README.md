@@ -75,8 +75,8 @@ distillation pipeline reads to size the student.
 | `success_persistence` | 5.0 | +5/step during the hold window |
 | `success_bonus` | 400.0 | One-shot pulse on streak completion, scaled `× exp(−t_first / 150)` (τ=3.0 s) — 1 s stand pays ~330, 2 s ~150, 3 s ~100 |
 | `post_success_standing` | 10.0 | +10/step for every frame still standing AFTER the episode's first sustained success. Episode runs to MAX_EPISODE_STEPS so a fast standup that falls forfeits ~1500–2000 of opportunity cost — the dominant gradient for "stand fast AND stay up" |
-| `foot_grounded_up` | 5.0 | Anti-gaming: pays only when BOTH feet z < `foot_grounded_max_z` (0.10 m) AND trunk z > `trunk_up_min_z` (0.30 m). Smooth multiplicative gate. Closes the bridge / shoulder-stand / sprawled-on-back local optima where the policy gets partial upright + height credit without putting feet on the floor. Saturates at the squat. |
-| `standing_tall` | 5.0 | Continues where `foot_grounded_up` saturates: same feet-grounded gate × trunk ramp on [`standing_tall_min_z`, `standing_tall_max_z`] = [0.30, 0.55]. 0 at squat, 1.0 at full K1 standing height. Stacks ADDITIVELY on top of `foot_grounded_up` so the squat reward is unchanged but full extension pays ~5/step extra (~1250 over the post-squat trajectory). Pulls the policy out of the squat local optimum. |
+| `foot_grounded_up` | 5.0 | Anti-gaming: pays only when BOTH feet z < `foot_grounded_max_z` (0.10 m) AND trunk z > `trunk_up_min_z` (0.30 m) AND the trunk is roughly vertical. Smooth multiplicative gate (`feet × trunk_lift × max(0, cos(tilt))`). Closes the bridge / shoulder-stand / sprawled-on-back AND side-plank local optima — anything that's not actually standing on its feet evaluates to ~0 here. Saturates at the squat. |
+| `standing_tall` | 5.0 | Continues where `foot_grounded_up` saturates: same feet-grounded × upright gate × trunk ramp on [`standing_tall_min_z`, `standing_tall_max_z`] = [0.30, 0.55]. 0 at squat, 1.0 at full K1 standing height. Stacks ADDITIVELY on top of `foot_grounded_up` so the squat reward is unchanged but full extension pays ~5/step extra (~1250 over the post-squat trajectory). Pulls the policy out of the squat local optimum. Like `foot_grounded_up`, gated by orientation so a side-plank can't game it. |
 
 All "gated" penalties are scaled by `near_upright_gate(up)` which ramps
 from 0 at up=0.7 to 1 at up=0.95. The intent: the recovery itself is
@@ -232,7 +232,18 @@ Three independent curricula tighten the success criteria from "reachable from a 
 
 ## Troubleshooting
 
-### "The policy is stuck at side-plank / lying still"
+### "The policy is stuck at side-plank (body horizontal but elevated, one arm propping it up)"
+
+The `foot_grounded_up` and `standing_tall` rewards both include an `upright_factor = max(0, cos(tilt))` multiplier so side-plank earns only ~half of what a vertical stand would earn from these terms. If the policy still converges here, the gate may be too gentle for your DR / spawn distribution — switch to a sharper ramp:
+
+```python
+# In _upright_factor (skills/standup/rewards.py)
+return np.clip((upright - 0.5) / 0.5, 0.0, 1.0).astype(np.float32)
+```
+
+This zeroes out the term entirely for any pose with cos(tilt) < 0.5 (~60° tilt) and gives full credit only when nearly vertical.
+
+### "The policy is stuck at side-plank / lying still" (legacy diagnosis)
 
 Check `rewards/upright_progress` AND `rewards/mean_robot_z`:
 - If `upright_progress` rises early then **decays back toward 0** AND `mean_robot_z` plateaus below ~0.3 → the policy is stuck in a sit/kneel partial pose. The threshold curricula are designed to break this: at t=0 the policy can succeed at z>0.30, up>0.80 (reachable from a kneel). If you still see no `frame_success_rate` rise by ~5M env-steps, lower `target_height_start` to 0.30 or `upright_threshold_start` to 0.75.

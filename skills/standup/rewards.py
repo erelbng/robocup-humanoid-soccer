@@ -93,14 +93,32 @@ def _feet_grounded_score(foot_z: np.ndarray,
     return foot_l * foot_r
 
 
+def _upright_factor(upright: np.ndarray) -> np.ndarray:
+    """Orientation gate in [0, 1] for the stand-on-feet rewards.
+
+    Without this gate, both `foot_grounded_up` and `standing_tall` would
+    pay full reward to a SIDE-PLANK pose — feet on the floor, trunk
+    elevated by a propping arm, but trunk horizontal rather than
+    vertical. The terms ONLY check scalar trunk z; they have no notion
+    of orientation. Multiplying by max(0, cos(tilt)) makes "stand on
+    feet" rewards proportional to how vertical the trunk is, so a
+    side-plank (up≈0.5) earns half credit and a full stand (up=1.0)
+    earns full credit.
+    """
+    return np.clip(upright, 0.0, 1.0).astype(np.float32)
+
+
 def foot_grounded_up_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
+                             upright: np.ndarray,
                              foot_max_z: float = 0.10,
                              trunk_min_z: float = 0.30) -> np.ndarray:
     """Smooth multiplicative gate in [0, 1] that pays only for the joint
-    condition "both feet on the floor AND trunk lifted". Forces the
-    policy to stand on its feet — bridge / shoulder-stand / sprawled
-    poses (which can game upright + height by lifting the trunk off the
-    ground without putting feet down) all evaluate to ~0 here.
+    condition "both feet on the floor AND trunk lifted AND trunk
+    vertical". Forces the policy to stand on its feet — bridge /
+    shoulder-stand / sprawled / side-plank poses (which can game
+    upright + height by lifting the trunk off the ground without
+    putting feet down OR by lying horizontally while propped up) all
+    evaluate to ~0 here.
 
     Smooth ramps instead of hard step functions so PPO gets a gradient
     toward the threshold even before satisfying it. Saturates at
@@ -111,24 +129,27 @@ def foot_grounded_up_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
     # Trunk: 0 at z=0.10 (still essentially flat), 1 at z=trunk_min_z.
     trunk = np.clip((trunk_z - 0.10) / max(trunk_min_z - 0.10, 1e-6),
                     0.0, 1.0)
-    return (feet * trunk).astype(np.float32)
+    return (feet * trunk * _upright_factor(upright)).astype(np.float32)
 
 
 def standing_tall_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
+                          upright: np.ndarray,
                           foot_max_z: float = 0.10,
                           trunk_min_z: float = 0.30,
                           trunk_max_z: float = 0.55) -> np.ndarray:
     """Picks up where `foot_grounded_up` saturates: same feet-grounded
-    gate × trunk ramp in [trunk_min_z, trunk_max_z]. 0 at squat
-    (trunk_z = trunk_min_z), 1.0 at full standing height. Stacks
-    additively on top of foot_grounded_up so the squat reward isn't
-    altered, but full extension pays significantly more — pulls the
-    policy out of the squat local optimum without destabilising it."""
+    gate × trunk ramp in [trunk_min_z, trunk_max_z] × upright_factor. 0
+    at squat (trunk_z = trunk_min_z), 1.0 at full standing height.
+    Stacks additively on top of foot_grounded_up so the squat reward
+    isn't altered, but full extension pays significantly more — pulls
+    the policy out of the squat local optimum without destabilising it.
+    Like `foot_grounded_up`, gated by trunk orientation so a side-plank
+    pose can't game it."""
     feet = _feet_grounded_score(foot_z, foot_max_z)
     trunk = np.clip((trunk_z - trunk_min_z)
                     / max(trunk_max_z - trunk_min_z, 1e-6),
                     0.0, 1.0)
-    return (feet * trunk).astype(np.float32)
+    return (feet * trunk * _upright_factor(upright)).astype(np.float32)
 
 
 # ─── phase gating ─────────────────────────────────────────────────────
@@ -286,12 +307,12 @@ def compute_standup_reward(
     # the floor. Smooth multiplicative gate provides gradient toward the
     # threshold even before satisfying it.
     foot_up = foot_grounded_up_signal(
-        foot_z, root_pos[:, 2],
+        foot_z, root_pos[:, 2], up,
         foot_max_z=foot_grounded_max_z,
         trunk_min_z=trunk_up_min_z,
     )
     tall = standing_tall_signal(
-        foot_z, root_pos[:, 2],
+        foot_z, root_pos[:, 2], up,
         foot_max_z=foot_grounded_max_z,
         trunk_min_z=standing_tall_min_z,
         trunk_max_z=standing_tall_max_z,
