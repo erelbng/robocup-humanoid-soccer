@@ -73,7 +73,8 @@ distillation pipeline reads to size the student.
 | `action_jerk` | 0.1 | (Δ²a)², gated |
 | `time_penalty` | 1.0 | Dense −1/step until sustained-success |
 | `success_persistence` | 5.0 | +5/step during the hold window |
-| `success_bonus` | 400.0 | Terminal, scaled `× exp(−t_first / 40)` (τ=0.8 s) — 0.5 s stand pays ~214, 2 s pays ~33 |
+| `success_bonus` | 400.0 | One-shot pulse on streak completion, scaled `× exp(−t_first / 150)` (τ=3.0 s) — 1 s stand pays ~330, 2 s ~150, 3 s ~100 |
+| `post_success_standing` | 10.0 | +10/step for every frame still standing AFTER the episode's first sustained success. Episode runs to MAX_EPISODE_STEPS so a fast standup that falls forfeits ~1500–2000 of opportunity cost — the dominant gradient for "stand fast AND stay up" |
 
 All "gated" penalties are scaled by `near_upright_gate(up)` which ramps
 from 0 at up=0.7 to 1 at up=0.95. The intent: the recovery itself is
@@ -174,14 +175,20 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 1. **`rewards/upright_progress`** — average `max(0, Δup)` per step. Should be **clearly positive and rising** in the first ~5M env-steps. If it stays near zero, the policy is stuck in a stable basin (lying still, side-plank). This is the canary for the side-plank failure mode.
 
-2. **`rewards/sustained_rate`** — fraction of envs that completed a sustained-success this iteration. Should start at zero and ramp to 0.5+ as standup becomes reliable.
+2. **`rewards/sustained_rate`** — fraction of envs that completed a sustained-success this iteration (the one-step pulse). Should start at zero and ramp to ~0.01 with the curriculum, then settle: because envs no longer terminate on success, sustained_now fires AT MOST ONCE per episode, so high success rates show up as `achieved_sustained_rate ≈ 1.0` with a much smaller `sustained_rate` (sustained_now / episode_length).
+
+   **`rewards/achieved_sustained_rate`** — fraction of envs that have completed at least one sustained success this episode. This is the better signal once the curriculum starts paying off: should climb from 0 → 0.5+ → 1.0 as the policy reliably stands up. If it tops out below 0.8 the policy is failing on a subset of fallen poses.
+
+   **`rewards/post_success_standing`** — average per-step "still standing after success" fraction. Climbs as `achieved_sustained_rate` × (post-success fraction of the episode spent upright). The single most informative scalar for "robot stood up AND stayed up".
 
 3. **`rewards/mean_robot_z`** — average trunk height across envs. Useful smoke-check: should rise from ~0.15 (fallen pool average) toward 0.55 (target standing).
 
-4. **`mean_reward`** / **`R̄`** — per-episode total. Should climb monotonically once `upright_progress` and `sustained_rate` are moving. Numerical landmarks:
+4. **`mean_reward`** / **`R̄`** — per-episode total. Should climb monotonically once `upright_progress` and `achieved_sustained_rate` are moving. Numerical landmarks with the post-success standing reward:
    - Pool-start "lie still" baseline: ~−500 to −650 per episode.
    - Side-plank attractor (if you hit it): ~+200 to +500.
-   - First successful standups: ~+1500 to +2500 (depending on speed).
+   - First successful standups (1 s held, then collapse): ~+500 to +900 — bonus paid but most post-success steps forfeited.
+   - Fast-and-stable standup (1.5 s to upright, holds the rest of the 5 s episode): ~+2000 to +2500.
+   - Sub-second standup that holds: ~+2500 to +3000.
 
 5. **`rewards/arm_pose_dev`** — average arm displacement². Should plateau low (~0.5–2.0) once the policy has converged; spikes above ~5 indicate the policy is leaning hard on arms.
 

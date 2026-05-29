@@ -53,6 +53,16 @@ class StandupRewardWeights:
                                        #   by exp(-t_first / tau)
     success_persistence: float = 5.0   # per step while in the hold window
 
+    # Post-success standing reward. The env does NOT terminate on
+    # sustained success — episodes run to the full MAX_EPISODE_STEPS so
+    # the robot must prove it can keep standing after the bonus is paid.
+    # Each frame after success where frame_success is still True earns
+    # this reward; falling back over forfeits the rest of the episode
+    # (no termination penalty, but the opportunity cost is huge — a
+    # 5 s episode with a 1.5 s standup yields ~175 steps × 10 = 1750
+    # of post-success reward, easily dominating any other term).
+    post_success_standing: float = 10.0
+
 
 @dataclass
 class StandupConfig:

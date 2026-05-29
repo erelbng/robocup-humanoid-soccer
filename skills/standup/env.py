@@ -11,10 +11,14 @@ Subclasses `SkillEnv` with:
     enter the training distribution). Every subsequent reset samples
     uniformly from this pool — no scene.step needed mid-rollout, which
     would desynchronise the other envs.
-  * Reward: speed (dense time penalty + time-scaled terminal bonus) +
-    stability cluster (sway, jerk, drift, quiet, gravity, smooth).
-  * Termination: SUSTAINED success — N consecutive 'looks standing'
-    frames before episode ends, OR timeout.
+  * Reward: speed (dense time penalty + time-scaled terminal bonus on
+    streak completion) + post-success standing reward (paid for every
+    later frame the robot stays upright) + stability cluster (sway,
+    jerk, drift, quiet, smooth) — all gated near upright.
+  * Termination: timeout ONLY. Episodes run the full MAX_EPISODE_STEPS
+    so the policy must prove sustained stability AFTER the success
+    bonus is paid; collapsing right after success forfeits the entire
+    post-success standing reward.
 """
 
 from __future__ import annotations
@@ -93,6 +97,12 @@ class K1StandupEnv(SkillEnv):
         self._frame_success = np.zeros(self.num_envs, dtype=bool)
         self._success_streak = np.zeros(self.num_envs, dtype=np.int32)
         self._sustained_now = np.zeros(self.num_envs, dtype=bool)
+        # Latches True once sustained_now fires; stays True until the
+        # episode resets. Gates the post-success standing reward so the
+        # robot only earns it AFTER it has proven it can hit the hold
+        # window — preventing accidental "stood for a few frames then
+        # collapsed" trajectories from collecting the same reward.
+        self._achieved_sustained = np.zeros(self.num_envs, dtype=bool)
         self._prev_prev_action = np.tile(self._default_action,
                                           (self.num_envs, 1))
         # Cumulative env-steps seen by the policy (sum over all parallel
@@ -344,6 +354,10 @@ class K1StandupEnv(SkillEnv):
         new_streak = np.where(frame_now, prev_streak + 1, 0).astype(np.int32)
         sustained_now = (new_streak == hold_steps) \
                         & (prev_streak < hold_steps)
+        # Latch: once an env has hit sustained success this episode, the
+        # post-success standing reward is unlocked for every later frame
+        # the robot stays upright. Cleared by _reset_skill_state.
+        achieved_sustained = self._achieved_sustained | sustained_now
 
         reward, _frame_success, components = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
@@ -355,6 +369,7 @@ class K1StandupEnv(SkillEnv):
             prev_upright=self._prev_upright,
             success_streak=new_streak,
             sustained_now=sustained_now,
+            achieved_sustained=achieved_sustained,
             step_count=self.step_count,
             weights=self.cfg.rewards,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
@@ -370,16 +385,25 @@ class K1StandupEnv(SkillEnv):
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now
+        self._achieved_sustained = achieved_sustained
         self._frame_success = frame_now
         self._prev_prev_action = self._last_action.copy()
         self._prev_upright = upright_signal(root_quat).astype(np.float32)
         return reward, components
 
-    # ── termination: sustained success OR timeout ─────────────────
+    # ── termination: timeout only ─────────────────────────────────
+    #
+    # The episode does NOT end at sustained success. Letting it run to
+    # MAX_EPISODE_STEPS forces the policy to demonstrate that it can
+    # KEEP standing after the bonus is paid — a fast-but-unstable
+    # standup that collapses immediately gives up all of the
+    # `post_success_standing` reward for the remaining frames. With a
+    # 5 s episode and a 1.5 s standup, that's ~175 frames × 10 = 1750
+    # of opportunity cost, dwarfing every other term.
 
     def _check_skill_done(self) -> np.ndarray:
         timeout = self.step_count >= self.MAX_EPISODE_STEPS
-        return (timeout | self._sustained_now)
+        return timeout
 
     # ── reset hook clears all per-env reward state ────────────────
 
@@ -387,6 +411,7 @@ class K1StandupEnv(SkillEnv):
         self._frame_success[envs_idx] = False
         self._success_streak[envs_idx] = 0
         self._sustained_now[envs_idx] = False
+        self._achieved_sustained[envs_idx] = False
         self._prev_prev_action[envs_idx] = self._default_action
         # Initialise prev_upright from the just-reset robot's actual
         # orientation, so the first-step progress reward is 0 instead of

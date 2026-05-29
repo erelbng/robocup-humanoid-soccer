@@ -125,6 +125,7 @@ def compute_standup_reward(
     prev_upright: np.ndarray,        # (N,) upright_signal from last step
     success_streak: np.ndarray,      # (N,) int — consecutive success-frames
     sustained_now: np.ndarray,       # (N,) bool — streak reached threshold this step
+    achieved_sustained: np.ndarray,  # (N,) bool — streak has reached threshold at some point this episode
     step_count: np.ndarray,          # (N,) int — control steps since reset
     weights,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
@@ -212,6 +213,16 @@ def compute_standup_reward(
         -t_first.astype(np.float32) / max(time_to_stand_tau_steps, 1e-6))
     sustained_bonus = sustained_now.astype(np.float32) * time_bonus_scale
 
+    # Post-success standing reward — only credited AFTER the robot has
+    # achieved a sustained success in this episode AND is still upright
+    # this frame. The episode runs to MAX_EPISODE_STEPS so this dominates
+    # the return for a fast-and-stable standup: a 1.5 s standup on a 5 s
+    # episode earns ~175 frames × w.post_success_standing of standing
+    # reward, which is much larger than the terminal speed bonus. A
+    # fast-but-unstable standup that collapses immediately after success
+    # forfeits all of it — exactly the "fast AND stable" pressure we want.
+    post_success = (achieved_sustained & frame_success).astype(np.float32)
+
     w = weights
     r = (
         w.upright * up_pos
@@ -226,6 +237,7 @@ def compute_standup_reward(
         + w.success_persistence * persistence
         - w.time_penalty * time_pen
         + w.success_bonus * sustained_bonus
+        + w.post_success_standing * post_success
     ).astype(np.float32)
 
     components = {
@@ -244,6 +256,8 @@ def compute_standup_reward(
         "hold_streak_mean": float(np.mean(success_streak)),
         "frame_success_rate": float(np.mean(frame_success)),
         "sustained_rate": float(np.mean(sustained_now)),
+        "achieved_sustained_rate": float(np.mean(achieved_sustained)),
+        "post_success_standing": float(np.mean(post_success)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),
         "mean_robot_z": float(np.mean(root_pos[:, 2])),
         "mean_reward": float(np.mean(r)),
