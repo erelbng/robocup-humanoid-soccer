@@ -297,6 +297,14 @@ class SkillEnv(ABC):
             except Exception:
                 continue
 
+    def _assist_wrench(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Optional skill-provided external wrench on the base, summed on
+        top of the push-DR wrench in `step()`. Used by the standup skill
+        for a decaying upward "support" force (force curriculum). Returns
+        (force[N,3], torque[N,3]) in world frame. Default: zeros."""
+        return (np.zeros((self.num_envs, 3), dtype=np.float32),
+                np.zeros((self.num_envs, 3), dtype=np.float32))
+
     def _check_skill_done(self) -> np.ndarray:
         """Default termination: timeout + trunk fell below FALL_TERMINATE_Z."""
         pos = _to_np(self.robot.get_pos())
@@ -532,16 +540,25 @@ class SkillEnv(ABC):
         except Exception:
             pass
 
-        # Random base perturbations (push DR). Best-effort: applies
-        # external force/torque to the robot's base link via Genesis'
-        # external-wrench API where available. Different Genesis builds
-        # name this differently, so we try a few common signatures and
-        # silently skip if none match — the perturbation just becomes
-        # a no-op rather than a crash.
+        # External base wrenches: push perturbations (push DR) + an
+        # optional skill-provided assist (standup's decaying upward
+        # support force). Summed and applied in a SINGLE call — some
+        # Genesis external-force APIs overwrite rather than accumulate, so
+        # two separate calls would clobber each other. Best-effort: the
+        # external-wrench API differs across Genesis builds, so
+        # `_apply_base_wrench` tries a few signatures and silently skips
+        # if none match (perturbation/assist becomes a no-op, not a crash).
+        total_force = np.zeros((self.num_envs, 3), dtype=np.float32)
+        total_torque = np.zeros((self.num_envs, 3), dtype=np.float32)
         if self._push_scheduler is not None:
-            force, torque = self._push_scheduler.step()
-            if np.any(force) or np.any(torque):
-                self._apply_base_wrench(force, torque)
+            pf, pt = self._push_scheduler.step()
+            total_force += np.asarray(pf, dtype=np.float32)
+            total_torque += np.asarray(pt, dtype=np.float32)
+        af, at = self._assist_wrench()
+        total_force += np.asarray(af, dtype=np.float32)
+        total_torque += np.asarray(at, dtype=np.float32)
+        if np.any(total_force) or np.any(total_torque):
+            self._apply_base_wrench(total_force, total_torque)
 
         for _ in range(self.action_repeat):
             self.scene.step()

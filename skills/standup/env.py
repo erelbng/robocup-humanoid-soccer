@@ -29,7 +29,7 @@ import numpy as np
 
 from skills.base import CommandSpec, SkillEnv
 from skills.common_obs import _to_np
-from skills.standup.config import StandupConfig
+from skills.standup.config import StandupConfig, discovery_weights
 from skills.standup.rewards import (compute_standup_reward, success_frame_mask,
                                      upright_signal)
 
@@ -141,9 +141,28 @@ class K1StandupEnv(SkillEnv):
         # step from any fallen pose produces a positive Δup credit.
         self._prev_upright = -np.ones(self.num_envs, dtype=np.float32)
 
+        # Mean assist force applied last step (N) — for logging.
+        self._last_assist_force_mean: float = 0.0
+
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
         self._hand_links = None
+
+        # Reward weights for the active stage. "discovery" zeroes the motion
+        # regularizers so the policy can find ANY standup; "deploy" uses the
+        # full set for a smooth, deployable motion.
+        if self.cfg.reward_stage == "discovery":
+            self._reward_weights = discovery_weights(self.cfg.rewards)
+            print("[standup] reward_stage=discovery — motion regularizers "
+                  "zeroed (upright/height/progress/feet/speed only)")
+        else:
+            self._reward_weights = self.cfg.rewards
+            print("[standup] reward_stage=deploy — full reward weight set")
+
+        if self.cfg.assist_force_enabled:
+            print(f"[standup] assist-force curriculum ON: up to "
+                  f"{self.cfg.assist_force_max:.0f} N, decaying over "
+                  f"{self.cfg.assist_curriculum_env_steps:,} env-steps")
 
         self.cfg.obs_dim = self.obs_dim
         self.cfg.act_dim = self.act_dim
@@ -499,6 +518,56 @@ class K1StandupEnv(SkillEnv):
             return max(time_frac, self.cfg.start_curriculum_min_easy_frac)
         return time_frac
 
+    def _current_assist_fraction(self) -> float:
+        """Fraction (1.0 → 0.0) of the peak assist force currently applied.
+
+        Time-based linear decay over `assist_curriculum_env_steps`, gated
+        on performance: while the EMA frame-success rate is below
+        `assist_min_success`, the fraction is held at `assist_min_frac` so
+        the support isn't pulled out from under a still-failing policy.
+        Mirrors `_current_easy_fraction`'s gate."""
+        if not self.cfg.assist_force_enabled:
+            return 0.0
+        p = self._curriculum_progress(self.cfg.assist_curriculum_env_steps)
+        time_frac = float(1.0 - p)
+        if self._success_rate_ema < self.cfg.assist_min_success:
+            return max(time_frac, self.cfg.assist_min_frac)
+        return time_frac
+
+    # ── assistive upward force (force curriculum) ─────────────────
+    #
+    # Decaying world-frame upward force on the trunk — the HoST "help an
+    # infant stand" trick. Summed onto the push-DR wrench by the base
+    # `step()` via the `_assist_wrench` hook, applied BEFORE scene.step.
+
+    def _assist_wrench(self):
+        zeros = np.zeros((self.num_envs, 3), dtype=np.float32)
+        frac = self._current_assist_fraction()
+        if frac <= 0.0:
+            self._last_assist_force_mean = 0.0
+            return zeros, zeros
+
+        try:
+            z = _to_np(self.robot.get_pos())[:, 2]
+        except Exception:
+            self._last_assist_force_mean = 0.0
+            return zeros, zeros
+
+        peak = self.cfg.assist_force_max
+        if self.cfg.assist_spring_shape:
+            # Strongest when fully fallen, releasing to ~0 near standing.
+            target = self.cfg.target_height
+            deficit = np.clip((target - z) / max(target, 1e-6), 0.0, 1.0)
+            fz = frac * peak * deficit
+        else:
+            # Flat support that simply decays with the curriculum.
+            fz = np.full(self.num_envs, frac * peak, dtype=np.float32)
+
+        force = zeros.copy()
+        force[:, 2] = fz.astype(np.float32)  # world +z, upward only
+        self._last_assist_force_mean = float(np.mean(fz))
+        return force, zeros
+
     # ── reward + sustained-success bookkeeping ────────────────────
 
     def _compute_skill_reward(self, action: np.ndarray):
@@ -545,7 +614,7 @@ class K1StandupEnv(SkillEnv):
             achieved_sustained=achieved_sustained,
             step_count=self.step_count,
             foot_z=foot_z,
-            weights=self.cfg.rewards,
+            weights=self._reward_weights,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
             default_joint_pos=self._default_action,
             target_height=target_h,
@@ -563,6 +632,8 @@ class K1StandupEnv(SkillEnv):
         components["upright_threshold_current"] = float(upright_thresh)
         components["target_height_current"] = float(target_h)
         components["easy_start_fraction"] = float(self._current_easy_fraction())
+        components["assist_fraction"] = float(self._current_assist_fraction())
+        components["assist_force_mean"] = float(self._last_assist_force_mean)
 
         # Update EMA of frame success rate — used to gate curriculum.
         current_success_rate = float(np.mean(frame_now))

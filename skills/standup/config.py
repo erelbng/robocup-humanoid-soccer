@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 
 
@@ -88,6 +89,29 @@ class StandupRewardWeights:
     standing_tall: float = 5.0
 
 
+# Regularizer weights zeroed in the "discovery" reward stage. These are
+# motion-quality / deployability shaping terms — useful for a SMOOTH final
+# motion, but (per HumanUP, arXiv:2502.12152) early regularization blocks
+# task discovery. Stage 1 turns them OFF so the policy can find *any*
+# standup; stage 2 ("deploy") turns them back on to refine the motion.
+_DISCOVERY_ZEROED_WEIGHTS = (
+    "arm_pose_dev",
+    "base_ang_vel_sway",
+    "base_lin_vel_drift",
+    "joint_vel_quiet",
+    "action_smoothness",
+    "action_jerk",
+)
+
+
+def discovery_weights(base: StandupRewardWeights) -> StandupRewardWeights:
+    """Return a copy of `base` with all motion-regularizer weights zeroed
+    — the Stage-1 (discovery) reward set: upright + height + progress +
+    feet-grounded + standing-tall + speed/success terms ONLY."""
+    return dataclasses.replace(
+        base, **{name: 0.0 for name in _DISCOVERY_ZEROED_WEIGHTS})
+
+
 @dataclass
 class StandupConfig:
     # ── env ────────────────────────────────────────────────────────
@@ -126,7 +150,46 @@ class StandupConfig:
     # blocker (PPO can't randomly discover the standup trajectory) by
     # giving the policy reachable "good states" to learn from before
     # asking it to recover from arbitrary fallen poses.
-    easy_pool_enabled: bool = True
+    # ── Assistive-force curriculum (HoST, arXiv:2502.08378) ──────────
+    # The single highest-leverage exploration aid for standup: apply a
+    # DECAYING upward "support" force on the trunk — like helping an
+    # infant stand. Early in training the force nearly holds the robot up,
+    # so the policy reliably reaches the standing pose and learns what the
+    # whole fallen→upright trajectory feels like; the force then weans to
+    # zero so the final policy stands unaided. This supersedes the
+    # easy-pose reverse curriculum (which only changed WHERE you start, not
+    # how hard the climb is) — `easy_pool_enabled` is therefore OFF by
+    # default when the assist is on, to isolate the effect. Flip both if
+    # you want to compare.
+    assist_force_enabled: bool = True
+    # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
+    # so 160 N supports most of body weight without launching it — the
+    # policy still has to do the last ~20% and get its feet underneath.
+    assist_force_max: float = 160.0
+    # Spring shape: force ramps with height deficit (target − z), so it's
+    # strongest when fully fallen and releases to ~0 near standing height.
+    # Upward-only (never pushes the trunk down). This keeps the assist from
+    # fighting the robot once it's nearly up.
+    assist_spring_shape: bool = True
+    # Curriculum horizon: assist fraction decays 1.0 → 0.0 over this many
+    # cumulative env-steps. Should be on the same order as the discovery
+    # phase length (a good chunk of total_timesteps).
+    assist_curriculum_env_steps: int = 30_000_000
+    # Performance gate (mirrors the easy-start gate): don't wean the assist
+    # while the policy is still failing. Hold the fraction at
+    # `assist_min_frac` until the EMA frame-success rate clears the
+    # threshold. Prevents the time-only decay from removing all support
+    # while success is still ~0.
+    assist_min_success: float = 0.10
+    assist_min_frac: float = 0.20
+
+    # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
+    # the policy can find ANY standup; "deploy" (Stage 2) uses the full
+    # weight set for a smooth, sim2real-ready motion. Train discovery →
+    # warm-start a deploy run from its checkpoint via --init-from.
+    reward_stage: str = "discovery"           # "discovery" | "deploy"
+
+    easy_pool_enabled: bool = False             # see assist_force_enabled
     easy_pool_settle_steps: int = 30            # brief — robot is already up
     easy_pool_height: float = 0.60              # spawn just above standing
     easy_pool_joint_jitter: float = 0.10        # rad — bigger than reset jitter
