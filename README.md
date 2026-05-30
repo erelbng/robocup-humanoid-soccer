@@ -1,5 +1,5 @@
 # RoboCup Humanoid Soccer RL
-
+hallo
 End-to-end reinforcement learning pipeline for training humanoid robots (Booster K1) to play soccer, targeting the RoboCup Humanoid Soccer League (HSL).
 
 The codebase is built around a **skill library**: instead of a monolithic policy that learns everything at once, four specialised policies (`standup`, `walk`, `dribble`, `shoot`) are trained independently, then a Phase-2 **orchestrator** selects between them in real time during 4v4 matches.
