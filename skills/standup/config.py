@@ -165,7 +165,7 @@ class StandupConfig:
     # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
     # so 160 N supports most of body weight without launching it — the
     # policy still has to do the last ~20% and get its feet underneath.
-    assist_force_max: float = 160.0
+    assist_force_max: float = 220.0
     # Spring shape: force ramps with height deficit (target − z), so it's
     # strongest when fully fallen and releases to ~0 near standing height.
     # Upward-only (never pushes the trunk down). This keeps the assist from
@@ -174,14 +174,14 @@ class StandupConfig:
     # Curriculum horizon: assist fraction decays 1.0 → 0.0 over this many
     # cumulative env-steps. Should be on the same order as the discovery
     # phase length (a good chunk of total_timesteps).
-    assist_curriculum_env_steps: int = 30_000_000
+    assist_curriculum_env_steps: int = 150_000_000
     # Performance gate (mirrors the easy-start gate): don't wean the assist
     # while the policy is still failing. Hold the fraction at
     # `assist_min_frac` until the EMA frame-success rate clears the
     # threshold. Prevents the time-only decay from removing all support
     # while success is still ~0.
     assist_min_success: float = 0.10
-    assist_min_frac: float = 0.20
+    assist_min_frac: float = 0.85
 
     # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
     # the policy can find ANY standup; "deploy" (Stage 2) uses the full
