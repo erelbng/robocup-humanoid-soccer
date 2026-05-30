@@ -182,7 +182,7 @@ Active. Lives in `envs/domain_randomization.py`. Ranges aligned with Booster's T
 - **COM offset** ±0.02 m on the trunk
 
 Per-step:
-- **Random base pushes** every ~5 s, magnitude up to 12 N / 3 N·m, held for 5 control steps. Applied via Genesis' external-wrench API; falls back silently if the build doesn't expose it.
+- **Random base pushes** every ~5 s, magnitude up to 12 N / 3 N·m, held for 5 control steps. Applied via `scene.rigid_solver.apply_links_external_force` on the base link's **global** index (`SkillEnv._apply_base_wrench`), re-applied every physics substep because Genesis clears external forces on each `scene.step()`. Shares this path with the standup assist force.
 
 Observation noise (Gaussian σ): root_quat 0.01, lin_vel 0.05, ang_vel 0.10, dof_pos 0.01, dof_vel 0.10 — applied to raw sensor readings before the common obs builder runs, so the projected_gravity / body-frame velocity downstream are computed from noisy inputs (closer to the real sensor model).
 

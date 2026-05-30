@@ -267,42 +267,55 @@ class SkillEnv(ABC):
         Components are batch-averaged scalars used for logging.
         """
 
-    def _apply_base_wrench(self, force: np.ndarray,
-                            torque: np.ndarray) -> None:
-        """Best-effort external-force application to the robot base.
+    def _resolve_base_link_idx(self) -> Optional[int]:
+        """GLOBAL solver index of the robot's base link, cached.
 
-        Genesis exposes external wrenches under a few different names
-        depending on build (`apply_external_force`, `add_link_force`,
-        `set_links_external_force`). We try them in order and skip on
-        AttributeError. Note that on Genesis builds where none match,
-        push DR effectively becomes a no-op — kp/kd/friction/mass DR
-        still apply.
-        """
-        # Genesis link index for the base — robot.base_link if exposed,
-        # otherwise link 0 (the trunk for K1).
+        The external-wrench API lives on the rigid SOLVER and indexes
+        links by their global solver index — NOT the entity-local index
+        (which is why the old `link_idx = 0` fallback was wrong: with the
+        field built first, the robot's trunk is not solver-link 0)."""
+        idx = getattr(self, "_base_link_idx", None)
+        if idx is not None:
+            return idx
         link = None
         for attr in ("base_link", "trunk", "root_link"):
             link = getattr(self.robot, attr, None)
             if link is not None:
                 break
-        link_idx = 0   # fall back to link 0
-        for method_name in ("apply_links_external_force",
-                            "set_links_external_force",
-                            "apply_external_force"):
-            method = getattr(self.robot, method_name, None)
-            if method is None:
-                continue
-            try:
-                method(force, torque, links_idx_local=[link_idx])
-                return
-            except TypeError:
-                try:
-                    method(force, torque, [link_idx])
-                    return
-                except Exception:
-                    continue
-            except Exception:
-                continue
+        if link is None:
+            links = getattr(self.robot, "links", None)
+            link = links[0] if links else None
+        self._base_link_idx = int(getattr(link, "idx")) if link is not None \
+            else None
+        return self._base_link_idx
+
+    def _apply_base_wrench(self, force: np.ndarray,
+                            torque: np.ndarray) -> None:
+        """Apply a world-frame external wrench to the robot's base link.
+
+        Genesis 0.4.x exposes this on `scene.rigid_solver`, not the entity:
+        `apply_links_external_force(force, links_idx, ...)` with force
+        shaped (n_envs, n_links, 3). IMPORTANT: external forces are CLEARED
+        every `scene.step()`, so the caller must re-apply each physics
+        substep (see `step()`); a single call before the action-repeat loop
+        only affects the first substep.
+        """
+        solver = getattr(self.scene, "rigid_solver", None)
+        link_idx = self._resolve_base_link_idx()
+        if solver is None or link_idx is None:
+            return
+        # (N, 3) → (N, 1, 3) for a single target link.
+        f3 = np.asarray(force, dtype=np.float32).reshape(self.num_envs, 1, 3)
+        t3 = np.asarray(torque, dtype=np.float32).reshape(self.num_envs, 1, 3)
+        try:
+            solver.apply_links_external_force(f3, links_idx=[link_idx])
+            solver.apply_links_external_torque(t3, links_idx=[link_idx])
+        except Exception as e:
+            if not getattr(self, "_warned_wrench", False):
+                print(f"[{self.SKILL_NAME}] external wrench failed "
+                      f"({type(e).__name__}: {e}); push DR + assist are "
+                      "no-ops. Other DR still applies.")
+                self._warned_wrench = True
 
     def _assist_wrench(self) -> Tuple[np.ndarray, np.ndarray]:
         """Optional skill-provided external wrench on the base, summed on
@@ -548,13 +561,12 @@ class SkillEnv(ABC):
             pass
 
         # External base wrenches: push perturbations (push DR) + an
-        # optional skill-provided assist (standup's decaying upward
-        # support force). Summed and applied in a SINGLE call — some
-        # Genesis external-force APIs overwrite rather than accumulate, so
-        # two separate calls would clobber each other. Best-effort: the
-        # external-wrench API differs across Genesis builds, so
-        # `_apply_base_wrench` tries a few signatures and silently skips
-        # if none match (perturbation/assist becomes a no-op, not a crash).
+        # optional skill-provided assist (standup's decaying upward support
+        # force). Computed once per control step then RE-APPLIED every
+        # physics substep below, because Genesis clears external forces on
+        # each `scene.step()` — a single pre-loop apply would only affect
+        # the first of `action_repeat` substeps (≈1/10 of the intended
+        # impulse).
         total_force = np.zeros((self.num_envs, 3), dtype=np.float32)
         total_torque = np.zeros((self.num_envs, 3), dtype=np.float32)
         if self._push_scheduler is not None:
@@ -564,10 +576,11 @@ class SkillEnv(ABC):
         af, at = self._assist_wrench()
         total_force += np.asarray(af, dtype=np.float32)
         total_torque += np.asarray(at, dtype=np.float32)
-        if np.any(total_force) or np.any(total_torque):
-            self._apply_base_wrench(total_force, total_torque)
+        apply_wrench = bool(np.any(total_force) or np.any(total_torque))
 
         for _ in range(self.action_repeat):
+            if apply_wrench:
+                self._apply_base_wrench(total_force, total_torque)
             self.scene.step()
 
         self.step_count += 1

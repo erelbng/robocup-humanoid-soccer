@@ -197,7 +197,7 @@ class StandupConfig:
     # shaping and small penalties. Each critic fits one homogeneous-scale
     # group; advantages are normalized per group then weighted-summed.
     # Standup-only (the other skills keep single-critic PPO).
-    use_multi_critic: bool = True
+    use_multi_critic: bool = False
     # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
     # success). Bias toward `task` early to drive the get-up; `reg` is ~0
     # in the discovery stage anyway (its weights are zeroed).
@@ -281,7 +281,7 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.005
+    entropy_coef: float = 0.01
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
