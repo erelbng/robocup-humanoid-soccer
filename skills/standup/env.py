@@ -30,7 +30,8 @@ import numpy as np
 from skills.base import CommandSpec, SkillEnv
 from skills.common_obs import _to_np
 from skills.standup.config import StandupConfig, discovery_weights
-from skills.standup.rewards import (compute_standup_reward, success_frame_mask,
+from skills.standup.rewards import (STANDUP_CRITIC_GROUPS,
+                                     compute_standup_reward, success_frame_mask,
                                      upright_signal)
 
 
@@ -82,6 +83,8 @@ def _small_tilt_quat(n: int, max_angle: float,
 class K1StandupEnv(SkillEnv):
 
     SKILL_NAME = "standup"
+    # Critic groups for multi-critic PPO (see rewards.STANDUP_CRITIC_GROUPS).
+    CRITIC_GROUP_NAMES = STANDUP_CRITIC_GROUPS
     # Addon dims are decided per-instance from `cfg.proprio_only` below:
     # 8 when contact obs is enabled (fast sim training), 0 when stripped
     # for sim2real-deployable training.
@@ -601,7 +604,7 @@ class K1StandupEnv(SkillEnv):
         # the robot stays upright. Cleared by _reset_skill_state.
         achieved_sustained = self._achieved_sustained | sustained_now
 
-        reward, _frame_success, components = compute_standup_reward(
+        reward, _frame_success, components, group_rewards = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
             joint_pos=jpos, joint_vel=jvel,
@@ -649,6 +652,13 @@ class K1StandupEnv(SkillEnv):
         self._frame_success = frame_now
         self._prev_prev_action = self._last_action.copy()
         self._prev_upright = upright_signal(root_quat).astype(np.float32)
+
+        # Per-env group rewards (N, G) in STANDUP_CRITIC_GROUPS order —
+        # consumed by the multi-critic trainer via info["group_rewards"].
+        # Single-critic training ignores this. Always populated (cheap).
+        self._group_rewards = np.stack(
+            [group_rewards[g] for g in STANDUP_CRITIC_GROUPS], axis=1
+        ).astype(np.float32)
         return reward, components
 
     # ── termination: timeout only ─────────────────────────────────

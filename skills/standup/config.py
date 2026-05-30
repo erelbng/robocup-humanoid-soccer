@@ -189,6 +189,20 @@ class StandupConfig:
     # warm-start a deploy run from its checkpoint via --init-from.
     reward_stage: str = "discovery"           # "discovery" | "deploy"
 
+    # ── Multi-critic PPO (HoST, arXiv:2502.08378) ────────────────────
+    # One value head per reward group (STANDUP_CRITIC_GROUPS: task / reg /
+    # success) instead of a single critic over the full heterogeneous
+    # reward. HoST found single-critic = ~zero success because the value
+    # net can't fit a return mixing a +400 terminal pulse with dense [0,1]
+    # shaping and small penalties. Each critic fits one homogeneous-scale
+    # group; advantages are normalized per group then weighted-summed.
+    # Standup-only (the other skills keep single-critic PPO).
+    use_multi_critic: bool = True
+    # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
+    # success). Bias toward `task` early to drive the get-up; `reg` is ~0
+    # in the discovery stage anyway (its weights are zeroed).
+    critic_group_weights: tuple = (1.0, 1.0, 1.0)
+
     easy_pool_enabled: bool = False             # see assist_force_enabled
     easy_pool_settle_steps: int = 30            # brief — robot is already up
     easy_pool_height: float = 0.60              # spawn just above standing

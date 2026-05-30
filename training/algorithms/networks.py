@@ -61,6 +61,15 @@ class PPOActorCritic(nn.Module):
     stable than the shared backbone our old code used. Action distribution
     is a Gaussian with a learned PER-ACTION log_std (state-independent),
     which is the standard formulation for locomotion PPO.
+
+    Multi-critic (`n_critics > 1`, HoST-style): instead of one value head,
+    build `n_critics` INDEPENDENT critic trunks+heads, one per reward
+    group. `get_value` then returns (N, n_critics) and the multi-critic
+    PPO loop fits/normalizes each group's return separately. With the
+    default `n_critics == 1` the module is byte-identical to before (same
+    `critic_trunk` / `critic_head` parameter names), so existing
+    single-critic checkpoints — walk, dribble, shoot, orchestrator — load
+    unchanged.
     """
 
     def __init__(self, obs_dim: int, act_dim: int,
@@ -68,27 +77,44 @@ class PPOActorCritic(nn.Module):
                  critic_hidden: Sequence[int] = (512, 256, 128),
                  init_log_std: float = -0.5,
                  layernorm: bool = True,
-                 activation: str = "elu"):
+                 activation: str = "elu",
+                 n_critics: int = 1):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.n_critics = int(n_critics)
 
         self.actor_trunk = make_mlp(obs_dim, actor_hidden, layernorm, activation)
         self.actor_head = nn.Linear(actor_hidden[-1], act_dim)
         self.actor_log_std = nn.Parameter(
             torch.full((act_dim,), float(init_log_std), dtype=torch.float32)
         )
-
-        self.critic_trunk = make_mlp(obs_dim, critic_hidden, layernorm, activation)
-        self.critic_head = nn.Linear(critic_hidden[-1], 1)
-
-        # Init
         for m in self.actor_trunk:
             orthogonal_init(m, gain=math.sqrt(2.0))
         orthogonal_init(self.actor_head, gain=0.01)
-        for m in self.critic_trunk:
-            orthogonal_init(m, gain=math.sqrt(2.0))
-        orthogonal_init(self.critic_head, gain=1.0)
+
+        if self.n_critics == 1:
+            # Single-critic: keep the original attribute names verbatim so
+            # checkpoints from before this change still load.
+            self.critic_trunk = make_mlp(obs_dim, critic_hidden, layernorm,
+                                         activation)
+            self.critic_head = nn.Linear(critic_hidden[-1], 1)
+            for m in self.critic_trunk:
+                orthogonal_init(m, gain=math.sqrt(2.0))
+            orthogonal_init(self.critic_head, gain=1.0)
+        else:
+            self.critic_trunks = nn.ModuleList([
+                make_mlp(obs_dim, critic_hidden, layernorm, activation)
+                for _ in range(self.n_critics)
+            ])
+            self.critic_heads = nn.ModuleList([
+                nn.Linear(critic_hidden[-1], 1) for _ in range(self.n_critics)
+            ])
+            for trunk in self.critic_trunks:
+                for m in trunk:
+                    orthogonal_init(m, gain=math.sqrt(2.0))
+            for head in self.critic_heads:
+                orthogonal_init(head, gain=1.0)
 
     def _action_dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
         mean = self.actor_head(self.actor_trunk(obs))
@@ -111,11 +137,16 @@ class PPOActorCritic(nn.Module):
         dist = self._action_dist(obs)
         log_prob = dist.log_prob(actions).sum(-1)
         entropy = dist.entropy().sum(-1)
-        value = self.critic_head(self.critic_trunk(obs)).squeeze(-1)
+        value = self.get_value(obs)
         return value, log_prob, entropy
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.critic_head(self.critic_trunk(obs)).squeeze(-1)
+        """Single-critic: (N,). Multi-critic: (N, n_critics)."""
+        if self.n_critics == 1:
+            return self.critic_head(self.critic_trunk(obs)).squeeze(-1)
+        vals = [head(trunk(obs)) for trunk, head
+                in zip(self.critic_trunks, self.critic_heads)]
+        return torch.cat(vals, dim=-1)  # (N, n_critics)
 
     # Convenience: emulate the old `get_action` signature used by the
     # single-env trainer so legacy paths keep working.

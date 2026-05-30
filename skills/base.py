@@ -100,6 +100,10 @@ class SkillEnv(ABC):
     SKILL_NAME: str = "skill"
     SKILL_OBS_ADDONS: int = 0
     MAX_EPISODE_STEPS: int = 1000
+    # Multi-critic PPO: skills that decompose their reward into groups set
+    # this to the ordered group names and populate `self._group_rewards`
+    # (N, G) each step. Empty tuple → single-critic (the default path).
+    CRITIC_GROUP_NAMES: Tuple[str, ...] = ()
     # Policy outputs are interpreted as RESIDUAL deltas from the default
     # joint pose, clipped to ±ACTION_DELTA_MAX radians per control step.
     # This ensures a near-zero-initialised network holds the default
@@ -152,6 +156,9 @@ class SkillEnv(ABC):
         self._last_action = np.zeros((self.num_envs, len(self._default_action)),
                                      dtype=np.float32)
         self._episode_reward = np.zeros(self.num_envs, dtype=np.float32)
+        # Per-env per-group reward (N, G), set by skills that opt into
+        # multi-critic PPO; None for single-critic skills.
+        self._group_rewards: Optional[np.ndarray] = None
         self.rng = np.random.default_rng(seed)
 
         # Command vector — populated after _make_command_spec is called
@@ -579,6 +586,8 @@ class SkillEnv(ABC):
             "episode_reward": self._episode_reward.copy(),
             "skill": self.SKILL_NAME,
             "reward_components": components,
+            # (N, G) per-group reward for multi-critic PPO, or None.
+            "group_rewards": self._group_rewards,
         }
         return obs, reward, done, info
 

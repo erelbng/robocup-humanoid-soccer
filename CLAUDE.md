@@ -124,7 +124,7 @@ python -m evaluation.evaluate checkpoints/orchestrator/orchestrator_best.pt \
 
 | Skill | Command vec (continuous, dim) | Obs add-ons (dim) | obs_dim | Reward focus |
 |-------|-------------------------------|-------------------|---------|--------------|
-| standup | none (0) | none (0) | 78 | upright + height + smoothness + one-shot success bonus; episode ends on success |
+| standup | none (0) | contact 8 (foot/hand z + bool) | 86 | upright + height + progress + feet-grounded + standing-tall + time-scaled success bonus + post-success standing. **Assist-force curriculum** (decaying upward trunk support), **two-stage reward** (discovery→deploy), **multi-critic PPO** (task/reg/success). Timeout-only termination |
 | walk | `[vx, vy, vyaw, foot_clearance, step_freq]` (5) | none (0) | 83 | exp-shaped lin/ang vel tracking + posture + foot clearance vs cmd swing + regularizers |
 | dribble | walk(5) + `[ball_off_x, ball_off_y]` (7) | ball pos/vel in body frame (6) | 91 | walk shaping + ball_offset (exp) + ball_velocity + ball_lost penalty/terminate at >2 m |
 | shoot | `[aim_angle, power, foot_pref]` (3) | ball pos/vel body + target body (9) | 90 | dense approach + ball→target velocity + sparse kick pulse (speed>1.5 m/s, aim<45°) + power/aim match |
@@ -159,6 +159,14 @@ Both PPO and FlashSAC are wired through `training/train_skill.py` (FlashSAC = of
 - **Control**: 50 Hz policy (`dt=0.02`), 500 Hz physics (`sim_dt=0.002`), `action_repeat=10`.
 - **PD gains**: `kp=50`, `kd=5` for all joints.
 - **Device presets** (`training/common.DEVICE_PRESETS`): GPU defaults `vec_num_envs=1024`, FlashSAC `buffer_capacity=2M / batch_size=2048 / gradient_steps=4`. CPU defaults are smaller for smoke tests.
+
+### Standup-specific RL (HoST / HumanUP, 2025)
+
+The standup skill was the hard case (it wouldn't learn under plain reward shaping). Three mechanisms from the 2025 get-up literature, all standup-only and on by default — the other skills route to plain single-critic PPO unchanged:
+
+- **Assist-force curriculum** (HoST, [arXiv:2502.08378](https://arxiv.org/abs/2502.08378)) — a decaying upward "support" force on the trunk (spring-shaped on height deficit, ~67% body weight when fully fallen), weaning 1.0→0.0 over `assist_curriculum_env_steps`, performance-gated by success EMA. Generic `_assist_wrench()` hook in `skills/base.py` step(), summed with push-DR; standup override in `skills/standup/env.py`.
+- **Two-stage reward** (HumanUP, [arXiv:2502.12152](https://arxiv.org/abs/2502.12152)) — `StandupConfig.reward_stage`: `"discovery"` zeroes the motion regularizers (via `config.discovery_weights`) so the policy can find any standup; `"deploy"` re-enables them for a smooth motion. Train discovery → `--init-from` the checkpoint for deploy.
+- **Multi-critic PPO** (HoST) — one value head per reward group (`rewards.STANDUP_CRITIC_GROUPS = (task, reg, success)`), per-group GAE + return-norm, normalized-advantage aggregation. `PPOActorCritic(n_critics=G)` + `ppo.train_ppo_multicritic_vec`. `train_skill` routes here when the env exposes `CRITIC_GROUP_NAMES` and `cfg.use_multi_critic`. `n_critics=1` keeps the original param names, so existing single-critic checkpoints load unchanged.
 
 ## GameController
 

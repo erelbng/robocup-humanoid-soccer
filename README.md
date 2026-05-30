@@ -139,7 +139,7 @@ python -m evaluation.evaluate checkpoints/orchestrator/orchestrator_best.pt \
 
 | Skill | Command vec | Obs add-ons | obs_dim |
 |-------|-------------|-------------|---------|
-| **standup** | none | none | 78 |
+| **standup** | none | contact (foot/hand z + bool, 8) | 86 |
 | **walk** | `[vx, vy, vyaw, foot_clearance, step_freq]` | none | 83 |
 | **dribble** | walk + `[ball_off_x, ball_off_y]` | ball pos/vel in body frame | 91 |
 | **shoot** | `[aim_angle, power, foot_pref]` | ball pos/vel + target pos in body frame | 90 |
@@ -162,6 +162,8 @@ All skills share a 78-dim base observation: root height, projected gravity (orie
 | Best for | Walk, standup (dense rewards) | Shoot, dribble (sparser rewards) |
 | `--resume` / `--init-from` | ✓ | ✗ (different network architecture) |
 | Used by orchestrator | ✓ | — |
+
+**Standup** additionally uses three mechanisms from the 2025 humanoid get-up literature (HoST / HumanUP), all standup-only and on by default: a decaying **assist-force curriculum** (upward trunk support that weans to zero), a **two-stage reward** (`discovery` → `deploy`), and **multi-critic PPO** (one value head per reward group). See `skills/standup/README.md`.
 
 Both share `MLP 512→256→128 + LayerNorm + ELU`. Hyperparameter device presets (`training/common.DEVICE_PRESETS`) auto-pick reasonable defaults: GPU → `vec_num_envs=1024`, FlashSAC `buffer_capacity=2M / batch_size=2048`.
 

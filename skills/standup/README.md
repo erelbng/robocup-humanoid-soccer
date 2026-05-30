@@ -7,30 +7,46 @@ training pipeline end-to-end, including sim2real distillation.
 
 ## TL;DR — recommended pipeline
 
-```bash
-# 1. Train a teacher with all the privileged signals (contact + DR).
-#    Fast convergence; not directly deployable on hardware.
-./scripts/run.sh train-skill standup \
-    --algorithm ppo --mode teacher \
-    --device gpu --vec-num-envs 2048 \
-    --total-timesteps 100_000_000 --wandb
+Getting a robust standup is a **two-stage discovery → deploy** flow. The
+defaults (assist-force curriculum, `reward_stage="discovery"`, multi-critic
+PPO) are tuned for stage 1; you flip two config fields for stage 2.
 
-# 2. Distill into a proprio-only student that IS deployable.
-#    The teacher checkpoint step won't land exactly on a round number —
-#    PPO saves at multiples of save_interval, so the final file is
-#    something like step99876864.pt. Use $(ls -t … | head -1) to pick
-#    the most recent one automatically.
-TEACHER=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
+```bash
+# Stage 1 — DISCOVERY. Find ANY standup. Assist force on, motion
+# regularizers off, one critic per reward group. Defaults are already set
+# for this, so no extra flags are needed.
 ./scripts/run.sh train-skill standup \
-    --algorithm ppo --mode student \
-    --teacher-ckpt "$TEACHER" \
     --device gpu --vec-num-envs 2048 \
-    --total-timesteps 20_000_000 --wandb
+    --total-timesteps 50_000_000 --wandb
+
+# Stage 2 — DEPLOY. Refine into a smooth, sim2real-ready motion. Edit
+# skills/standup/config.py: set reward_stage="deploy" (re-enables the
+# motion regularizers), then warm-start from the discovery checkpoint
+# (actor weights transfer; the per-group critics restart fresh).
+DISCOVERY=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
+./scripts/run.sh train-skill standup \
+    --device gpu --vec-num-envs 2048 \
+    --init-from "$DISCOVERY" \
+    --total-timesteps 50_000_000 --wandb
 ```
 
-If sim2real is not a current concern, just run `--mode single` and stop
-after step 1 (using a teacher checkpoint is fine — it's a regular PPO
-policy and works in eval).
+### Sim2real (teacher → student), once standup is working
+
+```bash
+# 1. Teacher: PPO with privileged DR + contact obs. Fast, not deployable.
+./scripts/run.sh train-skill standup --mode teacher \
+    --device gpu --vec-num-envs 2048 --total-timesteps 100_000_000 --wandb
+
+# 2. Student: distill into a proprio-only deployable policy.
+TEACHER=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
+./scripts/run.sh train-skill standup --mode student \
+    --teacher-ckpt "$TEACHER" \
+    --device gpu --vec-num-envs 2048 --total-timesteps 20_000_000 --wandb
+```
+
+`--mode teacher`/`student` work with all the above on by default. If
+sim2real is not a current concern, a `--mode single` (or teacher) checkpoint
+is a regular PPO policy and works fine in eval.
 
 ---
 
@@ -39,12 +55,60 @@ policy and works in eval).
 | Component | Purpose | Where it lives |
 |-----------|---------|----------------|
 | Settle pool | Physically-realistic fallen starts (no hand-coded poses) | `env._build_settle_pool` |
-| Easy pool + reverse curriculum | Near-standing starts that ramp out as training progresses — addresses the exploration problem (PPO can't randomly discover the standup trajectory) by giving the policy reachable "good states" to learn from before the harder ones | `env._build_easy_pool`, `env._current_easy_fraction` |
+| **Assist-force curriculum** | Decaying upward "support" force on the trunk (HoST's infant-support trick) — the primary exploration aid. Lets the policy reach the standing pose while assisted, then weans to zero | `env._assist_wrench`, `env._current_assist_fraction` |
+| **Two-stage reward** | `reward_stage="discovery"` zeroes motion regularizers so the policy can find ANY standup; `"deploy"` re-enables them for a smooth motion (HumanUP: early regularization blocks discovery) | `config.discovery_weights`, `env._reward_weights` |
+| **Multi-critic PPO** | One value head per reward group (task/reg/success) — single critic over the mixed reward fails (HoST) | `rewards.STANDUP_CRITIC_GROUPS`, `ppo.train_ppo_multicritic_vec` |
+| Easy pool + reverse curriculum | Near-standing starts that ramp out as training progresses. **Off by default** (`easy_pool_enabled=False`) — superseded by the assist-force curriculum, which changes task difficulty rather than just start state. Running both confounds the experiment | `env._build_easy_pool`, `env._current_easy_fraction` |
 | Contact obs (8 dims) | Foot/hand z + contact bool — tells the policy what's on the floor. **Privileged in sim2real.** | `env._read_contact_state` |
 | `upright_progress` reward | Pays per step for `Δup > 0` — breaks the side-plank attractor | `rewards.compute_standup_reward` |
 | `near_upright_gate` | Motion penalties only fire in the final balancing zone (up ∈ [0.7, 0.95]) | `rewards.near_upright_gate` |
 | Sustained-success terminal bonus | `success_bonus × exp(-t_first / τ)` paid once on hold completion | `rewards.compute_standup_reward` |
 | Arm-pose deviation penalty | Discourages heavy arm use without forbidding it | `rewards.compute_standup_reward` |
+
+### Why these three (the 2025 get-up literature)
+
+Earlier iterations relied on reward shaping + a reverse pose curriculum and
+got stuck (side-plank / kneel / squat attractors). The two papers that
+solved real-humanoid get-up — [HoST](https://arxiv.org/abs/2502.08378) and
+[HumanUP](https://arxiv.org/abs/2502.12152) — both use **pure RL, no
+imitation/AMP**, and pin the wins on three things we now implement:
+
+1. **Assist-force curriculum (HoST).** A decaying upward force on the
+   trunk, like helping an infant stand. This is the exploration
+   breakthrough: the policy reaches the upright pose while supported and
+   learns the whole fallen→standing trajectory, then the force weans to 0
+   so the final policy stands unaided.
+   - Spring-shaped on height deficit: strongest when fully fallen
+     (~131 N ≈ 67 % of the 20 kg body weight at z=0.10), ~0 near standing.
+   - World-up, upward-only, applied at the trunk; summed onto the push-DR
+     wrench via the generic `_assist_wrench` hook in `skills/base.py`.
+   - Fraction decays 1.0 → 0.0 over `assist_curriculum_env_steps`,
+     **performance-gated** by the success EMA so support isn't pulled out
+     from under a still-failing policy (`assist_min_success`/`assist_min_frac`).
+
+2. **Two-stage reward (HumanUP).** Early regularization blocks task
+   discovery. `reward_stage="discovery"` (default) zeroes the six motion
+   regularizers (smoothness, jerk, arm-pose, sway, drift, joint-quiet) so
+   the policy can find *any* standup; `"deploy"` turns them back on to
+   refine the motion. Train discovery → warm-start a deploy run from its
+   checkpoint with `--init-from`.
+
+3. **Multi-critic PPO (HoST).** A single critic over the full reward
+   (a +400 terminal pulse mixed with dense [0,1] shaping and small
+   penalties) achieved *zero* success in HoST's ablation — the value net
+   can't fit such a heterogeneous return. We split the reward into
+   `STANDUP_CRITIC_GROUPS = (task, reg, success)`, give each its own value
+   head + return-normalizer + GAE, normalize advantages per group, then
+   aggregate as a `critic_group_weights`-weighted sum for the policy
+   surrogate. The three groups sum exactly to the single-critic reward, so
+   nothing about the reward *magnitude* changes — only how it's valued.
+   Watch the per-group `explained_variance_{task,reg,success}` in
+   TensorBoard; each should climb toward ~1.
+
+All three are **standup-only** and on by default (`assist_force_enabled`,
+`reward_stage="discovery"`, `use_multi_critic` in `StandupConfig`). The
+other skills are untouched: they expose no `CRITIC_GROUP_NAMES`, so
+`train_skill` transparently routes them to single-critic PPO.
 
 ### Observation layout (proprio_only=False, include_privileged=True)
 
@@ -72,7 +136,7 @@ distillation pipeline reads to size the student.
 | `joint_vel_quiet` | 0.001 | Σ q̇², gated |
 | `action_smoothness` | 0.1 | (Δa)², gated |
 | `action_jerk` | 0.1 | (Δ²a)², gated |
-| `time_penalty` | 1.0 | Dense −1/step until sustained-success |
+| `time_penalty` | 3.0 | Dense −3/step until sustained-success (≥2.5 keeps the fallen floor net-negative) |
 | `success_persistence` | 5.0 | +5/step during the hold window |
 | `success_bonus` | 400.0 | One-shot pulse on streak completion, scaled `× exp(−t_first / 150)` (τ=3.0 s) — 1 s stand pays ~330, 2 s ~150, 3 s ~100 |
 | `post_success_standing` | 10.0 | +10/step for every frame still standing AFTER the episode's first sustained success. Episode runs to MAX_EPISODE_STEPS so a fast standup that falls forfeits ~1500–2000 of opportunity cost — the dominant gradient for "stand fast AND stay up" |
@@ -83,6 +147,14 @@ All "gated" penalties are scaled by `near_upright_gate(up)` which ramps
 from 0 at up=0.7 to 1 at up=0.95. The intent: the recovery itself is
 motion-free, stability shaping only activates in the final balancing
 range.
+
+**Critic groups / discovery zeroing.** For multi-critic PPO the terms map
+to `STANDUP_CRITIC_GROUPS`: `task` = upright + height + upright_progress +
+foot_grounded_up + standing_tall; `reg` = arm_pose_dev + sway + drift +
+joint_vel_quiet + smoothness + jerk; `success` = success_persistence +
+time_penalty + success_bonus + post_success_standing. In the **discovery**
+stage the entire `reg` group is zeroed (`config.discovery_weights`), so its
+critic just learns ≈0 and contributes ≈0 advantage — by design.
 
 ---
 
@@ -203,7 +275,20 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 9. **`rewards/standing_tall`** — full-extension signal in [0, 1]. Lags behind `foot_grounded_up` because it only kicks in past the squat (trunk_z > 0.30). Should climb later in training as the policy learns to extend out of the squat into full standing. If `foot_grounded_up` saturates high (~0.8+) but `standing_tall` stays near 0, the policy is stuck in the squat attractor — train longer or bump `standing_tall` weight to 8–10.
 
-10. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3, `explained_variance` climbing toward 1.0.
+10. **`rewards/assist_fraction`** / **`rewards/assist_force_mean`** — the assist-force curriculum. `assist_fraction` should track 1.0 → 0.0 over `assist_curriculum_env_steps` (held at `assist_min_frac` while the success EMA is below `assist_min_success`). The key thing to watch: `achieved_sustained_rate` should be climbing **while `assist_fraction` is still high** — that's the policy learning the trajectory under support. If success only appears at high assist and **collapses as the force weans off**, lengthen `assist_curriculum_env_steps` or raise `assist_min_success` so the wean-off is slower / better gated.
+
+11. **`explained_variance_task`** / **`_reg`** / **`_success`** (multi-critic only) — per-group critic fit. Each should climb toward ~1.0. `explained_variance_reg` will sit near 0 in the discovery stage (its reward is zeroed) — expected. If `_task` or `_success` stays low/negative, that critic isn't fitting its return; check the group's reward scale or lower the LR.
+
+### The hovering failure mode (new with the assist force)
+
+The assist supports trunk height, so a new way to game the reward is to
+**float horizontally at moderate height** without uprighting. Tell-tale:
+`mean_robot_z` rises but `rewards/upright_raw` stays low and
+`foot_grounded_up` stays near 0. The orientation gates on the feet/tall
+terms make this unrewarding, but if you see it, lower `assist_force_max`
+(less free lift) — 100–130 N is a reasonable next try.
+
+12. **PPO diagnostics** — `approx_kl` should stay under ~0.05, `clip_fraction` under ~0.3. For multi-critic runs the value fit is the per-group `explained_variance_{task,reg,success}` above rather than a single `explained_variance`.
 
 ---
 

@@ -24,6 +24,22 @@ from skills.common_obs import projected_gravity
 from skills.common_rewards import joint_pose_deviation
 
 
+# ─── critic groups (multi-critic PPO) ─────────────────────────────────
+#
+# HoST (arXiv:2502.08378) found a SINGLE critic over the full
+# heterogeneous reward achieves ~zero success — the value net can't fit
+# returns that mix a +400 terminal pulse, dense [0,1] shaping, and small
+# quadratic penalties. The fix is one critic PER reward GROUP, each fed a
+# homogeneous-scale return, with normalized-advantage aggregation. These
+# names index the per-env group-reward array `compute_standup_reward`
+# returns (column order = this tuple) and the per-group critic heads.
+#
+#   task    — "get upright + tall + on your feet" dense shaping
+#   reg     — motion-quality penalties (zeroed in the discovery stage)
+#   success — sparse/terminal: hold-window, speed, success bonus, stay-up
+STANDUP_CRITIC_GROUPS = ("task", "reg", "success")
+
+
 # ─── primary signals ──────────────────────────────────────────────────
 
 
@@ -212,13 +228,18 @@ def compute_standup_reward(
     standing_tall_min_z: float = 0.30,
     standing_tall_max_z: float = 0.55,
     control_dt: float = 0.02,
-) -> Tuple[np.ndarray, np.ndarray, dict]:
-    """Returns (reward[N], frame_success[N] bool, components_dict).
+) -> Tuple[np.ndarray, np.ndarray, dict, dict]:
+    """Returns (reward[N], frame_success[N] bool, components, group_rewards).
 
     `frame_success` is the per-frame "looks standing" mask — the env
     uses it to advance its streak counter. The env owns termination
     (sustained_now arrives back as input here so we can pay the bonus
-    on the exact frame the streak completes)."""
+    on the exact frame the streak completes).
+
+    `group_rewards` maps each name in `STANDUP_CRITIC_GROUPS` to its
+    per-env (N,) reward contribution; the three sum EXACTLY to `reward`.
+    Single-critic training ignores it; multi-critic training feeds one
+    critic per group (see `STANDUP_CRITIC_GROUPS`)."""
 
     up = upright_signal(root_quat)
     h = height_signal(root_pos[:, 2], target=target_height)
@@ -319,23 +340,35 @@ def compute_standup_reward(
     )
 
     w = weights
-    r = (
+
+    # ── per-group decomposition (multi-critic PPO) ──
+    # Each group is a homogeneous-scale return so a per-group critic can
+    # actually fit it. The three sum EXACTLY to the single-critic reward
+    # `r` below, so single-critic training is unchanged.
+    r_task = (
         w.upright * up_pos
         + w.height * h
         + w.upright_progress * progress
+        + w.foot_grounded_up * foot_up
+        + w.standing_tall * tall
+    ).astype(np.float32)
+    r_reg = (
         - w.arm_pose_dev * arm_dev
         - w.base_ang_vel_sway * ang_sway
         - w.base_lin_vel_drift * lin_drift
         - w.joint_vel_quiet * q_quiet
         - w.action_smoothness * smooth
         - w.action_jerk * jerk
-        + w.success_persistence * persistence
+    ).astype(np.float32)
+    r_success = (
+        w.success_persistence * persistence
         - w.time_penalty * time_pen
         + w.success_bonus * sustained_bonus
         + w.post_success_standing * post_success
-        + w.foot_grounded_up * foot_up
-        + w.standing_tall * tall
     ).astype(np.float32)
+
+    r = (r_task + r_reg + r_success).astype(np.float32)
+    group_rewards = {"task": r_task, "reg": r_reg, "success": r_success}
 
     components = {
         "upright": float(np.mean(up_pos)),
@@ -361,5 +394,8 @@ def compute_standup_reward(
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),
         "mean_robot_z": float(np.mean(root_pos[:, 2])),
         "mean_reward": float(np.mean(r)),
+        "group_task": float(np.mean(r_task)),
+        "group_reg": float(np.mean(r_reg)),
+        "group_success": float(np.mean(r_success)),
     }
-    return r, frame_success, components
+    return r, frame_success, components, group_rewards

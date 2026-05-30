@@ -119,6 +119,35 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
     algo_kwargs = dict(algo_kwargs or {})
 
     if algorithm == "ppo":
+        # Multi-critic path (HoST): only when the env decomposes its reward
+        # into ≥2 groups AND the config opts in. The other skills expose no
+        # groups, so they transparently fall through to single-critic PPO.
+        group_names = tuple(getattr(env, "CRITIC_GROUP_NAMES", ()))
+        use_multi = bool(getattr(cfg, "use_multi_critic", False)) \
+            and len(group_names) >= 2
+
+        if use_multi:
+            policy = create_policy(env.obs_dim, env.act_dim,
+                                   n_critics=len(group_names))
+            if init_from:
+                # Warm-start: actor weights load (names match); the
+                # per-group critics start fresh (names differ from the
+                # single-critic checkpoint) — exactly what we want when
+                # warm-starting a discovery run into multi-critic.
+                load_checkpoint(init_from, policy)
+            elif resume:
+                load_checkpoint(resume, policy)
+            from training.algorithms.ppo import train_ppo_multicritic_vec
+            return train_ppo_multicritic_vec(
+                env, policy, cfg, logger,
+                phase=f"skill_{env.SKILL_NAME}",
+                curriculum_stage=None,
+                checkpoint_dir=checkpoint_dir,
+                group_weights=getattr(cfg, "critic_group_weights", None),
+                device=device,
+                **algo_kwargs,
+            )
+
         policy = create_policy(env.obs_dim, env.act_dim)
         if init_from:
             load_checkpoint(init_from, policy)
