@@ -46,7 +46,7 @@ class DomainRandConfig:
     enabled: bool = True
 
     # ── physical params (per-env, set once at scene build) ────────
-    ground_friction_range: Tuple[float, float] = (0.5, 1.5)
+    ground_friction_range: Tuple[float, float] = (0.3, 2.0)   # widened for sim2sim robustness
     kp_scale_range:        Tuple[float, float] = (0.95, 1.05)
     kd_scale_range:        Tuple[float, float] = (0.95, 1.05)
     joint_friction_range:  Tuple[float, float] = (0.0, 0.4)   # additive Nm/(rad/s)

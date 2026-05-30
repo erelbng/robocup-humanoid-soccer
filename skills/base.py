@@ -36,6 +36,11 @@ try:
 except ImportError:
     gs = None
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from configs.config import K1RobotConfig
 from envs.domain_randomization import (DomainRandConfig, DRSample,
                                         PushScheduler, add_obs_noise,
@@ -456,6 +461,27 @@ class SkillEnv(ABC):
                 self.robot.set_dofs_kv(kd_arr.tolist(), self.dof_indices)
             except Exception:
                 pass
+
+        # ── apply per-env friction randomization (sim2sim CRITICAL) ──
+        # `ground_friction` was sampled into the DR obs but NEVER applied to
+        # the physics — so the policy trained on ONE fixed contact model and
+        # overfit it (100% Genesis → 0% MuJoCo). `set_friction_ratio` scales
+        # each env's link friction by the sampled value, giving REAL per-env
+        # friction variation so the policy learns contact-robust behaviour.
+        if self.dr_cfg.enabled:
+            try:
+                links = getattr(self.robot, "links", [])
+                n_links = len(links)
+                ratio = np.tile(self._dr_sample.ground_friction[:, None],
+                                (1, n_links)).astype(np.float32)
+                self.robot.set_friction_ratio(
+                    ratio, links_idx_local=list(range(n_links)),
+                    envs_idx=np.arange(self.num_envs))
+                print(f"[{self.SKILL_NAME}] per-env friction randomization "
+                      f"applied (ratio {ratio.min():.2f}–{ratio.max():.2f})")
+            except Exception as e:
+                print(f"[{self.SKILL_NAME}] WARNING: set_friction_ratio failed "
+                      f"({type(e).__name__}: {e}); friction NOT randomized.")
 
         self._initialized = True
 

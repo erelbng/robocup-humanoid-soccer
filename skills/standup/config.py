@@ -269,11 +269,15 @@ class StandupConfig:
     standing_tall_max_z: float = 0.55          # signal saturates at K1 standing height
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
-    # τ=150 steps (3.0 s) keeps the bonus meaningful for realistic
-    # standups: a 1 s standup pays ~330, a 2 s standup ~150, a 3 s
-    # standup ~100. The previous τ=40 (0.8 s) decayed so fast that
-    # 3 s standups paid only ~9 — less than the side-plank attractor.
-    time_to_stand_tau_steps: float = 150.0
+    # τ=60 steps (1.2 s): the speed reward must have a real GRADIENT in the
+    # range standups actually occur. Diagnosis (2026-05-30): with τ=150,
+    # observed stands clustered ~70 steps (1.4 s) and never got faster —
+    # exp(-t/150) is nearly flat there (70→35 steps only +27% bonus). At
+    # τ=60, 70→35 steps is 0.31→0.56 (+82%), a strong pull toward faster.
+    # NOTE: revisit after the torque-limited retrain — realizable (≤40 N·m)
+    # standups are slower than the old 780-N·m ones, so the realistic
+    # stand-time (and thus the ideal τ) may shift up.
+    time_to_stand_tau_steps: float = 60.0
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000

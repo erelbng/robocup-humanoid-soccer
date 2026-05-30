@@ -87,20 +87,27 @@ class K1RobotConfig:
     # on ankles (50/1) since ankle joints can't physically push as hard.
     # We expose per-joint-group gains here; per-joint plumbing happens
     # in the skill env's _init_genesis() when it calls set_dofs_kp.
-    kp: float = 50.0      # legacy uniform fallback
-    kd: float = 5.0
-    # T1-style per-joint-group gains (used when set_dofs_kp accepts an
-    # array indexed by joint).
-    kp_hip:   float = 200.0
-    kp_knee:  float = 200.0
-    kp_ankle: float = 50.0
-    kp_arm:   float = 50.0
-    kp_head:  float = 20.0
-    kd_hip:   float = 5.0
-    kd_knee:  float = 5.0
+    kp: float = 30.0      # legacy uniform fallback
+    kd: float = 1.0
+    # Per-joint-group PD gains. LOWERED toward canonical Genesis locomotion
+    # (the official go2 example uses kp=20 / kd=0.5) from the previous T1-style
+    # kp=200 / kd=5. Reasoning (2026-05-30): kp=200 is ~10× canonical and makes
+    # the controller near-rigidly position-locked, so the policy overfits
+    # Genesis's exact contact response and transfers terribly to MuJoCo (100%
+    # → 0%). Compliant low-gain control is inherently more robust across
+    # physics engines (and keeps torques realistic without a clamp). K1 is
+    # heavier than go2, so legs sit a bit above 20 (≈40) rather than exactly
+    # go2's 20. Revisit if the standup needs more authority.
+    kp_hip:   float = 40.0
+    kp_knee:  float = 40.0
+    kp_ankle: float = 40.0
+    kp_arm:   float = 20.0
+    kp_head:  float = 10.0
+    kd_hip:   float = 1.0
+    kd_knee:  float = 1.0
     kd_ankle: float = 1.0
-    kd_arm:   float = 2.0
-    kd_head:  float = 1.0
+    kd_arm:   float = 0.5
+    kd_head:  float = 0.5
 
 
 # ─── Training Config ─────────────────────────────────────────────────────────
