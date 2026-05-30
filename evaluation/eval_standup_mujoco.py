@@ -58,7 +58,8 @@ TARGET_HEIGHT = 0.55
 UPRIGHT_THRESHOLD = 0.92
 SUCCESS_HOLD_STEPS = 50         # 1.0 s sustained
 MAX_EPISODE_STEPS = 250         # 5 s
-SETTLE_STEPS = 60               # physics steps to settle the fallen pose
+SETTLE_STEPS = 300              # physics steps to settle the fallen pose
+                                # (0.6s — matches the Genesis settle pool)
 
 
 def _per_joint_gains(cfg: K1RobotConfig):
@@ -87,26 +88,47 @@ def _upright(quat: np.ndarray) -> float:
     return float(-g[0, 2])
 
 
-# Canonical fallen orientations (w, x, y, z): supine (on back), prone (on
-# face), and two side-lies — a representative spread of fallen starts.
-_FALLEN_QUATS = {
-    "supine": np.array([0.7071, 0.7071, 0.0, 0.0], np.float64),   # +90° about x
-    "prone":  np.array([0.7071, -0.7071, 0.0, 0.0], np.float64),
-    "left":   np.array([0.7071, 0.0, 0.7071, 0.0], np.float64),   # +90° about y
-    "right":  np.array([0.7071, 0.0, -0.7071, 0.0], np.float64),
-}
+def _random_unit_quat(rng):
+    """Uniform sample on SO(3) (Shoemake) → (w, x, y, z). Matches the
+    Genesis env's settle-pool orientation sampling so the eval's fallen
+    starts come from the same distribution the teacher trained on."""
+    u = rng.uniform(0.0, 1.0, size=3)
+    s1, s0 = np.sqrt(1.0 - u[0]), np.sqrt(u[0])
+    return np.array([s1 * np.sin(2*np.pi*u[1]), s1 * np.cos(2*np.pi*u[1]),
+                     s0 * np.sin(2*np.pi*u[2]), s0 * np.cos(2*np.pi*u[2])],
+                    dtype=np.float64)
 
 
 class StandupMujocoEval:
     def __init__(self, checkpoint: str, device: str = "cpu",
-                 record_video: bool = False):
+                 record_video: bool = False,
+                 upright_thr: float = UPRIGHT_THRESHOLD,
+                 height_bar: float = TARGET_HEIGHT - 0.10,
+                 floor_friction: float = None,
+                 torque_scale: float = 1.0):
         self.cfg = K1RobotConfig()
         self.device = torch.device(device)
         self.record_video = record_video
+        self.upright_thr = float(upright_thr)
+        self.height_bar = float(height_bar)
+        torque_scale = float(torque_scale)
 
         # ── model ──
         self.model = mujoco.MjModel.from_xml_path(os.path.abspath(_XML))
         self.model.opt.timestep = SIM_DT
+        # Optional: override ground friction (the MJCF ships friction 0.4,
+        # below Genesis's training range 0.5–1.5). Set condim=3 so tangential
+        # friction is definitely active, and bump sliding friction to match
+        # Genesis nominal (~1.0). Lets us test whether low floor traction is
+        # what stops the policy completing the stand.
+        if floor_friction is not None:
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                    "ground")
+            if gid >= 0:
+                self.model.geom_condim[gid] = 3
+                self.model.geom_friction[gid] = [float(floor_friction),
+                                                 0.005, 0.0001]
+                print(f"[eval] ground friction → {floor_friction} (condim=3)")
         self.data = mujoco.MjData(self.model)
 
         # joint / actuator / dof address maps in cfg.joint_names order
@@ -130,9 +152,16 @@ class StandupMujocoEval:
                               "world_joint")]
 
         self.kp, self.kd = _per_joint_gains(self.cfg)
-        self.force_lo = self.model.actuator_forcerange[self.act_id, 0].copy()
-        self.force_hi = self.model.actuator_forcerange[self.act_id, 1].copy()
+        # torque_scale > 1 relaxes the motor force limits — used to test
+        # whether Genesis was applying PD torque beyond the MJCF/URDF limits
+        # (it never sets a force range, so it may run unclipped PD).
+        self.force_lo = self.model.actuator_forcerange[self.act_id, 0] * torque_scale
+        self.force_hi = self.model.actuator_forcerange[self.act_id, 1] * torque_scale
         self.default = np.asarray(self.cfg.default_joint_pos, np.float64)
+        # torque-saturation diagnostics
+        self._tau_abs_max = 0.0
+        self._tau_sat = 0
+        self._tau_n = 0
 
         # ── policy ──
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -141,12 +170,33 @@ class StandupMujocoEval:
             raise RuntimeError("checkpoint has no policy/actor_state_dict")
         obs_dim = sd["actor_trunk.0.weight"].shape[1]
         act_dim = sd["actor_head.weight"].shape[0]
-        if obs_dim != SKILL_BASE_OBS_DIM:
-            raise SystemExit(
-                f"checkpoint obs_dim={obs_dim} but this proprio MuJoCo eval "
-                f"only supports {SKILL_BASE_OBS_DIM} (the deployable student / "
-                "proprio_only policy). A privileged teacher (obs_dim 94) "
-                "needs contact+DR obs unavailable in pure proprio.")
+        # Supported widths:
+        #   78  proprio student / proprio_only           (deployable)
+        #   86  proprio + 8 contact addons               (sim training, no DR)
+        #   94  proprio + 8 contact + 8 privileged DR    (teacher)
+        # The contact dims are computed faithfully from MuJoCo foot/hand z;
+        # the privileged DR dims (teacher only) have no MuJoCo counterpart, so
+        # we feed the obs_norm mean → they normalize to ~0 ("average dynamics").
+        # The teacher is trained to be robust to the DR axis, so this is a fair
+        # nominal — and lets us sanity-check the eval against a known-~45%
+        # policy. Don't read a teacher score here as deployable performance.
+        if obs_dim not in (SKILL_BASE_OBS_DIM, SKILL_BASE_OBS_DIM + 8,
+                           SKILL_BASE_OBS_DIM + 16):
+            raise SystemExit(f"unsupported checkpoint obs_dim={obs_dim} "
+                             "(expected 78, 86, or 94)")
+        self.use_contact = obs_dim >= SKILL_BASE_OBS_DIM + 8
+        self.use_privileged = obs_dim >= SKILL_BASE_OBS_DIM + 16
+        if self.use_privileged:
+            print("[eval] NOTE: privileged teacher (obs_dim 94) — privileged "
+                  "DR dims fed as nominal (obs_norm mean). This is an "
+                  "eval-fidelity sanity check, NOT deployable performance.")
+        if self.use_contact:
+            self.foot_body = [mujoco.mj_name2id(self.model,
+                              mujoco.mjtObj.mjOBJ_BODY, n)
+                              for n in ("left_foot_link", "right_foot_link")]
+            self.hand_body = [mujoco.mj_name2id(self.model,
+                              mujoco.mjtObj.mjOBJ_BODY, n)
+                              for n in ("left_hand_link", "right_hand_link")]
         # n_critics is irrelevant for eval (actor only); load non-strict.
         self.policy = PPOActorCritic(obs_dim, act_dim).to(self.device)
         self.policy.load_state_dict(sd, strict=False)
@@ -201,35 +251,59 @@ class StandupMujocoEval:
             default_joint_pos=self.default.astype(np.float32),
             control_dt=DT, gait_freq_hz=self.cfg_gait_freq,
         )
+        if self.use_contact:
+            obs = np.concatenate([obs, self._contact_obs()], axis=1)
+        if self.use_privileged:
+            # Nominal privileged: obs_norm mean for those 8 dims → normalizes
+            # to ~0 ("average dynamics"). No MuJoCo counterpart for DR.
+            priv = self.obs_norm.mean[None, SKILL_BASE_OBS_DIM + 8:
+                                      SKILL_BASE_OBS_DIM + 16].astype(np.float32)
+            obs = np.concatenate([obs, priv], axis=1)
         return self.obs_norm.normalize(obs).astype(np.float32)
+
+    def _contact_obs(self):
+        """(1, 8) = [lf_z, rf_z, lh_z, rh_z, lf_c, rf_c, lh_c, rh_c] — matches
+        env._read_contact_state: world-frame z + contact bool (z < 0.05)."""
+        fz = [float(self.data.xpos[b][2]) for b in self.foot_body]
+        hz = [float(self.data.xpos[b][2]) for b in self.hand_body]
+        zs = fz + hz
+        c = [1.0 if z < 0.05 else 0.0 for z in zs]
+        return np.array([zs + c], dtype=np.float32)
 
     cfg_gait_freq = 1.5
 
     def _apply_pd(self, targets: np.ndarray):
         q, qd = self._q(), self._qd()
-        tau = self.kp * (targets - q) - self.kd * qd
-        tau = np.clip(tau, self.force_lo, self.force_hi)
+        tau_raw = self.kp * (targets - q) - self.kd * qd
+        tau = np.clip(tau_raw, self.force_lo, self.force_hi)
+        # diagnostics: how often does the raw PD command exceed the limits?
+        self._tau_abs_max = max(self._tau_abs_max, float(np.max(np.abs(tau_raw))))
+        self._tau_sat += int(np.sum(tau_raw != tau))
+        self._tau_n += tau_raw.size
         self.data.ctrl[self.act_id] = tau
 
-    def _reset_fallen(self, pose: str, rng: np.random.Generator):
+    def _reset_fallen(self, rng: np.random.Generator):
+        """Match the Genesis settle pool: spawn high with a RANDOM orientation
+        + joint noise, hold the default pose via PD, and let physics settle it
+        into a natural fallen pose. (The previous version dropped 4 stiff
+        canonical poses from 0.30 m with only a 0.12 s settle — out of the
+        teacher's training distribution, which is why it couldn't complete.)"""
         mujoco.mj_resetData(self.model, self.data)
-        # base: low height, fallen orientation
         self.data.qpos[self.base_qadr + 0] = 0.0
         self.data.qpos[self.base_qadr + 1] = 0.0
-        self.data.qpos[self.base_qadr + 2] = 0.30
-        self.data.qpos[self.base_qadr + 3: self.base_qadr + 7] = _FALLEN_QUATS[pose]
-        # joints: default + small jitter
-        jitter = rng.normal(0, 0.05, size=self.cfg.num_dofs)
-        self.data.qpos[self.qpos_adr] = self.default + jitter
+        self.data.qpos[self.base_qadr + 2] = rng.uniform(0.8, 1.2)
+        self.data.qpos[self.base_qadr + 3: self.base_qadr + 7] = \
+            _random_unit_quat(rng)
+        self.data.qpos[self.qpos_adr] = self.default + rng.normal(
+            0, 0.2, size=self.cfg.num_dofs)
         mujoco.mj_forward(self.model, self.data)
-        # settle: hold default pose via PD, let it fall/relax to the ground
         for _ in range(SETTLE_STEPS):
             self._apply_pd(self.default)
             mujoco.mj_step(self.model, self.data)
 
     # ── episode ──
-    def run_episode(self, pose: str, rng, frames=None):
-        self._reset_fallen(pose, rng)
+    def run_episode(self, rng, frames=None):
+        self._reset_fallen(rng)
         last_action = np.zeros(self.cfg.num_dofs, np.float32)
         streak, t_first = 0, None
         for step in range(MAX_EPISODE_STEPS):
@@ -247,7 +321,7 @@ class StandupMujocoEval:
 
             up = _upright(self._root_quat())
             z = self._root_z()
-            success_frame = (up > UPRIGHT_THRESHOLD) and (z > TARGET_HEIGHT - 0.10)
+            success_frame = (up > self.upright_thr) and (z > self.height_bar)
             streak = streak + 1 if success_frame else 0
             if streak >= SUCCESS_HOLD_STEPS and t_first is None:
                 t_first = step - (SUCCESS_HOLD_STEPS - 1)
@@ -257,7 +331,6 @@ class StandupMujocoEval:
                 frames.append(self.renderer.render().copy())
 
         return {
-            "pose": pose,
             "success": t_first is not None,
             "time_to_stand_s": (t_first * DT) if t_first is not None else None,
             "final_up": _upright(self._root_quat()),
@@ -266,17 +339,14 @@ class StandupMujocoEval:
 
     def evaluate(self, episodes: int, video_path: str = None):
         rng = np.random.default_rng(0)
-        poses = list(_FALLEN_QUATS)
         frames = [] if self.record_video else None
         results = []
         for ep in range(episodes):
-            pose = poses[ep % len(poses)]
-            # only film the first episode of each pose, up to 4 clips
-            ep_frames = frames if (self.record_video and ep < len(poses)) else None
-            r = self.run_episode(pose, rng, frames=ep_frames)
+            ep_frames = frames if (self.record_video and ep < 4) else None
+            r = self.run_episode(rng, frames=ep_frames)
             results.append(r)
             tts = f"{r['time_to_stand_s']:.2f}s" if r["success"] else "—"
-            print(f"  ep {ep+1:3d} [{pose:6s}] success={r['success']!s:5s} "
+            print(f"  ep {ep+1:3d} success={r['success']!s:5s} "
                   f"t_stand={tts:6s} final_up={r['final_up']:.2f} "
                   f"final_z={r['final_z']:.3f}")
 
@@ -290,11 +360,9 @@ class StandupMujocoEval:
                   f"(min {tts.min():.2f}, max {tts.max():.2f})")
         print(f"   mean final upright: {np.mean([r['final_up'] for r in results]):.3f}")
         print(f"   mean final height : {np.mean([r['final_z'] for r in results]):.3f}")
-        # per-pose breakdown
-        for p in poses:
-            pr = [r for r in results if r["pose"] == p]
-            if pr:
-                print(f"   {p:6s}: {sum(r['success'] for r in pr)}/{len(pr)}")
+        sat = 100.0 * self._tau_sat / max(self._tau_n, 1)
+        print(f"   PD torque: max|tau|={self._tau_abs_max:.0f} Nm, "
+              f"{sat:.1f}% of joint-steps hit the force limit")
         print('='*54)
 
         if frames:
@@ -312,10 +380,26 @@ def main():
     ap.add_argument("--record-video", action="store_true")
     ap.add_argument("--video-path", type=str, default=None)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--upright-threshold", type=float, default=UPRIGHT_THRESHOLD,
+                    help="success: trunk upright cos > this (default 0.92)")
+    ap.add_argument("--height-bar", type=float, default=TARGET_HEIGHT - 0.10,
+                    help="success: trunk z > this (default 0.45)")
+    ap.add_argument("--floor-friction", type=float, default=None,
+                    help="override ground sliding friction + condim=3 "
+                         "(MJCF ships 0.4; Genesis nominal ~1.0)")
+    ap.add_argument("--torque-scale", type=float, default=1.0,
+                    help="multiply motor force limits (set high, e.g. 100, to "
+                         "test whether Genesis ran unclipped PD)")
     args = ap.parse_args()
 
     ev = StandupMujocoEval(args.checkpoint, device=args.device,
-                           record_video=args.record_video)
+                           record_video=args.record_video,
+                           upright_thr=args.upright_threshold,
+                           height_bar=args.height_bar,
+                           floor_friction=args.floor_friction,
+                           torque_scale=args.torque_scale)
+    print(f"[eval] success bar: upright>{args.upright_threshold} & "
+          f"z>{args.height_bar} held {SUCCESS_HOLD_STEPS} steps")
     vp = args.video_path or os.path.join(
         "videos", f"standup_eval_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
     ev.evaluate(args.episodes, video_path=vp)
