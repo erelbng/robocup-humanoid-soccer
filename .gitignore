@@ -129,6 +129,3 @@ core.*
 .claude/
 CLAUDE.local.md
 GEMINI.local.md
-
-# ─── Personal dev notes (per-user, not shared) ─────────────────────
-WORKFLOW.md
