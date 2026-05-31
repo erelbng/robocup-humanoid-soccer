@@ -398,6 +398,13 @@ class SkillEnv(ABC):
             )
 
         # Robot (URDF — Genesis path).
+        # NOTE (sim2sim, open): the manufacturer's URDF uses full foot-MESH
+        # collision while the MJCF (MuJoCo eval) uses simplified box foot
+        # colliders — this collision mismatch is the Genesis→MuJoCo transfer
+        # gap. Loading the MJCF here instead (gs.morphs.MJCF) unifies the
+        # collision but the MJCF robot settles differently in Genesis and
+        # breaks the standup settle-pool thresholds — needs re-calibration +
+        # retrain before switching. Tracked as the next sim2sim step.
         urdf_path = os.path.join(
             os.path.dirname(__file__), "..", "models", "robot", "K1",
             "K1_22dof.urdf",
@@ -462,6 +469,19 @@ class SkillEnv(ABC):
             except Exception:
                 pass
 
+        # ── apply joint ARMATURE to match MuJoCo / real motors (sim2sim CRITICAL) ──
+        # The URDF carries no rotor inertia, so without this Genesis trains
+        # with massless rotors while MuJoCo (and hardware) have armature that
+        # for the legs is 5-50× the link inertia — the dominant transfer gap.
+        arm = self._build_armature()
+        try:
+            self.robot.set_dofs_armature(arm, self.dof_indices)
+            print(f"[{self.SKILL_NAME}] joint armature applied "
+                  f"({arm.min():.3f}-{arm.max():.3f} kg·m²) to match MuJoCo")
+        except Exception as e:
+            print(f"[{self.SKILL_NAME}] WARNING: set_dofs_armature failed "
+                  f"({type(e).__name__}: {e}); sim2sim transfer will suffer.")
+
         # ── apply per-env friction randomization (sim2sim CRITICAL) ──
         # `ground_friction` was sampled into the DR obs but NEVER applied to
         # the physics — so the policy trained on ONE fixed contact model and
@@ -517,6 +537,32 @@ class SkillEnv(ABC):
                 kp[i] = getattr(self.robot_cfg, "kp_hip", self.robot_cfg.kp)
                 kd[i] = getattr(self.robot_cfg, "kd_hip", self.robot_cfg.kd)
         return kp, kd
+
+    def _build_armature(self) -> np.ndarray:
+        """Per-joint armature array from K1RobotConfig groups (MJCF values).
+        Finer for legs since hip pitch/roll/yaw differ."""
+        n = len(self.dof_indices)
+        c = self.robot_cfg
+        arm = np.full(n, getattr(c, "armature_default", 0.01), dtype=np.float32)
+        for i, name in enumerate(c.joint_names):
+            if i >= n:
+                break
+            lo = name.lower()
+            if "head" in lo:
+                arm[i] = c.armature_head
+            elif "shoulder" in lo or "elbow" in lo or "arm" in lo:
+                arm[i] = c.armature_arm
+            elif "knee" in lo:
+                arm[i] = c.armature_knee
+            elif "ankle" in lo:
+                arm[i] = c.armature_ankle
+            elif "hip" in lo and "pitch" in lo:
+                arm[i] = c.armature_hip_pitch
+            elif "hip" in lo and "roll" in lo:
+                arm[i] = c.armature_hip_roll
+            elif "hip" in lo and "yaw" in lo:
+                arm[i] = c.armature_hip_yaw
+        return arm
 
     def _setup_joint_mapping(self) -> None:
         self.dof_indices = []

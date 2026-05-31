@@ -109,6 +109,23 @@ class K1RobotConfig:
     kd_arm:   float = 0.5
     kd_head:  float = 0.5
 
+    # Per-joint motor ARMATURE (reflected rotor inertia), kg·m² — from the K1
+    # MJCF. CRITICAL for sim2sim/sim2real: the URDF has no <dynamics>, so
+    # Genesis trained with ZERO armature while MuJoCo (and the real motors)
+    # have it — and for the legs it's 0.05-0.10, i.e. 5-50× the link's own
+    # inertia, so it DOMINATES the joint dynamics. A policy trained without it
+    # cannot transfer (the MuJoCo joints feel far heavier). The skill env now
+    # applies these via `set_dofs_armature` at scene build so Genesis joint
+    # dynamics match MuJoCo.
+    armature_head:      float = 0.002
+    armature_arm:       float = 0.001
+    armature_hip_pitch: float = 0.0478125
+    armature_hip_roll:  float = 0.0339552
+    armature_hip_yaw:   float = 0.0282528
+    armature_knee:      float = 0.095625
+    armature_ankle:     float = 0.0565
+    armature_default:   float = 0.01
+
 
 # ─── Training Config ─────────────────────────────────────────────────────────
 
