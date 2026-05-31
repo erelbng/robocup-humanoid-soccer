@@ -35,7 +35,10 @@ class WalkConfig:
     # the standup curricula). Without this, sampling sprint speeds from step
     # 0 just makes the policy fall — it never learns the slow gait first.
     speed_curriculum_env_steps: int = 120_000_000
-    vx_walk_max: float = 1.0          # forward-speed cap at curriculum start
+    vx_walk_max: float = 0.4          # SLOW start so early tracking is easy
+    #                                   (learn to track at low speed first,
+    #                                   then ramp to the sprint range) — also
+    #                                   helps escape the "stand still" optimum
     speed_curriculum_min_track: float = 0.6   # only advance once lin-vel
     #                                           tracking reward EMA clears this
 
@@ -87,10 +90,15 @@ class WalkRewardWeights:
     smoothness / energy are SOFT shaping terms ≪ tracking.
     """
     # primary objectives
-    track_lin_vel: float = 1.5         # exp-shaped on (vx, vy) error
-    track_ang_vel: float = 0.75        # exp-shaped on vyaw error
-    upright: float = 0.5
-    height: float = 0.5                # gaussian around 0.55 m
+    # track_lin_vel bumped 1.5→3.0 and posture terms trimmed: at 1.5 the
+    # tracking reward was out-competed by the SUM of the standing/posture
+    # terms (~1.9), so the baseline plateaued at track_lin_vel≈0.19 — it just
+    # balanced nicely and ignored the command. Now tracking (3.0+1.5) clearly
+    # dominates posture (~1.5), so velocity tracking is the priority.
+    track_lin_vel: float = 3.0         # exp-shaped on (vx, vy) error
+    track_ang_vel: float = 1.5         # exp-shaped on vyaw error
+    upright: float = 0.3
+    height: float = 0.3                # gaussian around 0.55 m
 
     # gait shaping
     foot_clearance: float = 0.3        # match commanded swing height
