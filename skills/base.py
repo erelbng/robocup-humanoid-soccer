@@ -322,6 +322,12 @@ class SkillEnv(ABC):
                       "no-ops. Other DR still applies.")
                 self._warned_wrench = True
 
+    def _get_action_scale(self) -> float:
+        """Multiplicative scale applied to the residual action BEFORE clipping.
+        Override in subclasses to implement a β action-amplitude curriculum
+        (HoST, arXiv:2502.08378). Default: 1.0 (no scaling)."""
+        return 1.0
+
     def _assist_wrench(self) -> Tuple[np.ndarray, np.ndarray]:
         """Optional skill-provided external wrench on the base, summed on
         top of the push-DR wrench in `step()`. Used by the standup skill
@@ -621,6 +627,9 @@ class SkillEnv(ABC):
         # holds the default standing pose on step 0 instead of collapsing
         # to all-zeros, which was the cause of the floor local optimum in
         # early standup training.
+        scale = self._get_action_scale()
+        if scale != 1.0:
+            action = action * float(scale)
         action = np.clip(action, -self.ACTION_DELTA_MAX, self.ACTION_DELTA_MAX)
         targets = np.clip(
             self._default_action[None, :] + action,

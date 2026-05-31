@@ -162,25 +162,12 @@ class K1StandupEnv(SkillEnv):
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
 
-        # ── Pose difficulty curriculum (L0–L6) ────────────────────────────
+        # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
         # Named-pose pools built lazily alongside the settle pool.
         # {pose_name: {"pos": (M,3), "quat": (M,4), "jpos": (M,22), "size": int}}
         self._named_pools: dict = {}
-
-        # L6 per-env knockdown state. -1 in _knockdown_start means not scheduled.
-        self._knockdown_start = np.full(self.num_envs, -1, dtype=np.int32)
-        self._knockdown_remaining = np.zeros(self.num_envs, dtype=np.int32)
-        self._knockdown_active = np.zeros(self.num_envs, dtype=bool)
-        self._knockdown_force = np.zeros((self.num_envs, 3), dtype=np.float32)
-        self._knockdown_torque = np.zeros((self.num_envs, 3), dtype=np.float32)
-
-        # Push stress scaling (1.0 = normal; goes up when EMA is high).
-        self._push_stress_scale: float = 1.0
-        # Base push limits captured once after the scheduler is built.
-        self._base_push_force_max: float = -1.0
-        self._base_push_torque_max: float = -1.0
 
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
@@ -421,7 +408,8 @@ class K1StandupEnv(SkillEnv):
             # Small joint jitter so pool entries aren't rigidly identical.
             jpos_target = (np.tile(jpos_ref, (N, 1))
                            + self.rng.standard_normal((N, self.act_dim))
-                              .astype(np.float32) * 0.05)
+                              .astype(np.float32)
+                              * self.cfg.pose_pool_joint_jitter_rad)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)
@@ -539,58 +527,48 @@ class K1StandupEnv(SkillEnv):
     def _sample_reset_from_level(self, n: int) -> tuple:
         """Return (pos, quat, jpos) for n envs based on the current pose level.
 
-        L0 → easy pool (near-standing)
-        L1 → supine only
-        L2 → side_left + side_right (50 / 50)
-        L3 → all 4 named poses equally
-        L4 → named 60% + settle pool 40%
-        L5 → settle pool (random fallen)
-        L6 → easy pool (knockdown applied mid-episode via _assist_wrench)
+        L0 → easy pool (near-standing) — balance & hold
+        L1 → supine + prone (50/50)    — core recovery
+        L2 → all 4 named poses equally — + side_left + side_right
+        L3 → named (1-frac) + random fallen (frac) — full robustness
         """
         level = self._pose_level
+        names = ["supine", "prone", "side_left", "side_right"]
 
-        if level == 0 or level >= 6:
+        if level <= 0:
             return self._sample_from_pool("easy", n)
 
         if level == 1:
-            return self._sample_from_pool("supine", n)
-
-        if level == 2:
             choice = self.rng.integers(0, 2, size=n)
             return self._gather_by_choice(
-                [("side_left", choice == 0), ("side_right", choice == 1)], n)
+                [("supine", choice == 0), ("prone", choice == 1)], n)
 
-        if level == 3:
+        if level == 2:
             choice = self.rng.integers(0, 4, size=n)
-            names = ["supine", "prone", "side_left", "side_right"]
             return self._gather_by_choice(
                 [(nm, choice == i) for i, nm in enumerate(names)], n)
 
-        if level == 4:
-            n_named = max(0, int(round(n * self.cfg.pose_l4_named_frac)))
-            n_random = n - n_named
-            pos = np.empty((n, 3), dtype=np.float32)
-            quat = np.empty((n, 4), dtype=np.float32)
-            jpos = np.empty((n, self.act_dim), dtype=np.float32)
-            if n_named > 0:
-                choice = self.rng.integers(0, 4, size=n_named)
-                names = ["supine", "prone", "side_left", "side_right"]
-                pn, qn, jn = self._gather_by_choice(
-                    [(nm, choice == i) for i, nm in enumerate(names)], n_named)
-                pos[:n_named] = pn
-                quat[:n_named] = qn
-                jpos[:n_named] = jn
-            if n_random > 0:
-                pr, qr, jr = self._sample_from_pool("random", n_random)
-                pos[n_named:] = pr
-                quat[n_named:] = qr
-                jpos[n_named:] = jr
-            # Shuffle to avoid positional bias across parallel envs.
-            perm = self.rng.permutation(n)
-            return pos[perm], quat[perm], jpos[perm]
-
-        # level == 5: full random fallen (legacy behaviour)
-        return self._sample_from_pool("random", n)
+        # L3+: named poses + random fallen mix
+        n_random = int(round(n * self.cfg.pose_mix_random_frac))
+        n_named = n - n_random
+        pos = np.empty((n, 3), dtype=np.float32)
+        quat = np.empty((n, 4), dtype=np.float32)
+        jpos = np.empty((n, self.act_dim), dtype=np.float32)
+        if n_named > 0:
+            choice = self.rng.integers(0, 4, size=n_named)
+            pn, qn, jn = self._gather_by_choice(
+                [(nm, choice == i) for i, nm in enumerate(names)], n_named)
+            pos[:n_named] = pn
+            quat[:n_named] = qn
+            jpos[:n_named] = jn
+        if n_random > 0:
+            pr, qr, jr = self._sample_from_pool("random", n_random)
+            pos[n_named:] = pr
+            quat[n_named:] = qr
+            jpos[n_named:] = jr
+        # Shuffle to avoid positional bias across parallel envs.
+        perm = self.rng.permutation(n)
+        return pos[perm], quat[perm], jpos[perm]
 
     # ── contact-link lookup (after scene.build) ───────────────────
 
@@ -789,40 +767,34 @@ class K1StandupEnv(SkillEnv):
         else:
             self._last_assist_force_mean = 0.0
 
-        # ── L6 knockdown force ─────────────────────────────────────
-        if self._pose_level >= 6:
-            # Activate envs whose knockdown step has arrived.
-            should_start = (
-                (self._knockdown_start >= 0)
-                & (self.step_count == self._knockdown_start)
-                & (~self._knockdown_active)
-            )
-            if should_start.any():
-                idx = np.where(should_start)[0]
-                self._knockdown_active[idx] = True
-                self._knockdown_remaining[idx] = (
-                    self.cfg.pose_l6_knockdown_duration_steps)
-
-            # Tick timers and apply force to currently-active envs.
-            if self._knockdown_active.any():
-                self._knockdown_remaining[self._knockdown_active] -= 1
-                expired = (self._knockdown_active
-                           & (self._knockdown_remaining <= 0))
-                if expired.any():
-                    self._knockdown_active[expired] = False
-                    self._knockdown_start[expired] = -1
-                active = self._knockdown_active
-                force[active] += self._knockdown_force[active]
-                torque[active] += self._knockdown_torque[active]
-
         return force, torque
+
+    # ── β action rescaler (HoST) ──────────────────────────────────
+
+    def _current_action_beta(self) -> float:
+        """Linear decay 1.0 → β_end over action_beta_curriculum_steps.
+
+        Applied via the base-class _get_action_scale() hook before the
+        action delta is clipped to ACTION_DELTA_MAX. At β=0.30 with
+        ACTION_DELTA_MAX=0.5 the effective joint command range is 0.15
+        rad/step → ≤7.5 rad/s at 50 Hz — safe for K1 servo thermal limits.
+        """
+        if not self.cfg.action_beta_enabled:
+            return 1.0
+        p = self._curriculum_progress(self.cfg.action_beta_curriculum_steps)
+        return float(self.cfg.action_beta_start
+                     + (self.cfg.action_beta_end - self.cfg.action_beta_start) * p)
+
+    def _get_action_scale(self) -> float:
+        return self._current_action_beta()
 
     # ── pose curriculum advancement ───────────────────────────────
 
     def _maybe_advance_level(self) -> None:
         """Advance pose curriculum level when EMA has been above threshold
-        for pose_advance_sustain_steps cumulative env-steps. Never regresses."""
-        if not self.cfg.pose_curriculum_enabled or self._pose_level >= 6:
+        for pose_advance_sustain_steps cumulative env-steps. Never regresses.
+        Caps at the final level (len(thresholds) = num_levels - 1)."""
+        if not self.cfg.pose_curriculum_enabled:
             return
         thresholds = self.cfg.pose_level_thresholds
         if self._pose_level >= len(thresholds):
@@ -839,37 +811,6 @@ class K1StandupEnv(SkillEnv):
         else:
             # EMA fell below threshold — reset sustain counter (no regression).
             self._pose_level_sustain_steps = 0
-
-    def _update_push_stress(self) -> None:
-        """Scale push DR magnitudes when EMA success rate is high.
-
-        Mutates dr_cfg directly; PushScheduler holds a reference to it so
-        the updated values are used on the next triggered push.
-        """
-        if self._push_scheduler is None:
-            return
-        # Capture baseline once (after scheduler and dr_cfg are built).
-        if self._base_push_force_max < 0.0:
-            self._base_push_force_max = self.dr_cfg.push_force_max
-            self._base_push_torque_max = self.dr_cfg.push_torque_max
-
-        c = self.cfg
-        if self._success_rate_ema >= c.pose_stress_push_ema_threshold:
-            target_f = self._base_push_force_max * c.pose_stress_push_scale
-            target_t = self._base_push_torque_max * c.pose_stress_push_torque_scale
-        else:
-            target_f = self._base_push_force_max
-            target_t = self._base_push_torque_max
-
-        if self.dr_cfg.push_force_max != target_f:
-            stressed = target_f > self._base_push_force_max
-            self.dr_cfg.push_force_max = target_f
-            self.dr_cfg.push_torque_max = target_t
-            self._push_stress_scale = (c.pose_stress_push_scale
-                                       if stressed else 1.0)
-            print(f"[standup] push stress {'ON' if stressed else 'OFF'}: "
-                  f"force={target_f:.1f} N  torque={target_t:.1f} N·m  "
-                  f"(EMA={self._success_rate_ema:.3f})")
 
     # ── reward + sustained-success bookkeeping ────────────────────
 
@@ -946,14 +887,11 @@ class K1StandupEnv(SkillEnv):
         )
         components["success_rate_ema"] = self._success_rate_ema
 
-        # Pose curriculum advancement and push stress updates.
-        self._update_push_stress()
+        # Pose curriculum advancement.
         self._maybe_advance_level()
 
         components["pose_curriculum_level"] = float(self._pose_level)
-        components["push_stress_scale"] = float(self._push_stress_scale)
-        components["knockdown_active_frac"] = float(
-            np.mean(self._knockdown_active))
+        components["action_beta"] = float(self._current_action_beta())
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now
@@ -1002,36 +940,3 @@ class K1StandupEnv(SkillEnv):
                 quat[envs_idx]).astype(np.float32)
         except Exception:
             self._prev_upright[envs_idx] = -1.0
-
-        # L6 fall recovery: schedule a knockdown force for each resetting env.
-        c = self.cfg
-        n = envs_idx.shape[0]
-        if self._pose_level >= 6:
-            if self._easy_pool_size == 0:
-                # Can't start from standing if easy pool is empty — disable.
-                self._knockdown_start[envs_idx] = -1
-            else:
-                steps = self.rng.integers(
-                    c.pose_l6_knockdown_step_min,
-                    c.pose_l6_knockdown_step_max + 1,
-                    size=n,
-                ).astype(np.int32)
-                self._knockdown_start[envs_idx] = steps
-                # Random horizontal direction (no vertical component).
-                angles = self.rng.uniform(0.0, 2.0 * np.pi, size=n).astype(np.float32)
-                self._knockdown_force[envs_idx, 0] = np.cos(angles) * c.pose_l6_knockdown_force_n
-                self._knockdown_force[envs_idx, 1] = np.sin(angles) * c.pose_l6_knockdown_force_n
-                self._knockdown_force[envs_idx, 2] = 0.0
-                t_ang = self.rng.uniform(0.0, 2.0 * np.pi, size=n).astype(np.float32)
-                self._knockdown_torque[envs_idx, 0] = np.cos(t_ang) * c.pose_l6_knockdown_torque_nm
-                self._knockdown_torque[envs_idx, 1] = np.sin(t_ang) * c.pose_l6_knockdown_torque_nm
-                self._knockdown_torque[envs_idx, 2] = 0.0
-            self._knockdown_remaining[envs_idx] = 0
-            self._knockdown_active[envs_idx] = False
-        else:
-            # Non-L6: clear any stale knockdown state from a previous L6 phase.
-            self._knockdown_start[envs_idx] = -1
-            self._knockdown_remaining[envs_idx] = 0
-            self._knockdown_active[envs_idx] = False
-            self._knockdown_force[envs_idx] = 0.0
-            self._knockdown_torque[envs_idx] = 0.0

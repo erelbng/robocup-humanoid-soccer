@@ -130,7 +130,9 @@ class StandupConfig:
     # other envs).
     spawn_height_min: float = 0.8        # m
     spawn_height_max: float = 1.5        # m
-    settle_steps: int = 300              # sim substeps (0.6 s at 500 Hz)
+    settle_steps: int = 1500             # sim substeps (3.0 s at 500 Hz). HUMANUP uses 10 s
+                                       # to resolve self-collisions from randomised DOFs;
+                                       # 3 s is a practical GPU compromise (was 0.6 s).
     settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
     # Filter the pool: keep only states with a clearly fallen robot.
     # Avoids "robot landed upright" trivial-success starts.
@@ -203,7 +205,7 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    easy_pool_enabled: bool = False             # see assist_force_enabled
+    easy_pool_enabled: bool = True              # L0 of the pose curriculum uses it
     easy_pool_settle_steps: int = 30            # brief — robot is already up
     easy_pool_height: float = 0.60              # spawn just above standing
     easy_pool_joint_jitter: float = 0.10        # rad — bigger than reset jitter
@@ -219,26 +221,25 @@ class StandupConfig:
     start_curriculum_min_success: float = 0.05  # minimum EMA frame_success_rate
     start_curriculum_min_easy_frac: float = 0.30  # clamp easy_frac here if stuck
 
-    # ── Pose difficulty curriculum (discrete, L0–L6) ──────────────────────
-    # Each level presents harder fallen poses. Advancement is gated on both
+    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
+    # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
-    #   L0: easy_pool only (near-standing)
-    #   L1: supine only (face up — easiest fallen pose)
-    #   L2: side_left + side_right (50 / 50)
-    #   L3: all 4 named poses equally (25% each)
-    #   L4: named poses 60% + random settle pool 40%
-    #   L5: settle pool only (random fallen — current default behaviour)
-    #   L6: fall recovery — start from easy_pool, knockdown force mid-episode
+    #   L0: near-standing (easy_pool) — learn to balance & hold standing
+    #   L1: supine + prone (50/50)    — core recovery (back & front)
+    #   L2: all 4 named poses (25% each) — + side_left + side_right
+    #   L3: named 50% + random fallen 50% — full robustness
     #
-    # Set pose_curriculum_start_level=5 to replicate the old random-only
-    # behaviour (no curriculum advancement, no named-pose pools used).
+    # Recovery from fully-fallen poses (L1+) is additionally bootstrapped by
+    # the decaying assist force. Set pose_curriculum_start_level=3 to train
+    # directly on the full mixed distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
 
     # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length must equal 6.
-    pose_level_thresholds: tuple = (0.30, 0.50, 0.60, 0.70, 0.80, 0.90)
+    # transition from level i → i+1. Length = (num_levels - 1) = 3.
+    # L0→L1 is high (near-standing is easy → demand mastery before recovery).
+    pose_level_thresholds: tuple = (0.70, 0.50, 0.60)
 
     # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
     # threshold before advancing. Prevents a single lucky spike triggering a
@@ -247,32 +248,21 @@ class StandupConfig:
 
     # Named-pose pool build parameters. Same settle mechanism as the main
     # settle pool but starting from the named pose's reference orientation.
-    pose_pool_settle_steps: int = 150       # physics substeps per round
+    pose_pool_settle_steps: int = 1000      # physics substeps per round (2.0 s at 500 Hz).
+                                            # Was 150 (0.3 s) — too short to damp bouncing
+                                            # after 0.19 s free-fall from spawn height.
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
     pose_pool_quat_noise_rad: float = 0.30  # Gaussian σ on orientation perturbation
+    # Joint noise for named-pose pools. HUMANUP + X-Loco recommend large joint noise
+    # so each pool sample is a distinct fallen configuration rather than a rigid clone
+    # of the canonical pose. 0.30 rad σ ≈ ±17° per joint (was hardcoded 0.05 = ±3°).
+    pose_pool_joint_jitter_rad: float = 0.30
     # Filter: keep pool entries with trunk_z < trunk_height + this margin.
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
 
-    # L4: fraction from all named poses combined (rest from settle pool).
-    pose_l4_named_frac: float = 0.60
-
-    # Push stress test. When success EMA exceeds this threshold, push DR
-    # magnitudes are multiplied by the scale factors. Simulates robust testing
-    # against ball collisions and external disturbances.
-    pose_stress_push_ema_threshold: float = 0.85
-    pose_stress_push_scale: float = 3.0         # force multiplier
-    pose_stress_push_torque_scale: float = 3.0  # torque multiplier
-
-    # L6: fall recovery episode parameters. Episodes start from the easy_pool
-    # (near-standing). A strong horizontal knockdown force fires between
-    # knockdown_step_min and knockdown_step_max (randomised per env per reset)
-    # and is held for knockdown_duration_steps control steps.
-    pose_l6_knockdown_force_n: float = 180.0    # N — strong enough to drop K1
-    pose_l6_knockdown_torque_nm: float = 15.0   # N·m destabilising torque
-    pose_l6_knockdown_step_min: int = 5         # earliest step for knockdown
-    pose_l6_knockdown_step_max: int = 30        # latest step (randomised per env)
-    pose_l6_knockdown_duration_steps: int = 8   # steps the force is held
+    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
+    pose_mix_random_frac: float = 0.50
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
@@ -345,6 +335,17 @@ class StandupConfig:
     max_grad_norm: float = 0.5
     n_epochs: int = 5
     n_steps: int = 64
+
+    # ── β action rescaler (HoST, arXiv:2502.08378) ───────────────────────
+    # Multiplies the residual action delta before clipping. Starts at 1.0
+    # (full ACTION_DELTA_MAX range) and decays to β_end over training.
+    # Limits joint velocity to β × ACTION_DELTA_MAX × control_freq, preventing
+    # violent motions that overheat K1 servos in multi-game scenarios.
+    # At β_end=0.30: max delta = 0.15 rad/step → ≤7.5 rad/s at 50 Hz.
+    action_beta_enabled: bool = True
+    action_beta_start: float = 1.0              # no restriction initially
+    action_beta_end: float = 0.30               # 30% of delta — aligned with HoST's 0.25
+    action_beta_curriculum_steps: int = 300_000_000  # decay horizon
 
     obs_dim: int = 0
     act_dim: int = 22
