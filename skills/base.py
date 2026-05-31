@@ -242,6 +242,14 @@ class SkillEnv(ABC):
         """Return the command vector for this skill (use CommandSpec.empty()
         for no command)."""
 
+    def _sample_commands(self, envs_idx: np.ndarray) -> np.ndarray:
+        """Return freshly-sampled commands for `envs_idx`, shape (n, cmd_dim).
+
+        Default: uniform over the CommandSpec range. Skills override this to
+        apply a curriculum or couple command dims (e.g. walk ramps its speed
+        cap over training and couples step frequency to commanded speed)."""
+        return self.command_spec.sample(len(envs_idx), self.rng)
+
     def _make_head_command_spec(self) -> Optional[CommandSpec]:
         """Override to enable head-look tracking. Default: disabled.
 
@@ -596,8 +604,7 @@ class SkillEnv(ABC):
         self._last_action[envs_idx] = 0.0  # zero delta = hold default pose
 
         if self.command_spec.dim > 0:
-            self.commands[envs_idx] = self.command_spec.sample(
-                len(envs_idx), self.rng)
+            self.commands[envs_idx] = self._sample_commands(envs_idx)
 
         if self.head_command_spec is not None \
                 and self.head_command_spec.dim > 0:

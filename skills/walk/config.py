@@ -20,11 +20,35 @@ class WalkConfig:
     gait_freq_hz: float = 1.5   # clock signal for periodic-gait conditioning
 
     # ── command vec ranges (vx, vy, vyaw, foot_clearance, step_freq) ──
-    vx_range: Tuple[float, float] = (-0.5, 1.0)     # m/s — forward bias
-    vy_range: Tuple[float, float] = (-0.4, 0.4)     # m/s — side-step
-    vyaw_range: Tuple[float, float] = (-1.0, 1.0)   # rad/s
-    foot_clearance_range: Tuple[float, float] = (0.04, 0.12)  # m
-    step_freq_range: Tuple[float, float] = (1.0, 2.5)         # Hz
+    # vx_range is the FINAL (sprint) range; early training is restricted to
+    # `vx_walk_max` and ramps up via the speed curriculum (see below) so the
+    # policy masters balance + a walking gait before being asked to sprint.
+    vx_range: Tuple[float, float] = (-0.8, 2.5)     # m/s — sprint-capable fwd
+    vy_range: Tuple[float, float] = (-0.5, 0.5)     # m/s — side-step
+    vyaw_range: Tuple[float, float] = (-1.5, 1.5)   # rad/s
+    foot_clearance_range: Tuple[float, float] = (0.04, 0.14)  # m
+    step_freq_range: Tuple[float, float] = (1.0, 3.2)         # Hz
+
+    # ── speed curriculum (SPRINT, arXiv:2605.28549) ───────────────────
+    # Ramp the commanded forward-speed cap from a walk to the full sprint
+    # range over training, gated on the policy actually tracking well (like
+    # the standup curricula). Without this, sampling sprint speeds from step
+    # 0 just makes the policy fall — it never learns the slow gait first.
+    speed_curriculum_env_steps: int = 120_000_000
+    vx_walk_max: float = 1.0          # forward-speed cap at curriculum start
+    speed_curriculum_min_track: float = 0.6   # only advance once lin-vel
+    #                                           tracking reward EMA clears this
+
+    # ── frequency-adaptive gait (SPRINT's core idea) ─────────────────
+    # Natural locomotion cadence rises with speed. Rather than sampling
+    # step_freq independently, couple it to the commanded speed during
+    # training: step_freq ≈ base + slope·|v|. The command channel still
+    # exposes step_freq (the orchestrator/deploy can override), but the
+    # TRAINING distribution reflects speed→cadence coupling so the learned
+    # gait is sane across the speed range.
+    freq_adaptive_gait: bool = True
+    step_freq_base: float = 1.3       # Hz at standstill
+    step_freq_per_mps: float = 0.55   # Hz added per m/s of commanded speed
 
     # ── head-look command (from the vision system) ───────────────
     # Direct joint targets for AAHead_yaw / Head_pitch (rad). Ranges

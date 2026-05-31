@@ -55,6 +55,15 @@ class K1WalkEnv(SkillEnv):
         self._foot_links = None
         self._prev_contact = np.zeros((self.num_envs, 2), dtype=bool)
 
+        # Speed-curriculum state (SPRINT-style): the forward-speed cap expands
+        # only as the policy tracks the current speeds well. `_speed_prog`
+        # accrues env-steps ONLY while the lin-vel tracking EMA clears the
+        # gate, so a still-wobbly policy isn't handed sprint commands.
+        self._total_env_steps_seen: int = 0
+        self._speed_prog: int = 0
+        self._track_ema: float = 0.0
+        self._track_ema_alpha: float = 0.01
+
         # Mutate the cfg with the actual obs_dim so the trainer's buffers
         # are sized correctly.
         self.cfg.obs_dim = self.obs_dim
@@ -85,6 +94,34 @@ class K1WalkEnv(SkillEnv):
                           dtype=np.float32),
             names=("head_yaw", "head_pitch"),
         )
+
+    # ── command sampling: speed curriculum + frequency-adaptive gait ──
+
+    def _current_vx_max(self) -> float:
+        """Forward-speed cap, ramped from vx_walk_max → vx_range[1] as the
+        gated speed-progress accrues (SPRINT speed curriculum)."""
+        c = self.cfg
+        if c.speed_curriculum_env_steps <= 0:
+            return c.vx_range[1]
+        p = min(self._speed_prog / float(c.speed_curriculum_env_steps), 1.0)
+        return float(c.vx_walk_max + (c.vx_range[1] - c.vx_walk_max) * p)
+
+    def _sample_commands(self, envs_idx: np.ndarray) -> np.ndarray:
+        n = len(envs_idx)
+        c, rng = self.cfg, self.rng
+        vx = rng.uniform(c.vx_range[0], self._current_vx_max(), n)
+        vy = rng.uniform(c.vy_range[0], c.vy_range[1], n)
+        vyaw = rng.uniform(c.vyaw_range[0], c.vyaw_range[1], n)
+        fc = rng.uniform(c.foot_clearance_range[0], c.foot_clearance_range[1], n)
+        if getattr(c, "freq_adaptive_gait", False):
+            # cadence rises with commanded speed: step_freq ≈ base + slope·|v|
+            speed = np.sqrt(vx ** 2 + vy ** 2)
+            sf = (c.step_freq_base + c.step_freq_per_mps * speed
+                  + rng.normal(0.0, 0.1, n))
+            sf = np.clip(sf, c.step_freq_range[0], c.step_freq_range[1])
+        else:
+            sf = rng.uniform(c.step_freq_range[0], c.step_freq_range[1], n)
+        return np.stack([vx, vy, vyaw, fc, sf], axis=1).astype(np.float32)
 
     # ── scene extras: none for plain walk ──────────────────────────
 
@@ -163,6 +200,17 @@ class K1WalkEnv(SkillEnv):
             default_joint_pos=self._default_action,
             dt=self.dt,
         )
+
+        # ── speed-curriculum bookkeeping ──
+        self._total_env_steps_seen += self.num_envs
+        track = float(components.get("track_lin_vel", 0.0))
+        self._track_ema = ((1.0 - self._track_ema_alpha) * self._track_ema
+                           + self._track_ema_alpha * track)
+        # accrue progress (→ widen the speed cap) ONLY while tracking is good
+        if self._track_ema >= self.cfg.speed_curriculum_min_track:
+            self._speed_prog += self.num_envs
+        components["vx_max_current"] = self._current_vx_max()
+        components["track_ema"] = self._track_ema
 
         self._prev_jvel = jvel
         return reward, components
