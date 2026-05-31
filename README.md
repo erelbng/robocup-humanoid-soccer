@@ -132,6 +132,41 @@ python -m evaluation.evaluate checkpoints/orchestrator/orchestrator_best.pt \
     --phase phase2 --record-video --num-episodes 10
 ```
 
+### Standup: train → eval (Genesis → MuJoCo sim2sim)
+
+The standup skill has a dedicated, validated sim2sim path (teacher 0% → **83%**
+transfer to MuJoCo). The fix that made it transfer is baked into the code
+(joint **armature** is applied in Genesis via `set_dofs_armature` so the
+training dynamics match the MuJoCo MJCF / real motors — the URDF carries no
+rotor inertia, which previously broke transfer). So you just train and eval:
+
+```bash
+# 1. Train the teacher (privileged obs). The armature + friction-DR + assist
+#    curriculum are automatic. Expect a temporary success dip while the assist
+#    weans out (~100-130M steps) — it recovers into an UNAIDED standup.
+./scripts/run.sh train-skill standup --mode teacher \
+    --device gpu --vec-num-envs 2048 --total-timesteps 500_000_000
+
+# 2. Sim2sim eval in MuJoCo (CPU; native position-servo PD; keeps real armature).
+#    Use $(ls -t ...) to grab the latest checkpoint.
+CKPT=$(ls -t checkpoints/skill_standup/skill_standup_step*.pt | head -1)
+MUJOCO_GL=egl python -m evaluation.eval_standup_mujoco "$CKPT" \
+    --episodes 20 --record-video          # success rate + time-to-stand + video
+
+# 3. Genesis-side control eval (same deterministic policy, assist off) —
+#    confirms the teacher's true unaided rate; should track the MuJoCo number.
+python -m evaluation.eval_standup_genesis "$CKPT" --num-envs 128
+
+# 4. (Optional) distill a deployable proprio-only STUDENT, then eval it the
+#    same way as step 2.
+./scripts/run.sh train-skill standup --mode student --teacher-ckpt "$CKPT" \
+    --device gpu --vec-num-envs 2048 --total-timesteps 50_000_000
+```
+
+`MUJOCO_GL=egl` is for headless GPU rendering; on a desktop omit it, and use
+`MUJOCO_GL=osmesa` for headless CPU-only video. Without `--record-video` no GL
+is needed at all.
+
 ## Key Concepts
 
 ### Skill design
