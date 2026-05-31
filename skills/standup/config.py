@@ -219,6 +219,61 @@ class StandupConfig:
     start_curriculum_min_success: float = 0.05  # minimum EMA frame_success_rate
     start_curriculum_min_easy_frac: float = 0.30  # clamp easy_frac here if stuck
 
+    # ── Pose difficulty curriculum (discrete, L0–L6) ──────────────────────
+    # Each level presents harder fallen poses. Advancement is gated on both
+    # sustained EMA success and minimum time at threshold.
+    #
+    #   L0: easy_pool only (near-standing)
+    #   L1: supine only (face up — easiest fallen pose)
+    #   L2: side_left + side_right (50 / 50)
+    #   L3: all 4 named poses equally (25% each)
+    #   L4: named poses 60% + random settle pool 40%
+    #   L5: settle pool only (random fallen — current default behaviour)
+    #   L6: fall recovery — start from easy_pool, knockdown force mid-episode
+    #
+    # Set pose_curriculum_start_level=5 to replicate the old random-only
+    # behaviour (no curriculum advancement, no named-pose pools used).
+    pose_curriculum_enabled: bool = True
+    pose_curriculum_start_level: int = 0
+
+    # EMA threshold to advance FROM each level. Element i controls the
+    # transition from level i → i+1. Length must equal 6.
+    pose_level_thresholds: tuple = (0.30, 0.50, 0.60, 0.70, 0.80, 0.90)
+
+    # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
+    # threshold before advancing. Prevents a single lucky spike triggering a
+    # level jump. At 2048 envs, 1M steps ≈ 488 control steps ≈ ~10 s.
+    pose_advance_sustain_steps: int = 1_000_000
+
+    # Named-pose pool build parameters. Same settle mechanism as the main
+    # settle pool but starting from the named pose's reference orientation.
+    pose_pool_settle_steps: int = 150       # physics substeps per round
+    pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
+    pose_pool_quat_noise_rad: float = 0.30  # Gaussian σ on orientation perturbation
+    # Filter: keep pool entries with trunk_z < trunk_height + this margin.
+    # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
+    pose_pool_max_height_margin: float = 0.30
+
+    # L4: fraction from all named poses combined (rest from settle pool).
+    pose_l4_named_frac: float = 0.60
+
+    # Push stress test. When success EMA exceeds this threshold, push DR
+    # magnitudes are multiplied by the scale factors. Simulates robust testing
+    # against ball collisions and external disturbances.
+    pose_stress_push_ema_threshold: float = 0.85
+    pose_stress_push_scale: float = 3.0         # force multiplier
+    pose_stress_push_torque_scale: float = 3.0  # torque multiplier
+
+    # L6: fall recovery episode parameters. Episodes start from the easy_pool
+    # (near-standing). A strong horizontal knockdown force fires between
+    # knockdown_step_min and knockdown_step_max (randomised per env per reset)
+    # and is held for knockdown_duration_steps control steps.
+    pose_l6_knockdown_force_n: float = 180.0    # N — strong enough to drop K1
+    pose_l6_knockdown_torque_nm: float = 15.0   # N·m destabilising torque
+    pose_l6_knockdown_step_min: int = 5         # earliest step for knockdown
+    pose_l6_knockdown_step_max: int = 30        # latest step (randomised per env)
+    pose_l6_knockdown_duration_steps: int = 8   # steps the force is held
+
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
     # real robot doesn't have. Set True to remove the contact dims from

@@ -80,6 +80,21 @@ def _small_tilt_quat(n: int, max_angle: float,
                      np.zeros_like(cos_h)], axis=-1).astype(np.float32)
 
 
+def _quat_mul(q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Hamilton product of two (N, 4) wxyz quaternion arrays.
+
+    Result = q * r, i.e. apply r first then q (standard quaternion composition).
+    Both inputs must be unit quaternions; output is unit by algebra."""
+    w0, x0, y0, z0 = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    w1, x1, y1, z1 = r[:, 0], r[:, 1], r[:, 2], r[:, 3]
+    return np.stack([
+        w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+        w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+        w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+        w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+    ], axis=-1).astype(np.float32)
+
+
 class K1StandupEnv(SkillEnv):
 
     SKILL_NAME = "standup"
@@ -146,6 +161,26 @@ class K1StandupEnv(SkillEnv):
 
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
+
+        # ── Pose difficulty curriculum (L0–L6) ────────────────────────────
+        self._pose_level: int = self.cfg.pose_curriculum_start_level
+        self._pose_level_sustain_steps: int = 0
+        # Named-pose pools built lazily alongside the settle pool.
+        # {pose_name: {"pos": (M,3), "quat": (M,4), "jpos": (M,22), "size": int}}
+        self._named_pools: dict = {}
+
+        # L6 per-env knockdown state. -1 in _knockdown_start means not scheduled.
+        self._knockdown_start = np.full(self.num_envs, -1, dtype=np.int32)
+        self._knockdown_remaining = np.zeros(self.num_envs, dtype=np.int32)
+        self._knockdown_active = np.zeros(self.num_envs, dtype=bool)
+        self._knockdown_force = np.zeros((self.num_envs, 3), dtype=np.float32)
+        self._knockdown_torque = np.zeros((self.num_envs, 3), dtype=np.float32)
+
+        # Push stress scaling (1.0 = normal; goes up when EMA is high).
+        self._push_stress_scale: float = 1.0
+        # Base push limits captured once after the scheduler is built.
+        self._base_push_force_max: float = -1.0
+        self._base_push_torque_max: float = -1.0
 
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
@@ -343,6 +378,220 @@ class K1StandupEnv(SkillEnv):
         print(f"[standup] easy pool built: {self._easy_pool_size} states "
               f"(of {N} attempts) — used for reverse curriculum")
 
+    def _build_pose_pool(self, pose) -> dict:
+        """Spawn all envs at a named StandupPose, briefly settle, snapshot.
+
+        Orientation noise (σ = cfg.pose_pool_quat_noise_rad) is composed on top
+        of the reference quat so each sample is a physically distinct variant.
+        Returns {"pos", "quat", "jpos", "size"}. Returns size=0 on failure
+        (does NOT raise) so the caller can fall back gracefully.
+        """
+        c = self.cfg
+        N = self.num_envs
+        all_idx = np.arange(N)
+
+        _empty = {"pos": np.zeros((0, 3), dtype=np.float32),
+                  "quat": np.zeros((0, 4), dtype=np.float32),
+                  "jpos": np.zeros((0, self.act_dim), dtype=np.float32),
+                  "size": 0}
+
+        # Build reference joint target from the pose's joint dict.
+        name_to_idx = {name: i
+                       for i, name in enumerate(self.robot_cfg.joint_names)}
+        jpos_ref = self._default_action.copy()
+        for jname, angle in pose.joint_targets.items():
+            idx = name_to_idx.get(jname)
+            if idx is not None:
+                jpos_ref[idx] = float(angle)
+
+        # Base orientation tiled to (N, 4).
+        base_quat = np.tile(
+            np.array([pose.trunk_quat], dtype=np.float32), (N, 1))
+
+        pool_pos, pool_quat, pool_jpos = [], [], []
+
+        for round_idx in range(c.pose_pool_rounds):
+            # Compose base quat with small random tilt noise.
+            noise = _small_tilt_quat(N, c.pose_pool_quat_noise_rad, self.rng)
+            quat = _quat_mul(noise, base_quat)  # noise on top of base pose
+
+            pos = np.zeros((N, 3), dtype=np.float32)
+            pos[:, 2] = pose.trunk_height + 0.05  # small clearance above floor
+
+            # Small joint jitter so pool entries aren't rigidly identical.
+            jpos_target = (np.tile(jpos_ref, (N, 1))
+                           + self.rng.standard_normal((N, self.act_dim))
+                              .astype(np.float32) * 0.05)
+
+            try:
+                self.robot.set_pos(pos, envs_idx=all_idx)
+                self.robot.set_quat(quat, envs_idx=all_idx)
+                self.robot.set_dofs_position(jpos_target, self.dof_indices,
+                                              envs_idx=all_idx,
+                                              zero_velocity=True)
+                self.robot.control_dofs_position(jpos_target, self.dof_indices)
+            except Exception as e:
+                print(f"[standup] pose pool '{pose.name}' spawn "
+                      f"(round {round_idx}) failed: {e}")
+                continue
+
+            for _ in range(c.pose_pool_settle_steps):
+                self.scene.step()
+
+            try:
+                p = _to_np(self.robot.get_pos()).copy()
+                q = _to_np(self.robot.get_quat()).copy()
+                j = _to_np(self.robot.get_dofs_position(
+                    self.dof_indices)).copy()
+            except Exception as e:
+                print(f"[standup] pose pool '{pose.name}' snapshot failed: {e}")
+                continue
+
+            up = upright_signal(q)
+            max_z = pose.trunk_height + c.pose_pool_max_height_margin
+            ok = (p[:, 2] < max_z) & (up < c.pool_max_upright)
+            if ok.any():
+                pp = p[ok].copy()
+                pp[:, 0:2] = 0.0  # re-centre xy
+                pool_pos.append(pp)
+                pool_quat.append(q[ok].copy())
+                pool_jpos.append(j[ok].copy())
+
+        if not pool_pos:
+            print(f"[standup] WARNING: pose pool '{pose.name}' empty after "
+                  f"filtering — will fall back to settle pool at this level.")
+            return _empty
+
+        pos_arr = np.concatenate(pool_pos).astype(np.float32)
+        quat_arr = np.concatenate(pool_quat).astype(np.float32)
+        jpos_arr = np.concatenate(pool_jpos).astype(np.float32)
+        return {"pos": pos_arr, "quat": quat_arr,
+                "jpos": jpos_arr, "size": pos_arr.shape[0]}
+
+    def _build_all_pools(self) -> None:
+        """Build easy pool, all named-pose pools, and the settle pool.
+
+        Order matters only for the settle pool (goes last so it leaves envs
+        in the most neutral state for training). Easy pool goes first because
+        it's needed at L0 and L6 regardless of easy_pool_enabled.
+        """
+        from envs.standup import all_poses
+        self._build_easy_pool()  # always — needed for L0 and L6
+        for pose in all_poses():
+            pool = self._build_pose_pool(pose)
+            self._named_pools[pose.name] = pool
+            print(f"[standup] pose pool '{pose.name}': {pool['size']} states")
+        self._build_settle_pool()  # leaves envs in fallen state
+
+    # ── pool sampling helpers ─────────────────────────────────────
+
+    def _sample_from_pool(self, pool_name: str, n: int) -> tuple:
+        """Return (pos, quat, jpos) of n random states from the named pool.
+
+        Falls back to the settle pool with a one-time warning if the requested
+        pool is empty or missing.
+        """
+        if pool_name == "easy":
+            if self._easy_pool_size > 0:
+                idx = self.rng.integers(0, self._easy_pool_size, size=n)
+                return (self._easy_pool_pos[idx].copy(),
+                        self._easy_pool_quat[idx].copy(),
+                        self._easy_pool_jpos[idx].copy())
+            pool_name = "random"  # fallback
+
+        if pool_name == "random":
+            idx = self.rng.integers(0, self._pool_size, size=n)
+            return (self._pool_pos[idx].copy(),
+                    self._pool_quat[idx].copy(),
+                    self._pool_jpos[idx].copy())
+
+        pool = self._named_pools.get(pool_name)
+        if pool is None or pool["size"] == 0:
+            warn_attr = f"_pool_warn_{pool_name}"
+            if not getattr(self, warn_attr, False):
+                print(f"[standup] WARNING: pool '{pool_name}' empty, "
+                      f"falling back to settle pool")
+                setattr(self, warn_attr, True)
+            idx = self.rng.integers(0, self._pool_size, size=n)
+            return (self._pool_pos[idx].copy(),
+                    self._pool_quat[idx].copy(),
+                    self._pool_jpos[idx].copy())
+
+        idx = self.rng.integers(0, pool["size"], size=n)
+        return (pool["pos"][idx].copy(),
+                pool["quat"][idx].copy(),
+                pool["jpos"][idx].copy())
+
+    def _gather_by_choice(self, name_mask_pairs: list, n: int) -> tuple:
+        """Assemble (pos, quat, jpos) from multiple pools based on per-env masks."""
+        pos = np.empty((n, 3), dtype=np.float32)
+        quat = np.empty((n, 4), dtype=np.float32)
+        jpos = np.empty((n, self.act_dim), dtype=np.float32)
+        for pool_name, mask in name_mask_pairs:
+            count = int(mask.sum())
+            if count > 0:
+                p, q, j = self._sample_from_pool(pool_name, count)
+                pos[mask] = p
+                quat[mask] = q
+                jpos[mask] = j
+        return pos, quat, jpos
+
+    def _sample_reset_from_level(self, n: int) -> tuple:
+        """Return (pos, quat, jpos) for n envs based on the current pose level.
+
+        L0 → easy pool (near-standing)
+        L1 → supine only
+        L2 → side_left + side_right (50 / 50)
+        L3 → all 4 named poses equally
+        L4 → named 60% + settle pool 40%
+        L5 → settle pool (random fallen)
+        L6 → easy pool (knockdown applied mid-episode via _assist_wrench)
+        """
+        level = self._pose_level
+
+        if level == 0 or level >= 6:
+            return self._sample_from_pool("easy", n)
+
+        if level == 1:
+            return self._sample_from_pool("supine", n)
+
+        if level == 2:
+            choice = self.rng.integers(0, 2, size=n)
+            return self._gather_by_choice(
+                [("side_left", choice == 0), ("side_right", choice == 1)], n)
+
+        if level == 3:
+            choice = self.rng.integers(0, 4, size=n)
+            names = ["supine", "prone", "side_left", "side_right"]
+            return self._gather_by_choice(
+                [(nm, choice == i) for i, nm in enumerate(names)], n)
+
+        if level == 4:
+            n_named = max(0, int(round(n * self.cfg.pose_l4_named_frac)))
+            n_random = n - n_named
+            pos = np.empty((n, 3), dtype=np.float32)
+            quat = np.empty((n, 4), dtype=np.float32)
+            jpos = np.empty((n, self.act_dim), dtype=np.float32)
+            if n_named > 0:
+                choice = self.rng.integers(0, 4, size=n_named)
+                names = ["supine", "prone", "side_left", "side_right"]
+                pn, qn, jn = self._gather_by_choice(
+                    [(nm, choice == i) for i, nm in enumerate(names)], n_named)
+                pos[:n_named] = pn
+                quat[:n_named] = qn
+                jpos[:n_named] = jn
+            if n_random > 0:
+                pr, qr, jr = self._sample_from_pool("random", n_random)
+                pos[n_named:] = pr
+                quat[n_named:] = qr
+                jpos[n_named:] = jr
+            # Shuffle to avoid positional bias across parallel envs.
+            perm = self.rng.permutation(n)
+            return pos[perm], quat[perm], jpos[perm]
+
+        # level == 5: full random fallen (legacy behaviour)
+        return self._sample_from_pool("random", n)
+
     # ── contact-link lookup (after scene.build) ───────────────────
 
     def _ensure_contact_links(self) -> None:
@@ -417,44 +666,16 @@ class K1StandupEnv(SkillEnv):
     # ── reset using the pool ──────────────────────────────────────
 
     def _reset_robot_pose(self, envs_idx: np.ndarray) -> None:
-        # Build pools on first reset (lazy — needs scene + robot ready).
-        # IMPORTANT: build the easy pool FIRST. Both builders set state
-        # across all envs and step physics, so the second build overwrites
-        # the first build's state — but only the FINAL state matters here
-        # because the snapshots have already been taken and stored.
+        # Build all pools on first reset (lazy — needs scene + robot ready).
+        # _pool_pos is None until _build_settle_pool (called last) sets it.
         if self._pool_pos is None:
-            if self.cfg.easy_pool_enabled:
-                self._build_easy_pool()
-            self._build_settle_pool()
+            self._build_all_pools()
 
         n = envs_idx.shape[0]
-        # Reverse curriculum: pick a fraction of envs to start from the
-        # easy (near-standing) pool. Fraction ramps from 1.0 → 0.0 as
-        # training progresses; once curriculum ends, all starts are
-        # fallen (same as before).
-        easy_frac = self._current_easy_fraction()
-        use_easy = (self.rng.uniform(0.0, 1.0, size=n) < easy_frac) \
-                   & (self._easy_pool_size > 0)
-        n_easy = int(use_easy.sum())
-        n_hard = n - n_easy
+        pos, quat, jpos = self._sample_reset_from_level(n)
 
-        pos = np.empty((n, 3), dtype=np.float32)
-        quat = np.empty((n, 4), dtype=np.float32)
-        jpos = np.empty((n, self.act_dim), dtype=np.float32)
-
-        if n_easy > 0:
-            ei = self.rng.integers(0, self._easy_pool_size, size=n_easy)
-            pos[use_easy] = self._easy_pool_pos[ei]
-            quat[use_easy] = self._easy_pool_quat[ei]
-            jpos[use_easy] = self._easy_pool_jpos[ei]
-        if n_hard > 0:
-            hi = self.rng.integers(0, self._pool_size, size=n_hard)
-            pos[~use_easy] = self._pool_pos[hi]
-            quat[~use_easy] = self._pool_quat[hi]
-            jpos[~use_easy] = self._pool_jpos[hi]
-
-        # Small Gaussian joint jitter on top of the pool sample — adds
-        # continuous variation across (pool_size × ∞) effective starts.
+        # Small Gaussian joint jitter adds continuous variation on top of
+        # the discrete pool — effectively infinite unique starting states.
         if self.cfg.joint_jitter_rad > 0:
             jpos = jpos + (self.rng.standard_normal(jpos.shape)
                            .astype(np.float32)
@@ -545,31 +766,110 @@ class K1StandupEnv(SkillEnv):
 
     def _assist_wrench(self):
         zeros = np.zeros((self.num_envs, 3), dtype=np.float32)
-        frac = self._current_assist_fraction()
-        if frac <= 0.0:
-            self._last_assist_force_mean = 0.0
-            return zeros, zeros
-
-        try:
-            z = _to_np(self.robot.get_pos())[:, 2]
-        except Exception:
-            self._last_assist_force_mean = 0.0
-            return zeros, zeros
-
-        peak = self.cfg.assist_force_max
-        if self.cfg.assist_spring_shape:
-            # Strongest when fully fallen, releasing to ~0 near standing.
-            target = self.cfg.target_height
-            deficit = np.clip((target - z) / max(target, 1e-6), 0.0, 1.0)
-            fz = frac * peak * deficit
-        else:
-            # Flat support that simply decays with the curriculum.
-            fz = np.full(self.num_envs, frac * peak, dtype=np.float32)
-
         force = zeros.copy()
-        force[:, 2] = fz.astype(np.float32)  # world +z, upward only
-        self._last_assist_force_mean = float(np.mean(fz))
-        return force, zeros
+        torque = zeros.copy()
+
+        # ── upward assist force (decaying curriculum) ──────────────
+        frac = self._current_assist_fraction()
+        if frac > 0.0:
+            try:
+                z = _to_np(self.robot.get_pos())[:, 2]
+                peak = self.cfg.assist_force_max
+                if self.cfg.assist_spring_shape:
+                    target = self.cfg.target_height
+                    deficit = np.clip(
+                        (target - z) / max(target, 1e-6), 0.0, 1.0)
+                    fz = frac * peak * deficit
+                else:
+                    fz = np.full(self.num_envs, frac * peak, dtype=np.float32)
+                force[:, 2] = fz.astype(np.float32)
+                self._last_assist_force_mean = float(np.mean(fz))
+            except Exception:
+                self._last_assist_force_mean = 0.0
+        else:
+            self._last_assist_force_mean = 0.0
+
+        # ── L6 knockdown force ─────────────────────────────────────
+        if self._pose_level >= 6:
+            # Activate envs whose knockdown step has arrived.
+            should_start = (
+                (self._knockdown_start >= 0)
+                & (self.step_count == self._knockdown_start)
+                & (~self._knockdown_active)
+            )
+            if should_start.any():
+                idx = np.where(should_start)[0]
+                self._knockdown_active[idx] = True
+                self._knockdown_remaining[idx] = (
+                    self.cfg.pose_l6_knockdown_duration_steps)
+
+            # Tick timers and apply force to currently-active envs.
+            if self._knockdown_active.any():
+                self._knockdown_remaining[self._knockdown_active] -= 1
+                expired = (self._knockdown_active
+                           & (self._knockdown_remaining <= 0))
+                if expired.any():
+                    self._knockdown_active[expired] = False
+                    self._knockdown_start[expired] = -1
+                active = self._knockdown_active
+                force[active] += self._knockdown_force[active]
+                torque[active] += self._knockdown_torque[active]
+
+        return force, torque
+
+    # ── pose curriculum advancement ───────────────────────────────
+
+    def _maybe_advance_level(self) -> None:
+        """Advance pose curriculum level when EMA has been above threshold
+        for pose_advance_sustain_steps cumulative env-steps. Never regresses."""
+        if not self.cfg.pose_curriculum_enabled or self._pose_level >= 6:
+            return
+        thresholds = self.cfg.pose_level_thresholds
+        if self._pose_level >= len(thresholds):
+            return
+        threshold = thresholds[self._pose_level]
+        if self._success_rate_ema >= threshold:
+            self._pose_level_sustain_steps += self.num_envs
+            if self._pose_level_sustain_steps >= self.cfg.pose_advance_sustain_steps:
+                old = self._pose_level
+                self._pose_level += 1
+                self._pose_level_sustain_steps = 0
+                print(f"[standup] pose curriculum: L{old} → L{self._pose_level} "
+                      f"(EMA={self._success_rate_ema:.3f})")
+        else:
+            # EMA fell below threshold — reset sustain counter (no regression).
+            self._pose_level_sustain_steps = 0
+
+    def _update_push_stress(self) -> None:
+        """Scale push DR magnitudes when EMA success rate is high.
+
+        Mutates dr_cfg directly; PushScheduler holds a reference to it so
+        the updated values are used on the next triggered push.
+        """
+        if self._push_scheduler is None:
+            return
+        # Capture baseline once (after scheduler and dr_cfg are built).
+        if self._base_push_force_max < 0.0:
+            self._base_push_force_max = self.dr_cfg.push_force_max
+            self._base_push_torque_max = self.dr_cfg.push_torque_max
+
+        c = self.cfg
+        if self._success_rate_ema >= c.pose_stress_push_ema_threshold:
+            target_f = self._base_push_force_max * c.pose_stress_push_scale
+            target_t = self._base_push_torque_max * c.pose_stress_push_torque_scale
+        else:
+            target_f = self._base_push_force_max
+            target_t = self._base_push_torque_max
+
+        if self.dr_cfg.push_force_max != target_f:
+            stressed = target_f > self._base_push_force_max
+            self.dr_cfg.push_force_max = target_f
+            self.dr_cfg.push_torque_max = target_t
+            self._push_stress_scale = (c.pose_stress_push_scale
+                                       if stressed else 1.0)
+            print(f"[standup] push stress {'ON' if stressed else 'OFF'}: "
+                  f"force={target_f:.1f} N  torque={target_t:.1f} N·m  "
+                  f"(EMA={self._success_rate_ema:.3f})")
 
     # ── reward + sustained-success bookkeeping ────────────────────
 
@@ -646,6 +946,15 @@ class K1StandupEnv(SkillEnv):
         )
         components["success_rate_ema"] = self._success_rate_ema
 
+        # Pose curriculum advancement and push stress updates.
+        self._update_push_stress()
+        self._maybe_advance_level()
+
+        components["pose_curriculum_level"] = float(self._pose_level)
+        components["push_stress_scale"] = float(self._push_stress_scale)
+        components["knockdown_active_frac"] = float(
+            np.mean(self._knockdown_active))
+
         self._success_streak = new_streak
         self._sustained_now = sustained_now
         self._achieved_sustained = achieved_sustained
@@ -693,3 +1002,36 @@ class K1StandupEnv(SkillEnv):
                 quat[envs_idx]).astype(np.float32)
         except Exception:
             self._prev_upright[envs_idx] = -1.0
+
+        # L6 fall recovery: schedule a knockdown force for each resetting env.
+        c = self.cfg
+        n = envs_idx.shape[0]
+        if self._pose_level >= 6:
+            if self._easy_pool_size == 0:
+                # Can't start from standing if easy pool is empty — disable.
+                self._knockdown_start[envs_idx] = -1
+            else:
+                steps = self.rng.integers(
+                    c.pose_l6_knockdown_step_min,
+                    c.pose_l6_knockdown_step_max + 1,
+                    size=n,
+                ).astype(np.int32)
+                self._knockdown_start[envs_idx] = steps
+                # Random horizontal direction (no vertical component).
+                angles = self.rng.uniform(0.0, 2.0 * np.pi, size=n).astype(np.float32)
+                self._knockdown_force[envs_idx, 0] = np.cos(angles) * c.pose_l6_knockdown_force_n
+                self._knockdown_force[envs_idx, 1] = np.sin(angles) * c.pose_l6_knockdown_force_n
+                self._knockdown_force[envs_idx, 2] = 0.0
+                t_ang = self.rng.uniform(0.0, 2.0 * np.pi, size=n).astype(np.float32)
+                self._knockdown_torque[envs_idx, 0] = np.cos(t_ang) * c.pose_l6_knockdown_torque_nm
+                self._knockdown_torque[envs_idx, 1] = np.sin(t_ang) * c.pose_l6_knockdown_torque_nm
+                self._knockdown_torque[envs_idx, 2] = 0.0
+            self._knockdown_remaining[envs_idx] = 0
+            self._knockdown_active[envs_idx] = False
+        else:
+            # Non-L6: clear any stale knockdown state from a previous L6 phase.
+            self._knockdown_start[envs_idx] = -1
+            self._knockdown_remaining[envs_idx] = 0
+            self._knockdown_active[envs_idx] = False
+            self._knockdown_force[envs_idx] = 0.0
+            self._knockdown_torque[envs_idx] = 0.0
