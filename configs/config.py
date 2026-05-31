@@ -87,20 +87,44 @@ class K1RobotConfig:
     # on ankles (50/1) since ankle joints can't physically push as hard.
     # We expose per-joint-group gains here; per-joint plumbing happens
     # in the skill env's _init_genesis() when it calls set_dofs_kp.
-    kp: float = 50.0      # legacy uniform fallback
-    kd: float = 5.0
-    # T1-style per-joint-group gains (used when set_dofs_kp accepts an
-    # array indexed by joint).
-    kp_hip:   float = 200.0
-    kp_knee:  float = 200.0
-    kp_ankle: float = 50.0
-    kp_arm:   float = 50.0
-    kp_head:  float = 20.0
-    kd_hip:   float = 5.0
-    kd_knee:  float = 5.0
+    kp: float = 30.0      # legacy uniform fallback
+    kd: float = 1.0
+    # Per-joint-group PD gains. LOWERED toward canonical Genesis locomotion
+    # (the official go2 example uses kp=20 / kd=0.5) from the previous T1-style
+    # kp=200 / kd=5. Reasoning (2026-05-30): kp=200 is ~10× canonical and makes
+    # the controller near-rigidly position-locked, so the policy overfits
+    # Genesis's exact contact response and transfers terribly to MuJoCo (100%
+    # → 0%). Compliant low-gain control is inherently more robust across
+    # physics engines (and keeps torques realistic without a clamp). K1 is
+    # heavier than go2, so legs sit a bit above 20 (≈40) rather than exactly
+    # go2's 20. Revisit if the standup needs more authority.
+    kp_hip:   float = 40.0
+    kp_knee:  float = 40.0
+    kp_ankle: float = 40.0
+    kp_arm:   float = 20.0
+    kp_head:  float = 10.0
+    kd_hip:   float = 1.0
+    kd_knee:  float = 1.0
     kd_ankle: float = 1.0
-    kd_arm:   float = 2.0
-    kd_head:  float = 1.0
+    kd_arm:   float = 0.5
+    kd_head:  float = 0.5
+
+    # Per-joint motor ARMATURE (reflected rotor inertia), kg·m² — from the K1
+    # MJCF. CRITICAL for sim2sim/sim2real: the URDF has no <dynamics>, so
+    # Genesis trained with ZERO armature while MuJoCo (and the real motors)
+    # have it — and for the legs it's 0.05-0.10, i.e. 5-50× the link's own
+    # inertia, so it DOMINATES the joint dynamics. A policy trained without it
+    # cannot transfer (the MuJoCo joints feel far heavier). The skill env now
+    # applies these via `set_dofs_armature` at scene build so Genesis joint
+    # dynamics match MuJoCo.
+    armature_head:      float = 0.002
+    armature_arm:       float = 0.001
+    armature_hip_pitch: float = 0.0478125
+    armature_hip_roll:  float = 0.0339552
+    armature_hip_yaw:   float = 0.0282528
+    armature_knee:      float = 0.095625
+    armature_ankle:     float = 0.0565
+    armature_default:   float = 0.01
 
 
 # ─── Training Config ─────────────────────────────────────────────────────────

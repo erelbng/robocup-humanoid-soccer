@@ -135,7 +135,10 @@ def load_checkpoint(path: str, policy, optimizer=None):
     except ImportError:
         print("PyTorch not available")
         return None
-    ckpt = torch.load(path, map_location="cpu")
+    # weights_only=False: our checkpoints carry numpy obs_norm/ret_norm state,
+    # which torch>=2.6's default weights_only=True refuses to unpickle. These
+    # are our own trusted checkpoints (not untrusted downloads).
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     sd = ckpt.get("policy_state_dict") or ckpt.get("actor_state_dict")
     if sd is None:
         print(f"[load] checkpoint {path} has no policy/actor state_dict")
