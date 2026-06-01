@@ -666,15 +666,33 @@ class SkillEnv(ABC):
 
         self.step_count += 1
 
-        obs = self._get_obs()
+        # Obs at the post-physics state. For envs about to reset this is the
+        # TERMINAL obs (returned in info for value bootstrapping); for the
+        # rest it is simply the next obs.
+        terminal_obs = self._get_obs()
         reward, components = self._compute_skill_reward(action)
         done = self._check_skill_done()
+        # Separate true termination from time-limit truncation: a timeout is
+        # NOT a terminal state — its value must still be bootstrapped in GAE,
+        # whereas a true terminal (e.g. a fall) must not. Standup is
+        # timeout-only, so every episode end here is a truncation.
+        truncated = self.step_count >= self.MAX_EPISODE_STEPS
+        terminated = np.asarray(done) & ~truncated
 
         self._episode_reward += reward
         self._last_action = action  # delta (residual), not absolute target
 
         if done.any():
-            self.reset(envs_idx=np.where(done)[0])
+            didx = np.where(done)[0]
+            self.reset(envs_idx=didx)
+            # Return the FRESH post-reset obs for the envs that reset, so the
+            # next action is chosen from the actual new state rather than the
+            # discarded terminal obs. Non-reset envs keep their obs unchanged.
+            fresh = self._get_obs()
+            obs = terminal_obs.copy()
+            obs[didx] = fresh[didx]
+        else:
+            obs = terminal_obs
 
         info = {
             "episode_reward": self._episode_reward.copy(),
@@ -682,6 +700,11 @@ class SkillEnv(ABC):
             "reward_components": components,
             # (N, G) per-group reward for multi-critic PPO, or None.
             "group_rewards": self._group_rewards,
+            # Time-limit handling for correct GAE bootstrapping. `terminal_obs`
+            # is the pre-reset obs; `truncated`/`terminated` split episode-end.
+            "terminal_obs": terminal_obs,
+            "terminated": terminated,
+            "truncated": truncated,
         }
         return obs, reward, done, info
 
