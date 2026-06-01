@@ -130,7 +130,7 @@ class StandupConfig:
     # other envs).
     spawn_height_min: float = 0.8        # m
     spawn_height_max: float = 1.5        # m
-    settle_steps: int = 1500             # sim substeps (3.0 s at 500 Hz). HUMANUP uses 10 s
+    settle_steps: int = 300             # sim substeps (3.0 s at 500 Hz). HUMANUP uses 10 s
                                        # to resolve self-collisions from randomised DOFs;
                                        # 3 s is a practical GPU compromise (was 0.6 s).
     settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
@@ -142,27 +142,13 @@ class StandupConfig:
     # unlimited per-reset variation on top of the discrete pool.
     joint_jitter_rad: float = 0.03
 
-    # Reverse curriculum on initial pose distribution. Build a second
-    # pool of near-standing starts (default pose + small jitter, brief
-    # settle) and mix it with the fallen pool. Early in training the
-    # policy mostly trains on easy starts (already standing → just
-    # don't fall) so it learns what standing LOOKS like and gets the
-    # success bonus regularly. As `_total_env_steps_seen` advances, the
-    # mix shifts to fully fallen starts. This addresses the actual
-    # blocker (PPO can't randomly discover the standup trajectory) by
-    # giving the policy reachable "good states" to learn from before
-    # asking it to recover from arbitrary fallen poses.
     # ── Assistive-force curriculum (HoST, arXiv:2502.08378) ──────────
     # The single highest-leverage exploration aid for standup: apply a
     # DECAYING upward "support" force on the trunk — like helping an
     # infant stand. Early in training the force nearly holds the robot up,
     # so the policy reliably reaches the standing pose and learns what the
     # whole fallen→upright trajectory feels like; the force then weans to
-    # zero so the final policy stands unaided. This supersedes the
-    # easy-pose reverse curriculum (which only changed WHERE you start, not
-    # how hard the climb is) — `easy_pool_enabled` is therefore OFF by
-    # default when the assist is on, to isolate the effect. Flip both if
-    # you want to compare.
+    # zero so the final policy stands unaided.
     assist_force_enabled: bool = True
     # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
     # so 160 N supports most of body weight without launching it — the
@@ -177,7 +163,7 @@ class StandupConfig:
     # cumulative env-steps. Should be on the same order as the discovery
     # phase length (a good chunk of total_timesteps).
     assist_curriculum_env_steps: int = 150_000_000
-    # Performance gate (mirrors the easy-start gate): don't wean the assist
+    # Performance gate: don't wean the assist
     # while the policy is still failing. Hold the fraction at
     # `assist_min_frac` until the EMA frame-success rate clears the
     # threshold. Prevents the time-only decay from removing all support
@@ -205,41 +191,23 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    easy_pool_enabled: bool = True              # L0 of the pose curriculum uses it
-    easy_pool_settle_steps: int = 30            # brief — robot is already up
-    easy_pool_height: float = 0.60              # spawn just above standing
-    easy_pool_joint_jitter: float = 0.10        # rad — bigger than reset jitter
-    easy_pool_tilt_max: float = 0.15            # rad (~8°) — small initial tilt
-    easy_pool_min_height: float = 0.40          # filter: keep only standing-ish
-    easy_pool_min_upright: float = 0.70         # filter: cos(tilt) ≥ 0.70
-    start_curriculum_env_steps: int = 50_000_000  # ramp easy_frac 1.0 → 0.0
-    # Performance gate: easy_frac only decays when the EMA success rate
-    # exceeds this threshold. Below it, the fraction is held at
-    # `start_curriculum_min_easy_frac` to keep training viable. This
-    # prevents the time-only curriculum from reaching 0% easy starts while
-    # the policy still has 0% success rate.
-    start_curriculum_min_success: float = 0.05  # minimum EMA frame_success_rate
-    start_curriculum_min_easy_frac: float = 0.30  # clamp easy_frac here if stuck
-
-    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
+    # ── Pose difficulty curriculum (discrete, L0–L2) ──────────────────────
     # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
-    #   L0: near-standing (easy_pool) — learn to balance & hold standing
-    #   L1: supine + prone (50/50)    — core recovery (back & front)
-    #   L2: all 4 named poses (25% each) — + side_left + side_right
-    #   L3: named 50% + random fallen 50% — full robustness
+    #   L0: supine + prone (50/50)    — core recovery (back & front)
+    #   L1: all 4 named poses (25% each) — + side_left + side_right
+    #   L2: named 50% + random fallen 50% — full robustness
     #
-    # Recovery from fully-fallen poses (L1+) is additionally bootstrapped by
-    # the decaying assist force. Set pose_curriculum_start_level=3 to train
-    # directly on the full mixed distribution (no curriculum ramp).
+    # Recovery from fully-fallen poses is bootstrapped by the decaying assist
+    # force. Set pose_curriculum_start_level=2 to train directly on the full
+    # mixed distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
 
     # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length = (num_levels - 1) = 3.
-    # L0→L1 is high (near-standing is easy → demand mastery before recovery).
-    pose_level_thresholds: tuple = (0.70, 0.50, 0.60)
+    # transition from level i → i+1. Length = (num_levels - 1) = 2.
+    pose_level_thresholds: tuple = (0.50, 0.60)
 
     # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
     # threshold before advancing. Prevents a single lucky spike triggering a
@@ -248,7 +216,7 @@ class StandupConfig:
 
     # Named-pose pool build parameters. Same settle mechanism as the main
     # settle pool but starting from the named pose's reference orientation.
-    pose_pool_settle_steps: int = 1000      # physics substeps per round (2.0 s at 500 Hz).
+    pose_pool_settle_steps: int = 150      # physics substeps per round (2.0 s at 500 Hz).
                                             # Was 150 (0.3 s) — too short to damp bouncing
                                             # after 0.19 s free-fall from spawn height.
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
@@ -261,7 +229,7 @@ class StandupConfig:
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
 
-    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
+    # L2: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
@@ -335,17 +303,6 @@ class StandupConfig:
     max_grad_norm: float = 0.5
     n_epochs: int = 5
     n_steps: int = 64
-
-    # ── β action rescaler (HoST, arXiv:2502.08378) ───────────────────────
-    # Multiplies the residual action delta before clipping. Starts at 1.0
-    # (full ACTION_DELTA_MAX range) and decays to β_end over training.
-    # Limits joint velocity to β × ACTION_DELTA_MAX × control_freq, preventing
-    # violent motions that overheat K1 servos in multi-game scenarios.
-    # At β_end=0.30: max delta = 0.15 rad/step → ≤7.5 rad/s at 50 Hz.
-    action_beta_enabled: bool = True
-    action_beta_start: float = 1.0              # no restriction initially
-    action_beta_end: float = 0.30               # 30% of delta — aligned with HoST's 0.25
-    action_beta_curriculum_steps: int = 300_000_000  # decay horizon
 
     obs_dim: int = 0
     act_dim: int = 22

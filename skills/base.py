@@ -113,8 +113,8 @@ class SkillEnv(ABC):
     # joint pose, clipped to ±ACTION_DELTA_MAX radians per control step.
     # This ensures a near-zero-initialised network holds the default
     # standing pose (rather than commanding all joints to 0), which is
-    # critical for skills that start near the desired pose (standup easy
-    # pool, walk). Subclasses can tighten this for fine-grained skills.
+    # critical for skills that start near the desired pose (walk).
+    # Subclasses can tighten this for fine-grained skills.
     ACTION_DELTA_MAX: float = 0.5
 
     # Episode-termination thresholds (override in subclasses if needed).

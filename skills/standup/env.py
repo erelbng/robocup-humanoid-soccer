@@ -128,12 +128,6 @@ class K1StandupEnv(SkillEnv):
         self._pool_jpos: Optional[np.ndarray] = None
         self._pool_size: int = 0
 
-        # Easy pool — near-standing starts for the reverse curriculum.
-        self._easy_pool_pos: Optional[np.ndarray] = None
-        self._easy_pool_quat: Optional[np.ndarray] = None
-        self._easy_pool_jpos: Optional[np.ndarray] = None
-        self._easy_pool_size: int = 0
-
         # Per-env reward / termination state.
         self._frame_success = np.zeros(self.num_envs, dtype=bool)
         self._success_streak = np.zeros(self.num_envs, dtype=np.int32)
@@ -150,8 +144,8 @@ class K1StandupEnv(SkillEnv):
         # envs of every `step()` call). Drives the hold_steps curriculum.
         self._total_env_steps_seen: int = 0
         # EMA of frame_success_rate — used to gate curriculum advancement.
-        # The easy-start curriculum only advances when the policy shows
-        # real performance, preventing time-only advancement while stuck.
+        # The pose curriculum only advances when the policy shows real
+        # performance, preventing time-only advancement while stuck.
         self._success_rate_ema: float = 0.0
         self._success_ema_alpha: float = 0.005  # ~200-step window
         # Upright signal from the previous step — used by the progress
@@ -162,7 +156,7 @@ class K1StandupEnv(SkillEnv):
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
 
-        # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
+        # ── Pose difficulty curriculum (L0–L2) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
         # Named-pose pools built lazily alongside the settle pool.
@@ -305,66 +299,6 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
-    def _build_easy_pool(self) -> None:
-        """Build pool of near-standing initial poses for the reverse
-        curriculum. Spawn at standing default pose with small joint
-        jitter and a small initial tilt, brief settle so physics relaxes,
-        snapshot. The policy uses these starts early in training to
-        learn 'what standing looks like' before recovering from harder
-        fallen poses."""
-        c = self.cfg
-        N = self.num_envs
-        all_idx = np.arange(N)
-
-        pos = np.zeros((N, 3), dtype=np.float32)
-        pos[:, 2] = c.easy_pool_height
-        quat = _small_tilt_quat(N, c.easy_pool_tilt_max, self.rng)
-        # If tilt_max is zero, the helper returns identity quats — but
-        # _small_tilt_quat with max_angle=0 gives [1,0,0,0] for all,
-        # which is what we want.
-        jpos_target = (self._default_action[None, :]
-                       + self.rng.standard_normal((N, self.act_dim))
-                          .astype(np.float32) * c.easy_pool_joint_jitter)
-
-        try:
-            self.robot.set_pos(pos, envs_idx=all_idx)
-            self.robot.set_quat(quat, envs_idx=all_idx)
-            self.robot.set_dofs_position(jpos_target, self.dof_indices,
-                                          envs_idx=all_idx,
-                                          zero_velocity=True)
-            # Hold PD at the spawn pose during settle so the robot
-            # actively maintains standing posture (instead of flopping).
-            self.robot.control_dofs_position(jpos_target, self.dof_indices)
-        except Exception as e:
-            print(f"[standup] easy pool spawn failed: {e}")
-            self._easy_pool_size = 0
-            return
-
-        for _ in range(c.easy_pool_settle_steps):
-            self.scene.step()
-
-        try:
-            p = _to_np(self.robot.get_pos()).copy()
-            q = _to_np(self.robot.get_quat()).copy()
-            j = _to_np(self.robot.get_dofs_position(self.dof_indices)).copy()
-        except Exception as e:
-            print(f"[standup] easy pool snapshot failed: {e}")
-            self._easy_pool_size = 0
-            return
-
-        # Filter: keep only states that are still standing-ish (robot
-        # didn't fall during the brief settle).
-        up = upright_signal(q)
-        ok = (p[:, 2] > c.easy_pool_min_height) & (up > c.easy_pool_min_upright)
-        # Re-center horizontally so spawn is always at the origin.
-        p[:, 0:2] = 0.0
-        self._easy_pool_pos = p[ok].astype(np.float32)
-        self._easy_pool_quat = q[ok].astype(np.float32)
-        self._easy_pool_jpos = j[ok].astype(np.float32)
-        self._easy_pool_size = int(ok.sum())
-        print(f"[standup] easy pool built: {self._easy_pool_size} states "
-              f"(of {N} attempts) — used for reverse curriculum")
-
     def _build_pose_pool(self, pose) -> dict:
         """Spawn all envs at a named StandupPose, briefly settle, snapshot.
 
@@ -457,14 +391,12 @@ class K1StandupEnv(SkillEnv):
                 "jpos": jpos_arr, "size": pos_arr.shape[0]}
 
     def _build_all_pools(self) -> None:
-        """Build easy pool, all named-pose pools, and the settle pool.
+        """Build all named-pose pools and the settle pool.
 
         Order matters only for the settle pool (goes last so it leaves envs
-        in the most neutral state for training). Easy pool goes first because
-        it's needed at L0 and L6 regardless of easy_pool_enabled.
+        in the most neutral state for training).
         """
         from envs.standup import all_poses
-        self._build_easy_pool()  # always — needed for L0 and L6
         for pose in all_poses():
             pool = self._build_pose_pool(pose)
             self._named_pools[pose.name] = pool
@@ -479,14 +411,6 @@ class K1StandupEnv(SkillEnv):
         Falls back to the settle pool with a one-time warning if the requested
         pool is empty or missing.
         """
-        if pool_name == "easy":
-            if self._easy_pool_size > 0:
-                idx = self.rng.integers(0, self._easy_pool_size, size=n)
-                return (self._easy_pool_pos[idx].copy(),
-                        self._easy_pool_quat[idx].copy(),
-                        self._easy_pool_jpos[idx].copy())
-            pool_name = "random"  # fallback
-
         if pool_name == "random":
             idx = self.rng.integers(0, self._pool_size, size=n)
             return (self._pool_pos[idx].copy(),
@@ -527,28 +451,24 @@ class K1StandupEnv(SkillEnv):
     def _sample_reset_from_level(self, n: int) -> tuple:
         """Return (pos, quat, jpos) for n envs based on the current pose level.
 
-        L0 → easy pool (near-standing) — balance & hold
-        L1 → supine + prone (50/50)    — core recovery
-        L2 → all 4 named poses equally — + side_left + side_right
-        L3 → named (1-frac) + random fallen (frac) — full robustness
+        L0 → supine + prone (50/50)    — core recovery
+        L1 → all 4 named poses equally — + side_left + side_right
+        L2 → named (1-frac) + random fallen (frac) — full robustness
         """
         level = self._pose_level
         names = ["supine", "prone", "side_left", "side_right"]
 
         if level <= 0:
-            return self._sample_from_pool("easy", n)
-
-        if level == 1:
             choice = self.rng.integers(0, 2, size=n)
             return self._gather_by_choice(
                 [("supine", choice == 0), ("prone", choice == 1)], n)
 
-        if level == 2:
+        if level == 1:
             choice = self.rng.integers(0, 4, size=n)
             return self._gather_by_choice(
                 [(nm, choice == i) for i, nm in enumerate(names)], n)
 
-        # L3+: named poses + random fallen mix
+        # L2+: named poses + random fallen mix
         n_random = int(round(n * self.cfg.pose_mix_random_frac))
         n_named = n - n_random
         pos = np.empty((n, 3), dtype=np.float32)
@@ -699,35 +619,13 @@ class K1StandupEnv(SkillEnv):
         return float(c.target_height_start
                      + (c.target_height - c.target_height_start) * p)
 
-    def _current_easy_fraction(self) -> float:
-        """Fraction of episodes starting from the EASY (near-standing) pool.
-
-        Combines time-based decay with a performance gate: if the policy
-        hasn't demonstrated minimum performance (`start_curriculum_min_success`
-        EMA success rate), the easy fraction is held at its current level and
-        only allowed to decay further once performance recovers. This prevents
-        the curriculum from advancing during a stuck phase — the previous
-        purely-time-based advancement left the policy on 0% easy starts with
-        0% success rate by step 25M."""
-        if not self.cfg.easy_pool_enabled or self._easy_pool_size == 0:
-            return 0.0
-        p = self._curriculum_progress(self.cfg.start_curriculum_env_steps)
-        time_frac = float(1.0 - p)
-        # Only allow further decay if the policy is meeting minimum performance.
-        # If below the threshold, clamp to the minimum easy fraction that
-        # keeps training viable.
-        if self._success_rate_ema < self.cfg.start_curriculum_min_success:
-            return max(time_frac, self.cfg.start_curriculum_min_easy_frac)
-        return time_frac
-
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.
 
         Time-based linear decay over `assist_curriculum_env_steps`, gated
         on performance: while the EMA frame-success rate is below
         `assist_min_success`, the fraction is held at `assist_min_frac` so
-        the support isn't pulled out from under a still-failing policy.
-        Mirrors `_current_easy_fraction`'s gate."""
+        the support isn't pulled out from under a still-failing policy."""
         if not self.cfg.assist_force_enabled:
             return 0.0
         p = self._curriculum_progress(self.cfg.assist_curriculum_env_steps)
@@ -768,25 +666,6 @@ class K1StandupEnv(SkillEnv):
             self._last_assist_force_mean = 0.0
 
         return force, torque
-
-    # ── β action rescaler (HoST) ──────────────────────────────────
-
-    def _current_action_beta(self) -> float:
-        """Linear decay 1.0 → β_end over action_beta_curriculum_steps.
-
-        Applied via the base-class _get_action_scale() hook before the
-        action delta is clipped to ACTION_DELTA_MAX. At β=0.30 with
-        ACTION_DELTA_MAX=0.5 the effective joint command range is 0.15
-        rad/step → ≤7.5 rad/s at 50 Hz — safe for K1 servo thermal limits.
-        """
-        if not self.cfg.action_beta_enabled:
-            return 1.0
-        p = self._curriculum_progress(self.cfg.action_beta_curriculum_steps)
-        return float(self.cfg.action_beta_start
-                     + (self.cfg.action_beta_end - self.cfg.action_beta_start) * p)
-
-    def _get_action_scale(self) -> float:
-        return self._current_action_beta()
 
     # ── pose curriculum advancement ───────────────────────────────
 
@@ -875,7 +754,6 @@ class K1StandupEnv(SkillEnv):
         components["hold_steps_current"] = float(hold_steps)
         components["upright_threshold_current"] = float(upright_thresh)
         components["target_height_current"] = float(target_h)
-        components["easy_start_fraction"] = float(self._current_easy_fraction())
         components["assist_fraction"] = float(self._current_assist_fraction())
         components["assist_force_mean"] = float(self._last_assist_force_mean)
 
@@ -891,7 +769,6 @@ class K1StandupEnv(SkillEnv):
         self._maybe_advance_level()
 
         components["pose_curriculum_level"] = float(self._pose_level)
-        components["action_beta"] = float(self._current_action_beta())
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now
