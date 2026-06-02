@@ -26,7 +26,8 @@ class StandupRewardWeights:
     # 5.0 to 10.0 because the policy got stuck in a sit/kneel attractor
     # (z ≈ 0.25, up ≈ 0.85) where Δup ≈ 0; a stronger progress weight
     # amplifies the tiny gradient that pulls the policy onward.
-    upright_progress: float = 10.0     # weight on max(0, up_t - up_{t-1})
+    upright_progress: float = 15.0     # weight on max(0, up_t - up_{t-1})
+                                       # (10→15 with the kneel-attractor fix)
 
     # Explosive-rise shaping — direct per-step reward for a fast UPWARD trunk
     # velocity while still low (gated to the recovery phase, vanishing near
@@ -35,7 +36,9 @@ class StandupRewardWeights:
     # rate-capped, speed-independent `upright_progress` term doesn't pay for.
     # A TASK term (drives the get-up) → stays ON in the discovery stage; it is
     # deliberately NOT in `_DISCOVERY_ZEROED_WEIGHTS`.
-    explosive_rise: float = 3.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
+    explosive_rise: float = 4.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
+                                       # (3.0→4.0 with the kneel-attractor fix:
+                                       #  more upward drive off the squat)
 
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
@@ -95,7 +98,11 @@ class StandupRewardWeights:
     # reward is unchanged (no destabilising regression), but full
     # extension pays an extra ~5/step → ~1250 over the post-squat
     # trajectory. Pulls the policy out of the squat local optimum.
-    standing_tall: float = 5.0
+    # Bumped 5.0→10.0 (2026-06-02): run #1 converged to a ~0.32 m kneel and
+    # plateaued there for 40M steps. This is the dense, monotone "go higher"
+    # term, so doubling it makes rising squat→full-height worth clearly more
+    # than sitting stably at the kneel — the targeted kneel-attractor fix.
+    standing_tall: float = 10.0
 
 
 # Regularizer weights zeroed in the "discovery" reward stage. These are
@@ -369,7 +376,8 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.002  # was 0.01 — stops std runaway; std stays moderate
+    entropy_coef: float = 0.005  # 0.002→0.005 (kneel-attractor fix): more
+                                 # exploration to escape the squat local optimum
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
