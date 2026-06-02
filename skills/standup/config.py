@@ -157,29 +157,32 @@ class StandupConfig:
     # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
     # so 160 N supports most of body weight without launching it — the
     # policy still has to do the last ~20% and get its feet underneath.
-    assist_force_max: float = 220.0
+    assist_force_max: float = 300.0
     # Spring shape: force ramps with height deficit (target − z), so it's
     # strongest when fully fallen and releases to ~0 near standing height.
     # Upward-only (never pushes the trunk down). This keeps the assist from
     # fighting the robot once it's nearly up.
     assist_spring_shape: bool = True
-    # Curriculum horizon: assist fraction decays 1.0 → 0.0 over this many
-    # cumulative env-steps. Should be on the same order as the discovery
-    # phase length (a good chunk of total_timesteps).
-    assist_curriculum_env_steps: int = 80_000_000
-    # Performance gate: don't wean the assist
-    # while the policy is still failing. Hold the fraction at
-    # `assist_min_frac` until the EMA frame-success rate clears the
-    # threshold. Prevents the time-only decay from removing all support
-    # while success is still ~0.
-    assist_min_success: float = 0.10
-    # Floor the assist holds at while still failing. Was 0.85 — that nearly
-    # carried the whole body weight, so the policy never NEEDED to get its
-    # legs under itself: it could leave them flat (cobra/push-up) and let
-    # the assist lift the trunk to collect upright+height. Combined with the
-    # feet-under-base reward gate, lower this so a 60%-supported robot still
-    # has to plant its feet to stand. Tune up if discovery stalls entirely.
-    assist_min_frac: float = 0.60
+    # PERFORMANCE-COUPLED assist (primary driver). The assist fraction is
+    # tied directly to the success EMA:
+    #   success_frac = clip(1 - success_ema / assist_success_target, 0, 1)
+    # → full support at zero competence, fading to ~0 as the policy reaches
+    # `assist_success_target`. This auto-couples the assist to the pose
+    # curriculum: a level-up introduces a harder pose, the success EMA drops,
+    # and the assist rises back to help — no explicit per-level logic needed.
+    # Set slightly ABOVE the highest advance threshold (0.60 vs 0.55/0.60) so
+    # that at the moment of advancement the assist is already LOW (but not
+    # exactly 0). The old `assist_min_success`/`assist_min_frac` floor is
+    # replaced by this: it pinned the assist at 0.60 right up to the 0.50
+    # advance threshold, so the policy advanced *before* it was weaned.
+    assist_success_target: float = 0.60
+    # Time-decay BACKSTOP (multiplicative). On its own the success coupling
+    # would let a policy that plateaus BELOW the target lean on the assist
+    # forever. Multiply success_frac by a linear time ramp (1.0 → 0.0 over
+    # this many cumulative env-steps) so support is always weaned out
+    # eventually, regardless of success. Should be on the same order as the
+    # discovery phase length (a good chunk of total_timesteps).
+    assist_curriculum_env_steps: int = 150_000_000
     # Anti-cobra assist gate. The naive fix — multiply the assist by a "feet
     # under base" score — is WRONG: a freshly fallen robot also has its feet
     # splayed out, so that gate zeroes the assist in *every* legitimate fall,
@@ -245,7 +248,10 @@ class StandupConfig:
     # EMA threshold to advance FROM each level. Element i controls the
     # transition from level i → i+1. Length = (num_levels - 1) = 3.
     #   L0→L1 (supine solid before adding prone), L1→L2, L2→L3.
-    pose_level_thresholds: tuple = (0.50, 0.50, 0.60)
+    # Set just below assist_success_target (0.60) so advancement requires
+    # genuine, largely-unassisted competence — by the time the success EMA
+    # hits 0.55 the performance-coupled assist is already low (~0.08).
+    pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
 
     # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
     # threshold before advancing. Prevents a single lucky spike triggering a

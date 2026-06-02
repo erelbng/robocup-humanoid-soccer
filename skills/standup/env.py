@@ -644,17 +644,25 @@ class K1StandupEnv(SkillEnv):
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.
 
-        Time-based linear decay over `assist_curriculum_env_steps`, gated
-        on performance: while the EMA frame-success rate is below
-        `assist_min_success`, the fraction is held at `assist_min_frac` so
-        the support isn't pulled out from under a still-failing policy."""
+        PERFORMANCE-COUPLED: the assist fades as the policy gets better,
+        tied directly to the success EMA —
+            success_frac = clip(1 - success_ema / assist_success_target, 0, 1)
+        so it's full at zero competence and ~0 once success reaches the
+        target. This auto-couples the assist to the pose curriculum: a
+        level-up introduces a harder pose, the success EMA drops, and the
+        assist rises back to help.
+
+        A multiplicative TIME-DECAY backstop (1.0 → 0.0 over
+        `assist_curriculum_env_steps`) guarantees weaning even if the policy
+        plateaus below the target and would otherwise lean forever."""
         if not self.cfg.assist_force_enabled:
             return 0.0
-        p = self._curriculum_progress(self.cfg.assist_curriculum_env_steps)
-        time_frac = float(1.0 - p)
-        if self._success_rate_ema < self.cfg.assist_min_success:
-            return max(time_frac, self.cfg.assist_min_frac)
-        return time_frac
+        target = max(self.cfg.assist_success_target, 1e-6)
+        success_frac = float(
+            np.clip(1.0 - self._success_rate_ema / target, 0.0, 1.0))
+        time_frac = float(
+            1.0 - self._curriculum_progress(self.cfg.assist_curriculum_env_steps))
+        return success_frac * time_frac
 
     # ── assistive upward force (force curriculum) ─────────────────
     #
