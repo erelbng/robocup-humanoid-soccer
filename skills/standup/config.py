@@ -130,17 +130,21 @@ class StandupConfig:
     # other envs).
     spawn_height_min: float = 0.8        # m
     spawn_height_max: float = 1.5        # m
-    settle_steps: int = 300             # sim substeps (3.0 s at 500 Hz). HUMANUP uses 10 s
+    settle_steps: int = 1500            # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
                                        # to resolve self-collisions from randomised DOFs;
-                                       # 3 s is a practical GPU compromise (was 0.6 s).
+                                       # 3 s is a practical GPU compromise. Was 300 (0.6 s) —
+                                       # too short to actually let the pose settle.
     settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
     # Filter the pool: keep only states with a clearly fallen robot.
     # Avoids "robot landed upright" trivial-success starts.
     pool_max_upright: float = 0.7        # upright signal upper bound
     pool_max_height: float = 0.4         # trunk-z upper bound (m)
-    # Small joint noise added on every pool-sample → effectively
-    # unlimited per-reset variation on top of the discrete pool.
-    joint_jitter_rad: float = 0.03
+    # Joint noise added on every pool-sample → effectively unlimited
+    # per-reset variation on top of the discrete pool. 0.10 rad ≈ ±6°.
+    # Raised from 0.03 (±1.7°, too small to give real start diversity);
+    # the pool was already settled at this magnitude so penetration risk
+    # is low.
+    joint_jitter_rad: float = 0.10
 
     # ── Assistive-force curriculum (HoST, arXiv:2502.08378) ──────────
     # The single highest-leverage exploration aid for standup: apply a
@@ -162,7 +166,7 @@ class StandupConfig:
     # Curriculum horizon: assist fraction decays 1.0 → 0.0 over this many
     # cumulative env-steps. Should be on the same order as the discovery
     # phase length (a good chunk of total_timesteps).
-    assist_curriculum_env_steps: int = 150_000_000
+    assist_curriculum_env_steps: int = 80_000_000
     # Performance gate: don't wean the assist
     # while the policy is still failing. Hold the fraction at
     # `assist_min_frac` until the EMA frame-success rate clears the
@@ -176,6 +180,26 @@ class StandupConfig:
     # feet-under-base reward gate, lower this so a 60%-supported robot still
     # has to plant its feet to stand. Tune up if discovery stalls entirely.
     assist_min_frac: float = 0.60
+    # Anti-cobra assist gate. The naive fix — multiply the assist by a "feet
+    # under base" score — is WRONG: a freshly fallen robot also has its feet
+    # splayed out, so that gate zeroes the assist in *every* legitimate fall,
+    # killing the HoST bootstrap (≈167 N → 0 N at z≈0.13). The real cobra
+    # marker is TRUNK LIFTED *and* FEET BEHIND simultaneously — a fallen
+    # robot has the trunk DOWN, so it must still be fully supported. We only
+    # throttle the assist once the chest is up but the feet haven't tucked:
+    #   cobra_factor = 1 - trunk_lifted · (1 - feet_under_base)
+    # → fallen: ~1 (full support), cobra: ~0 (cut), real stand: ~1 (deficit≈0
+    #   makes the force ~0 anyway). Set False for unconditional upward assist.
+    assist_cobra_gate: bool = True
+    # Soft ramp width (m) for the feet-under-base term inside the cobra gate:
+    # 1 at foot-under-base (d=0), → 0 at d ≥ this. Matches the reward-side
+    # feet_under_base_soft_d so assist and on-feet reward agree on geometry.
+    assist_under_base_soft_d: float = 0.40
+    # Trunk-z band (m) for the `trunk_lifted` ramp in the cobra gate: 0 at
+    # z ≤ z_low (fallen — full support), 1 at z ≥ z_high (chest clearly up —
+    # cobra territory if feet still behind). Fallen prone/supine sits ≈0.13.
+    assist_cobra_z_low: float = 0.15
+    assist_cobra_z_high: float = 0.35
 
     # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
     # the policy can find ANY standup; "deploy" (Stage 2) uses the full
@@ -222,7 +246,7 @@ class StandupConfig:
 
     # Named-pose pool build parameters. Same settle mechanism as the main
     # settle pool but starting from the named pose's reference orientation.
-    pose_pool_settle_steps: int = 150      # physics substeps per round (2.0 s at 500 Hz).
+    pose_pool_settle_steps: int = 1000     # physics substeps per round = 2.0 s at 500 Hz.
                                             # Was 150 (0.3 s) — too short to damp bouncing
                                             # after 0.19 s free-fall from spawn height.
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
@@ -317,7 +341,7 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.002  # was 0.01 — stops std runaway; std stays moderate
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5

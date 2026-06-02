@@ -32,6 +32,7 @@ from skills.common_obs import _to_np
 from skills.standup.config import StandupConfig, discovery_weights
 from skills.standup.rewards import (STANDUP_CRITIC_GROUPS,
                                      compute_standup_reward,
+                                     feet_under_base_score,
                                      standing_on_feet_mask, success_frame_mask,
                                      upright_signal)
 
@@ -588,6 +589,12 @@ class K1StandupEnv(SkillEnv):
             self.robot.set_dofs_position(jpos, self.dof_indices,
                                           envs_idx=envs_idx,
                                           zero_velocity=True)
+            # `zero_velocity=True` only zeros the actuated joint DOFs we just
+            # set; the 6 free-base DOFs keep whatever linear/angular velocity
+            # the trunk had at episode end. Zero ALL DOFs so the new episode
+            # starts from rest with no residual-impulse carryover from the
+            # previous fall.
+            self.robot.zero_all_dofs_velocity(envs_idx=envs_idx)
         except Exception as e:
             print(f"[standup] _reset_robot_pose failed: {e}")
 
@@ -652,7 +659,8 @@ class K1StandupEnv(SkillEnv):
         frac = self._current_assist_fraction()
         if frac > 0.0:
             try:
-                z = _to_np(self.robot.get_pos())[:, 2]
+                root_pos = _to_np(self.robot.get_pos())
+                z = root_pos[:, 2]
                 peak = self.cfg.assist_force_max
                 if self.cfg.assist_spring_shape:
                     target = self.cfg.target_height
@@ -661,6 +669,23 @@ class K1StandupEnv(SkillEnv):
                     fz = frac * peak * deficit
                 else:
                     fz = np.full(self.num_envs, frac * peak, dtype=np.float32)
+                # Cobra-specific gate. NOT "feet under base" alone — that
+                # also zeroes the assist for a freshly fallen robot (feet
+                # naturally splayed), killing the bootstrap. The cobra marker
+                # is trunk LIFTED *and* feet BEHIND: only then throttle. A
+                # fallen robot (trunk down) keeps full support.
+                #   cobra_factor = 1 - trunk_lifted · (1 - feet_under_base)
+                if self.cfg.assist_cobra_gate:
+                    foot_xy = self._read_foot_pos()[:, :, :2]   # (N, 2, 2)
+                    under_base_soft = feet_under_base_score(
+                        foot_xy, root_pos[:, :2],
+                        d_max=self.cfg.assist_under_base_soft_d)
+                    z_low = self.cfg.assist_cobra_z_low
+                    z_high = self.cfg.assist_cobra_z_high
+                    trunk_lifted = np.clip(
+                        (z - z_low) / max(z_high - z_low, 1e-6), 0.0, 1.0)
+                    cobra_factor = 1.0 - trunk_lifted * (1.0 - under_base_soft)
+                    fz = fz * cobra_factor.astype(np.float32)
                 force[:, 2] = fz.astype(np.float32)
                 self._last_assist_force_mean = float(np.mean(fz))
             except Exception:
