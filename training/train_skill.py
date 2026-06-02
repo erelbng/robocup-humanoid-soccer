@@ -213,6 +213,20 @@ def main():
                         help="Warm-start policy weights from another "
                              "checkpoint (partial load — shape-mismatched "
                              "layers are skipped). PPO only.")
+    parser.add_argument(
+        "--amp", action="store_true",
+        help="Train with Adversarial Motion Priors: a discriminator rewards "
+             "the policy for moving like a reference-motion dataset (natural/"
+             "human-like gait) on top of the task reward. PPO + single mode "
+             "only. Reference motions come from a parametric walk generator.")
+    parser.add_argument("--amp-task-coef", type=float, default=0.5,
+                        help="Weight on the task (velocity) reward under --amp.")
+    parser.add_argument("--amp-style-coef", type=float, default=0.5,
+                        help="Weight on the AMP style reward under --amp.")
+    parser.add_argument("--amp-motion-file", type=str, default=None,
+                        help="Path to a reference-motion .npz (build_amp_obs "
+                             "transitions, e.g. retargeted LAFAN1 mocap). If "
+                             "omitted, the synthetic parametric walk is used.")
     parser.add_argument("--device", choices=["auto", "cpu", "gpu"],
                         default="auto")
     parser.add_argument("--vec-num-envs", type=int, default=None,
@@ -257,12 +271,15 @@ def main():
     wandb_project = args.wandb_project or project.wandb.project
     use_wandb = bool(args.wandb or args.wandb_project)
 
+    # Distinct run label for AMP so its TB dir (skill_walk_amp_*) doesn't mix
+    # with a concurrent plain run (skill_walk_ppo_*).
+    run_label = "amp" if args.amp else algorithm
     logger = setup_logger(
-        run_name=default_run_name(f"skill_{args.skill}", algorithm),
+        run_name=default_run_name(f"skill_{args.skill}", run_label),
         log_root=str(LOGS_DIR),
         wandb_project=wandb_project,
         wandb_entity=project.wandb.entity,
-        wandb_tags=list(project.wandb.tags) + ["skill", args.skill, algorithm],
+        wandb_tags=list(project.wandb.tags) + ["skill", args.skill, run_label],
         use_wandb=use_wandb,
         config={
             "skill": args.skill,
@@ -320,6 +337,50 @@ def main():
                 learning_rate=float(cfg.learning_rate),
                 logger=logger, skill=args.skill,
                 checkpoint_dir=ckpt_dir, device=device,
+            )
+        elif args.amp:
+            # Adversarial Motion Priors: PPO + a discriminator style reward
+            # against a reference-motion dataset (parametric walk for now).
+            if algorithm != "ppo" or args.mode != "single":
+                raise SystemExit("--amp requires --algorithm ppo and "
+                                 "--mode single.")
+            if not hasattr(env, "amp_observation"):
+                raise SystemExit(f"skill {args.skill!r} has no amp_observation();"
+                                 " AMP is only wired for skills that expose it.")
+            import torch
+            from training.algorithms.amp import (
+                parametric_walk_dataset, load_motion_dataset, train_ppo_amp_vec)
+            policy = create_policy(env.obs_dim, env.act_dim)
+            if args.init_from:
+                load_checkpoint(args.init_from, policy)
+            elif args.resume:
+                load_checkpoint(args.resume, policy)
+            # Under AMP, let the STYLE reward shape the arms toward the
+            # reference (real walking has bent, swinging elbows). The task
+            # reward's arm_pose penalty pulls arms to the straight/tucked
+            # default — directly fighting the reference and making the
+            # discriminator trivially separate on elbow angle. Zero it so the
+            # policy can actually move toward the reference distribution.
+            if hasattr(cfg, "rewards") and hasattr(cfg.rewards, "arm_pose"):
+                cfg.rewards.arm_pose = 0.0
+                print("[amp] arm_pose penalty zeroed (AMP style reward shapes arms)")
+            if args.amp_motion_file:
+                dataset = load_motion_dataset(args.amp_motion_file, device)
+            else:
+                dataset = parametric_walk_dataset(
+                    env.robot_cfg.default_joint_pos, device,
+                    dt=cfg.dt, gait_freq_range=cfg.step_freq_range)
+            # Distinct checkpoint dir + phase so an AMP run can train CONCURRENTLY
+            # with a plain run on the same skill without clobbering checkpoints.
+            amp_ckpt_dir = os.path.join(str(CHECKPOINTS_DIR),
+                                        f"skill_{args.skill}_amp")
+            Path(amp_ckpt_dir).mkdir(parents=True, exist_ok=True)
+            train_ppo_amp_vec(
+                env, policy, cfg, dataset, logger=logger,
+                phase=f"skill_{env.SKILL_NAME}_amp", checkpoint_dir=amp_ckpt_dir,
+                task_reward_coef=args.amp_task_coef,
+                style_reward_coef=args.amp_style_coef,
+                device=device, **algo_kwargs,
             )
         else:
             # 'single' (legacy) and 'teacher' both use the standard PPO

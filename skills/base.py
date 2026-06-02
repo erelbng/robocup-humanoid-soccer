@@ -664,15 +664,34 @@ class SkillEnv(ABC):
 
         self.step_count += 1
 
-        obs = self._get_obs()
+        # `terminal_obs` is the TRUE final observation of this transition
+        # (state s_{t+1}), read BEFORE any auto-reset. The trainer needs it to
+        # bootstrap the value on a timeout (truncation) instead of throwing the
+        # post-reset frame at GAE.
+        terminal_obs = self._get_obs()
         reward, components = self._compute_skill_reward(action)
         done = self._check_skill_done()
+
+        # Split `done` into TRUE termination (a failure: fall / ball-lost /
+        # kick-event) vs TRUNCATION (hit the episode-horizon timeout). The
+        # timeout is universally `step_count >= MAX_EPISODE_STEPS` across all
+        # skills, so we can derive the split here without changing any
+        # `_check_skill_done` override's contract. GAE zeroes the bootstrap
+        # only on true termination and bootstraps V(terminal_obs) on
+        # truncation — matters a lot for standup, which ends ONLY by timeout.
+        truncated = self.step_count >= self.MAX_EPISODE_STEPS
+        terminated = done & (~truncated)
 
         self._episode_reward += reward
         self._last_action = action  # delta (residual), not absolute target
 
+        # Auto-reset done envs and return the FRESH post-reset frame for them
+        # (reset() returns a full _get_obs()), so the policy's first action of
+        # each new episode is chosen from the new initial state — not the
+        # stale terminal frame. Non-done envs keep `terminal_obs` (unchanged).
+        obs = terminal_obs
         if done.any():
-            self.reset(envs_idx=np.where(done)[0])
+            obs = self.reset(envs_idx=np.where(done)[0])
 
         info = {
             "episode_reward": self._episode_reward.copy(),
@@ -680,6 +699,10 @@ class SkillEnv(ABC):
             "reward_components": components,
             # (N, G) per-group reward for multi-critic PPO, or None.
             "group_rewards": self._group_rewards,
+            # Episode-boundary signals for correct GAE bootstrapping.
+            "terminated": terminated,        # true failure → zero bootstrap
+            "truncated": truncated,          # timeout → bootstrap terminal_obs
+            "terminal_obs": terminal_obs,    # raw s_{t+1}; trainer normalizes
         }
         return obs, reward, done, info
 
