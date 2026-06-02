@@ -811,6 +811,7 @@ class K1StandupEnv(SkillEnv):
             standing_tall_min_z=self.cfg.standing_tall_min_z,
             standing_tall_max_z=self.cfg.standing_tall_max_z,
             feet_under_base_soft_d=self.cfg.feet_under_base_soft_d,
+            explosive_rise_v_cap=self.cfg.explosive_rise_v_cap,
             control_dt=self.dt,
         )
 

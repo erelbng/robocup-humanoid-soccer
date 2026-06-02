@@ -62,6 +62,34 @@ def height_signal(root_z: np.ndarray, target: float = 0.55,
 # ─── stability penalties ──────────────────────────────────────────────
 
 
+def explosive_rise_signal(root_lin_vel: np.ndarray, root_z: np.ndarray,
+                          upright: np.ndarray,
+                          target_h: float = 0.55,
+                          v_cap: float = 0.8) -> np.ndarray:
+    """Reward in [0, 1] for moving the trunk UPWARD fast WHILE still low.
+
+    This is the direct "explosive rise" carrot the rest of the reward was
+    missing: `upright_progress` only pays for orientation change (rate-capped,
+    speed-independent total) and the speed signal is indirect (opportunity
+    cost + a terminal time bonus). This term pays per-step for a high positive
+    vertical trunk velocity during the recovery, which is exactly the snappy
+    hip/knee extension in the reference fast-standup.
+
+    Three multiplicative gates keep it honest:
+      * `rise`    — clip(v_z, 0, v_cap)/v_cap: upward only (no credit for
+                    falling), and CAPPED so a destabilising ballistic launch
+                    can't out-earn a controlled fast push.
+      * `deficit` — (target − z)/target: 1 when fully fallen, 0 at standing
+                    height, so it can't be farmed by bouncing once already up.
+      * `early`   — 1 − near_upright_gate(up): fades out as the robot nears
+                    upright, leaving the final balance to the stability terms.
+    """
+    rise = np.clip(root_lin_vel[:, 2], 0.0, v_cap) / max(v_cap, 1e-6)
+    deficit = np.clip((target_h - root_z) / max(target_h, 1e-6), 0.0, 1.0)
+    early = 1.0 - near_upright_gate(upright)
+    return (rise * deficit * early).astype(np.float32)
+
+
 def base_ang_vel_sway(ang_vel: np.ndarray) -> np.ndarray:
     """ωx² + ωy² — roll/pitch rate. Direct penalty on front/back +
     left/right sway. Yaw rate is intentionally ignored — robot may need
@@ -278,6 +306,7 @@ def compute_standup_reward(
     standing_tall_min_z: float = 0.30,
     standing_tall_max_z: float = 0.55,
     feet_under_base_soft_d: float = 0.40,
+    explosive_rise_v_cap: float = 0.8,
     control_dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray, dict, dict]:
     """Returns (reward[N], frame_success[N] bool, components, group_rewards).
@@ -323,6 +352,15 @@ def compute_standup_reward(
     # only clip avoids paying for backsliding being undone — credit is
     # only awarded for genuine forward progress.
     progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
+
+    # Explosive-rise shaping — direct per-step reward for a fast upward trunk
+    # velocity while still low. Drives the snappy hip/knee extension of the
+    # reference fast-standup that the (rate-capped, speed-independent)
+    # `progress` term doesn't pay for. Gated to the recovery phase + capped so
+    # it can't be farmed by bouncing or a destabilising ballistic launch.
+    rise = explosive_rise_signal(
+        root_lin_vel, root_pos[:, 2], up,
+        target_h=target_height, v_cap=explosive_rise_v_cap)
 
     # Arm-pose deviation — drives the final standing pose to "arms
     # hanging at the sides" (the corrected K1 default with shoulder
@@ -416,6 +454,7 @@ def compute_standup_reward(
         w.upright * up_pos
         + w.height * h
         + w.upright_progress * progress
+        + w.explosive_rise * rise
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
     ).astype(np.float32)
@@ -441,6 +480,8 @@ def compute_standup_reward(
         "upright": float(np.mean(up_pos)),
         "upright_raw": float(np.mean(up)),
         "upright_progress": float(np.mean(progress)),
+        "explosive_rise": float(np.mean(rise)),
+        "mean_rise_vel_z": float(np.mean(root_lin_vel[:, 2])),
         "arm_pose_dev": float(np.mean(arm_dev)),
         "arm_gate": float(np.mean(arm_gate)),
         "height": float(np.mean(h)),

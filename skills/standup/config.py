@@ -28,6 +28,15 @@ class StandupRewardWeights:
     # amplifies the tiny gradient that pulls the policy onward.
     upright_progress: float = 10.0     # weight on max(0, up_t - up_{t-1})
 
+    # Explosive-rise shaping — direct per-step reward for a fast UPWARD trunk
+    # velocity while still low (gated to the recovery phase, vanishing near
+    # upright; capped by `explosive_rise_v_cap`). This is the carrot for the
+    # snappy hip/knee extension of the reference fast-standup that the
+    # rate-capped, speed-independent `upright_progress` term doesn't pay for.
+    # A TASK term (drives the get-up) → stays ON in the discovery stage; it is
+    # deliberately NOT in `_DISCOVERY_ZEROED_WEIGHTS`.
+    explosive_rise: float = 3.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
+
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
     # rolls at ±π/2). Phase-gated on a [0.5, 0.85] band so arms are
@@ -52,7 +61,7 @@ class StandupRewardWeights:
     # realistic standup time range: a 1 s stand pays ~330, a 2 s stand
     # ~150, a 3 s stand ~100, a 4 s stand ~55. Sub-second standups still
     # get the largest pulse but slow ones are no longer disqualified.
-    time_penalty: float = 3.0          # per step until sustained-success
+    time_penalty: float = 3.5          # per step until sustained-success
                                        # (≥2.5 to make floor net-negative:
                                        #  upright≈0.5×3 + height≈0.3 − 3.0 < 0)
     success_bonus: float = 400.0       # paid on streak completion, scaled
@@ -339,15 +348,20 @@ class StandupConfig:
     standing_tall_max_z: float = 0.55          # signal saturates at K1 standing height
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
-    # τ=60 steps (1.2 s): the speed reward must have a real GRADIENT in the
-    # range standups actually occur. Diagnosis (2026-05-30): with τ=150,
-    # observed stands clustered ~70 steps (1.4 s) and never got faster —
-    # exp(-t/150) is nearly flat there (70→35 steps only +27% bonus). At
-    # τ=60, 70→35 steps is 0.31→0.56 (+82%), a strong pull toward faster.
-    # NOTE: revisit after the torque-limited retrain — realizable (≤40 N·m)
-    # standups are slower than the old 780-N·m ones, so the realistic
-    # stand-time (and thus the ideal τ) may shift up.
-    time_to_stand_tau_steps: float = 60.0
+    # τ=45 steps (0.9 s): steepened from 60 alongside the explosive-rise reward
+    # to pull harder toward a snappy get-up. The speed reward must have a real
+    # GRADIENT in the range standups actually occur. Diagnosis (2026-05-30):
+    # with τ=150, observed stands clustered ~70 steps (1.4 s) and never got
+    # faster — exp(-t/150) is nearly flat there. At τ=45, 70→45 steps is
+    # 0.21→0.37 (+74%), a strong pull toward faster.
+    # NOTE: realizable (≤40 N·m) standups are torque-limited to ~2 s, so if the
+    # policy can't reach the steep part of the curve, relax τ back toward 60.
+    time_to_stand_tau_steps: float = 45.0
+
+    # Velocity cap (m/s) for the explosive-rise reward: upward trunk velocity
+    # is clipped to [0, v_cap] then normalised, so the term saturates at a
+    # brisk-but-controlled push and never rewards a destabilising launch.
+    explosive_rise_v_cap: float = 0.8
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000
