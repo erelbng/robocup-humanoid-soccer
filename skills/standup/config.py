@@ -169,7 +169,13 @@ class StandupConfig:
     # threshold. Prevents the time-only decay from removing all support
     # while success is still ~0.
     assist_min_success: float = 0.10
-    assist_min_frac: float = 0.85
+    # Floor the assist holds at while still failing. Was 0.85 — that nearly
+    # carried the whole body weight, so the policy never NEEDED to get its
+    # legs under itself: it could leave them flat (cobra/push-up) and let
+    # the assist lift the trunk to collect upright+height. Combined with the
+    # feet-under-base reward gate, lower this so a 60%-supported robot still
+    # has to plant its feet to stand. Tune up if discovery stalls entirely.
+    assist_min_frac: float = 0.60
 
     # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
     # the policy can find ANY standup; "deploy" (Stage 2) uses the full
@@ -275,6 +281,19 @@ class StandupConfig:
     # Thresholds for the `foot_grounded_up` anti-gaming reward.
     foot_grounded_max_z: float = 0.10          # feet "on ground" when z < this
     trunk_up_min_z: float = 0.30               # trunk "lifted" when z > this
+
+    # ── Feet-under-base (anti-cobra / anti-push-up) ──────────────────────
+    # The missing discriminator between "standing on its feet" and "lying
+    # with its feet flat and splayed". `_feet_grounded_score` only checks
+    # foot_z, which a prone / cobra / L-sit pose satisfies trivially — so
+    # the policy got ~10/step from foot_grounded_up + standing_tall while
+    # keeping its legs flat on the floor and letting the assist hold the
+    # trunk up. These gate both stand-on-feet rewards (soft, for gradient)
+    # and success detection (hard, so the +400 bonus can't be farmed from
+    # a propped pose) on the horizontal foot↔base distance.
+    feet_under_base_soft_d: float = 0.40       # soft ramp: 1 at d=0, 0 at d≥this
+    success_under_base_max_d: float = 0.25     # hard: feet must be within this of base
+    success_foot_max_z: float = 0.12           # hard: feet must be on the ground
 
     # Thresholds for the `standing_tall` reward — pulls the policy from
     # squat (trunk ~0.30) to full standing (trunk ~0.55).

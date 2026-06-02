@@ -31,7 +31,8 @@ from skills.base import CommandSpec, SkillEnv
 from skills.common_obs import _to_np
 from skills.standup.config import StandupConfig, discovery_weights
 from skills.standup.rewards import (STANDUP_CRITIC_GROUPS,
-                                     compute_standup_reward, success_frame_mask,
+                                     compute_standup_reward,
+                                     standing_on_feet_mask, success_frame_mask,
                                      upright_signal)
 
 
@@ -543,22 +544,24 @@ class K1StandupEnv(SkillEnv):
             return np.zeros((self.num_envs, 0), dtype=np.float32)
         return self._read_contact_state()
 
-    def _read_foot_z(self) -> np.ndarray:
-        """Return (N, 2) world-frame z of left and right foot. Used by
-        the `foot_grounded_up` reward term regardless of `proprio_only`
-        — reward signals can use privileged data; only the policy obs
-        respects the proprio constraint."""
+    def _read_foot_pos(self) -> np.ndarray:
+        """Return (N, 2, 3) world-frame position of left and right foot.
+        Used by the stand-on-feet reward terms regardless of
+        `proprio_only` — reward signals can use privileged data; only the
+        policy obs respects the proprio constraint. The z column feeds the
+        feet-grounded score; the xy columns feed the feet-under-base
+        anti-cobra gate."""
         N = self.num_envs
         if self._foot_links is None:
             self._ensure_contact_links()
-        out = np.zeros((N, 2), dtype=np.float32)
+        out = np.zeros((N, 2, 3), dtype=np.float32)
         if self._foot_links is None:
             return out
         try:
-            out[:, 0] = _to_np(self._foot_links[0].get_pos())[:, 2]
-            out[:, 1] = _to_np(self._foot_links[1].get_pos())[:, 2]
+            out[:, 0, :] = _to_np(self._foot_links[0].get_pos())
+            out[:, 1, :] = _to_np(self._foot_links[1].get_pos())
         except Exception as e:
-            print(f"[standup] foot z read failed: {e}")
+            print(f"[standup] foot pos read failed: {e}")
         return out
 
     # ── reset using the pool ──────────────────────────────────────
@@ -701,7 +704,9 @@ class K1StandupEnv(SkillEnv):
             root_ang_vel = _to_np(self.robot.get_ang())
             jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
-            foot_z = self._read_foot_z()
+            foot_pos = self._read_foot_pos()
+            foot_z = foot_pos[:, :, 2]      # (N, 2)
+            foot_xy = foot_pos[:, :, :2]    # (N, 2, 2)
         except Exception:
             return np.zeros(self.num_envs, dtype=np.float32), {}
 
@@ -710,11 +715,21 @@ class K1StandupEnv(SkillEnv):
         upright_thresh = self._current_upright_threshold()
         target_h = self._current_target_height()
 
+        # Hard "actually standing on its feet" gate — feet grounded AND
+        # under the base. Gates success detection so the success bonus /
+        # post-success reward can't be farmed from an assist-propped cobra.
+        feet_ok = standing_on_feet_mask(
+            foot_z, foot_xy, root_pos[:, :2],
+            foot_max_z=self.cfg.success_foot_max_z,
+            under_base_max_d=self.cfg.success_under_base_max_d,
+        )
+
         prev_streak = self._success_streak.copy()
         frame_now = success_frame_mask(
             root_quat, root_pos[:, 2],
             target_h=target_h,
             upright_threshold=upright_thresh,
+            feet_ok=feet_ok,
         )
         new_streak = np.where(frame_now, prev_streak + 1, 0).astype(np.int32)
         sustained_now = (new_streak == hold_steps) \
@@ -737,6 +752,8 @@ class K1StandupEnv(SkillEnv):
             achieved_sustained=achieved_sustained,
             step_count=self.step_count,
             foot_z=foot_z,
+            foot_xy=foot_xy,
+            feet_ok=feet_ok,
             weights=self._reward_weights,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
             default_joint_pos=self._default_action,
@@ -748,6 +765,7 @@ class K1StandupEnv(SkillEnv):
             trunk_up_min_z=self.cfg.trunk_up_min_z,
             standing_tall_min_z=self.cfg.standing_tall_min_z,
             standing_tall_max_z=self.cfg.standing_tall_max_z,
+            feet_under_base_soft_d=self.cfg.feet_under_base_soft_d,
             control_dt=self.dt,
         )
 
