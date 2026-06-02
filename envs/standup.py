@@ -85,14 +85,43 @@ def prone() -> StandupPose:
     return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13)
 
 
+# Lying on LEFT side (right side up). Left arm (ground contact) angled forward
+# and bent for push-up leverage; right arm (airborne) relaxed against body.
+# Physics settling resolves the final contact configuration.
+_POSE_SIDE_LEFT = {
+    "AAHead_yaw": 0.0, "Head_pitch": 0.0,
+    "ALeft_Shoulder_Pitch": 0.5,  "Left_Shoulder_Roll": -0.5,
+    "Left_Elbow_Pitch": -0.5,     "Left_Elbow_Yaw": 0.0,
+    "ARight_Shoulder_Pitch": -0.2, "Right_Shoulder_Roll": 0.3,
+    "Right_Elbow_Pitch": 0.0,     "Right_Elbow_Yaw": 0.0,
+    "Left_Hip_Pitch": -0.1,  "Left_Hip_Roll": 0.0,  "Left_Hip_Yaw": 0.0,
+    "Left_Knee_Pitch": 0.3,  "Left_Ankle_Pitch": -0.1, "Left_Ankle_Roll": 0.0,
+    "Right_Hip_Pitch": -0.1, "Right_Hip_Roll": 0.0, "Right_Hip_Yaw": 0.0,
+    "Right_Knee_Pitch": 0.3, "Right_Ankle_Pitch": -0.1, "Right_Ankle_Roll": 0.0,
+}
+
+# Lying on RIGHT side — mirror of _POSE_SIDE_LEFT.
+_POSE_SIDE_RIGHT = {
+    "AAHead_yaw": 0.0, "Head_pitch": 0.0,
+    "ALeft_Shoulder_Pitch": -0.2, "Left_Shoulder_Roll": -0.3,
+    "Left_Elbow_Pitch": 0.0,      "Left_Elbow_Yaw": 0.0,
+    "ARight_Shoulder_Pitch": 0.5, "Right_Shoulder_Roll": 0.5,
+    "Right_Elbow_Pitch": -0.5,    "Right_Elbow_Yaw": 0.0,
+    "Left_Hip_Pitch": -0.1,  "Left_Hip_Roll": 0.0,  "Left_Hip_Yaw": 0.0,
+    "Left_Knee_Pitch": 0.3,  "Left_Ankle_Pitch": -0.1, "Left_Ankle_Roll": 0.0,
+    "Right_Hip_Pitch": -0.1, "Right_Hip_Roll": 0.0, "Right_Hip_Yaw": 0.0,
+    "Right_Knee_Pitch": 0.3, "Right_Ankle_Pitch": -0.1, "Right_Ankle_Roll": 0.0,
+}
+
+
 def side_left() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), math.pi / 2)
-    return StandupPose("side_left", _POSE_SUPINE, q, trunk_height=0.13)
+    return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13)
 
 
 def side_right() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), -math.pi / 2)
-    return StandupPose("side_right", _POSE_SUPINE, q, trunk_height=0.13)
+    return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13)
 
 
 def all_poses() -> List[StandupPose]:

@@ -130,58 +130,79 @@ class StandupConfig:
     # other envs).
     spawn_height_min: float = 0.8        # m
     spawn_height_max: float = 1.5        # m
-    settle_steps: int = 300              # sim substeps (0.6 s at 500 Hz)
+    settle_steps: int = 1500            # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
+                                       # to resolve self-collisions from randomised DOFs;
+                                       # 3 s is a practical GPU compromise. Was 300 (0.6 s) —
+                                       # too short to actually let the pose settle.
     settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
     # Filter the pool: keep only states with a clearly fallen robot.
     # Avoids "robot landed upright" trivial-success starts.
     pool_max_upright: float = 0.7        # upright signal upper bound
     pool_max_height: float = 0.4         # trunk-z upper bound (m)
-    # Small joint noise added on every pool-sample → effectively
-    # unlimited per-reset variation on top of the discrete pool.
-    joint_jitter_rad: float = 0.03
+    # Joint noise added on every pool-sample → effectively unlimited
+    # per-reset variation on top of the discrete pool. 0.10 rad ≈ ±6°.
+    # Raised from 0.03 (±1.7°, too small to give real start diversity);
+    # the pool was already settled at this magnitude so penetration risk
+    # is low.
+    joint_jitter_rad: float = 0.10
 
-    # Reverse curriculum on initial pose distribution. Build a second
-    # pool of near-standing starts (default pose + small jitter, brief
-    # settle) and mix it with the fallen pool. Early in training the
-    # policy mostly trains on easy starts (already standing → just
-    # don't fall) so it learns what standing LOOKS like and gets the
-    # success bonus regularly. As `_total_env_steps_seen` advances, the
-    # mix shifts to fully fallen starts. This addresses the actual
-    # blocker (PPO can't randomly discover the standup trajectory) by
-    # giving the policy reachable "good states" to learn from before
-    # asking it to recover from arbitrary fallen poses.
     # ── Assistive-force curriculum (HoST, arXiv:2502.08378) ──────────
     # The single highest-leverage exploration aid for standup: apply a
     # DECAYING upward "support" force on the trunk — like helping an
     # infant stand. Early in training the force nearly holds the robot up,
     # so the policy reliably reaches the standing pose and learns what the
     # whole fallen→upright trajectory feels like; the force then weans to
-    # zero so the final policy stands unaided. This supersedes the
-    # easy-pose reverse curriculum (which only changed WHERE you start, not
-    # how hard the climb is) — `easy_pool_enabled` is therefore OFF by
-    # default when the assist is on, to isolate the effect. Flip both if
-    # you want to compare.
+    # zero so the final policy stands unaided.
     assist_force_enabled: bool = True
     # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
     # so 160 N supports most of body weight without launching it — the
     # policy still has to do the last ~20% and get its feet underneath.
-    assist_force_max: float = 220.0
+    assist_force_max: float = 300.0
     # Spring shape: force ramps with height deficit (target − z), so it's
     # strongest when fully fallen and releases to ~0 near standing height.
     # Upward-only (never pushes the trunk down). This keeps the assist from
     # fighting the robot once it's nearly up.
     assist_spring_shape: bool = True
-    # Curriculum horizon: assist fraction decays 1.0 → 0.0 over this many
-    # cumulative env-steps. Should be on the same order as the discovery
-    # phase length (a good chunk of total_timesteps).
+    # PERFORMANCE-COUPLED assist (primary driver). The assist fraction is
+    # tied directly to the success EMA:
+    #   success_frac = clip(1 - success_ema / assist_success_target, 0, 1)
+    # → full support at zero competence, fading to ~0 as the policy reaches
+    # `assist_success_target`. This auto-couples the assist to the pose
+    # curriculum: a level-up introduces a harder pose, the success EMA drops,
+    # and the assist rises back to help — no explicit per-level logic needed.
+    # Set slightly ABOVE the highest advance threshold (0.60 vs 0.55/0.60) so
+    # that at the moment of advancement the assist is already LOW (but not
+    # exactly 0). The old `assist_min_success`/`assist_min_frac` floor is
+    # replaced by this: it pinned the assist at 0.60 right up to the 0.50
+    # advance threshold, so the policy advanced *before* it was weaned.
+    assist_success_target: float = 0.60
+    # Time-decay BACKSTOP (multiplicative). On its own the success coupling
+    # would let a policy that plateaus BELOW the target lean on the assist
+    # forever. Multiply success_frac by a linear time ramp (1.0 → 0.0 over
+    # this many cumulative env-steps) so support is always weaned out
+    # eventually, regardless of success. Should be on the same order as the
+    # discovery phase length (a good chunk of total_timesteps).
     assist_curriculum_env_steps: int = 150_000_000
-    # Performance gate (mirrors the easy-start gate): don't wean the assist
-    # while the policy is still failing. Hold the fraction at
-    # `assist_min_frac` until the EMA frame-success rate clears the
-    # threshold. Prevents the time-only decay from removing all support
-    # while success is still ~0.
-    assist_min_success: float = 0.10
-    assist_min_frac: float = 0.85
+    # Anti-cobra assist gate. The naive fix — multiply the assist by a "feet
+    # under base" score — is WRONG: a freshly fallen robot also has its feet
+    # splayed out, so that gate zeroes the assist in *every* legitimate fall,
+    # killing the HoST bootstrap (≈167 N → 0 N at z≈0.13). The real cobra
+    # marker is TRUNK LIFTED *and* FEET BEHIND simultaneously — a fallen
+    # robot has the trunk DOWN, so it must still be fully supported. We only
+    # throttle the assist once the chest is up but the feet haven't tucked:
+    #   cobra_factor = 1 - trunk_lifted · (1 - feet_under_base)
+    # → fallen: ~1 (full support), cobra: ~0 (cut), real stand: ~1 (deficit≈0
+    #   makes the force ~0 anyway). Set False for unconditional upward assist.
+    assist_cobra_gate: bool = True
+    # Soft ramp width (m) for the feet-under-base term inside the cobra gate:
+    # 1 at foot-under-base (d=0), → 0 at d ≥ this. Matches the reward-side
+    # feet_under_base_soft_d so assist and on-feet reward agree on geometry.
+    assist_under_base_soft_d: float = 0.40
+    # Trunk-z band (m) for the `trunk_lifted` ramp in the cobra gate: 0 at
+    # z ≤ z_low (fallen — full support), 1 at z ≥ z_high (chest clearly up —
+    # cobra territory if feet still behind). Fallen prone/supine sits ≈0.13.
+    assist_cobra_z_low: float = 0.15
+    assist_cobra_z_high: float = 0.35
 
     # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
     # the policy can find ANY standup; "deploy" (Stage 2) uses the full
@@ -203,21 +224,57 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    easy_pool_enabled: bool = False             # see assist_force_enabled
-    easy_pool_settle_steps: int = 30            # brief — robot is already up
-    easy_pool_height: float = 0.60              # spawn just above standing
-    easy_pool_joint_jitter: float = 0.10        # rad — bigger than reset jitter
-    easy_pool_tilt_max: float = 0.15            # rad (~8°) — small initial tilt
-    easy_pool_min_height: float = 0.40          # filter: keep only standing-ish
-    easy_pool_min_upright: float = 0.70         # filter: cos(tilt) ≥ 0.70
-    start_curriculum_env_steps: int = 50_000_000  # ramp easy_frac 1.0 → 0.0
-    # Performance gate: easy_frac only decays when the EMA success rate
-    # exceeds this threshold. Below it, the fraction is held at
-    # `start_curriculum_min_easy_frac` to keep training viable. This
-    # prevents the time-only curriculum from reaching 0% easy starts while
-    # the policy still has 0% success rate.
-    start_curriculum_min_success: float = 0.05  # minimum EMA frame_success_rate
-    start_curriculum_min_easy_frac: float = 0.30  # clamp easy_frac here if stuck
+    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
+    # Each level presents harder starting poses. Advancement is gated on both
+    # sustained EMA success and minimum time at threshold.
+    #
+    #   L0: supine only               — easiest single entry pose
+    #   L1: supine + prone (50/50)    — add the harder front recovery
+    #   L2: all 4 named poses (25% each) — + side_left + side_right
+    #   L3: named 50% + random fallen 50% — full robustness
+    #
+    # Supine (roll/sit up) and prone (arm push-up → tuck → stand) are
+    # different motor strategies, and prone additionally pulls toward the
+    # cobra. Training both 50/50 from the start averages the gradients so the
+    # policy learns neither cleanly, and the combined success EMA stalls below
+    # the gate when one pose lags — so prone is held back to L1 and gets there
+    # only after supine is solid. Recovery from fully-fallen poses is
+    # bootstrapped by the decaying assist force. Set
+    # pose_curriculum_start_level=3 to train directly on the full mixed
+    # distribution (no curriculum ramp).
+    pose_curriculum_enabled: bool = True
+    pose_curriculum_start_level: int = 0
+
+    # EMA threshold to advance FROM each level. Element i controls the
+    # transition from level i → i+1. Length = (num_levels - 1) = 3.
+    #   L0→L1 (supine solid before adding prone), L1→L2, L2→L3.
+    # Set just below assist_success_target (0.60) so advancement requires
+    # genuine, largely-unassisted competence — by the time the success EMA
+    # hits 0.55 the performance-coupled assist is already low (~0.08).
+    pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
+
+    # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
+    # threshold before advancing. Prevents a single lucky spike triggering a
+    # level jump. At 2048 envs, 1M steps ≈ 488 control steps ≈ ~10 s.
+    pose_advance_sustain_steps: int = 1_000_000
+
+    # Named-pose pool build parameters. Same settle mechanism as the main
+    # settle pool but starting from the named pose's reference orientation.
+    pose_pool_settle_steps: int = 1000     # physics substeps per round = 2.0 s at 500 Hz.
+                                            # Was 150 (0.3 s) — too short to damp bouncing
+                                            # after 0.19 s free-fall from spawn height.
+    pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
+    pose_pool_quat_noise_rad: float = 0.30  # Gaussian σ on orientation perturbation
+    # Joint noise for named-pose pools. HUMANUP + X-Loco recommend large joint noise
+    # so each pool sample is a distinct fallen configuration rather than a rigid clone
+    # of the canonical pose. 0.30 rad σ ≈ ±17° per joint (was hardcoded 0.05 = ±3°).
+    pose_pool_joint_jitter_rad: float = 0.30
+    # Filter: keep pool entries with trunk_z < trunk_height + this margin.
+    # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
+    pose_pool_max_height_margin: float = 0.30
+
+    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
+    pose_mix_random_frac: float = 0.50
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
@@ -263,6 +320,19 @@ class StandupConfig:
     foot_grounded_max_z: float = 0.10          # feet "on ground" when z < this
     trunk_up_min_z: float = 0.30               # trunk "lifted" when z > this
 
+    # ── Feet-under-base (anti-cobra / anti-push-up) ──────────────────────
+    # The missing discriminator between "standing on its feet" and "lying
+    # with its feet flat and splayed". `_feet_grounded_score` only checks
+    # foot_z, which a prone / cobra / L-sit pose satisfies trivially — so
+    # the policy got ~10/step from foot_grounded_up + standing_tall while
+    # keeping its legs flat on the floor and letting the assist hold the
+    # trunk up. These gate both stand-on-feet rewards (soft, for gradient)
+    # and success detection (hard, so the +400 bonus can't be farmed from
+    # a propped pose) on the horizontal foot↔base distance.
+    feet_under_base_soft_d: float = 0.40       # soft ramp: 1 at d=0, 0 at d≥this
+    success_under_base_max_d: float = 0.25     # hard: feet must be within this of base
+    success_foot_max_z: float = 0.12           # hard: feet must be on the ground
+
     # Thresholds for the `standing_tall` reward — pulls the policy from
     # squat (trunk ~0.30) to full standing (trunk ~0.55).
     standing_tall_min_z: float = 0.30          # signal starts ramping here
@@ -285,7 +355,7 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.002  # was 0.01 — stops std runaway; std stays moderate
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5

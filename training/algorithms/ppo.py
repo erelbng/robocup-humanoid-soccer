@@ -29,9 +29,7 @@ import torch
 import torch.nn as nn
 
 from training.algorithms.networks import PPOActorCritic
-from training.normalizers import (
-    RunningMeanStd, ReturnNormalizer, linear_std_schedule,
-)
+from training.normalizers import RunningMeanStd, ReturnNormalizer
 
 
 # ─── checkpoint I/O ────────────────────────────────────────────────────
@@ -147,11 +145,12 @@ def train_ppo_vec(env, policy, config, logger=None,
     logp_buf = torch.zeros(n_steps, n_envs, device=device)
     rew_buf = torch.zeros(n_steps, n_envs, device=device)
     val_buf = torch.zeros(n_steps, n_envs, device=device)
-    done_buf = torch.zeros(n_steps, n_envs, device=device)        # terminated|truncated
-    term_buf = torch.zeros(n_steps, n_envs, device=device)        # TRUE termination
-    trunc_buf = torch.zeros(n_steps, n_envs, device=device)       # timeout truncation
-    # Normalized terminal obs s_{t+1} — for value bootstrap on truncation.
-    term_obs_buf = torch.zeros(n_steps, n_envs, obs_dim, device=device)
+    done_buf = torch.zeros(n_steps, n_envs, device=device)
+    # Episode-end split for correct GAE: term_buf = true terminal (no
+    # bootstrap), trunc_buf = time-limit (bootstrap from terminal-obs value).
+    term_buf = torch.zeros(n_steps, n_envs, device=device)
+    trunc_buf = torch.zeros(n_steps, n_envs, device=device)
+    truncval_buf = torch.zeros(n_steps, n_envs, device=device)
 
     for iteration in range(num_iterations):
         # Kick off a new video clip every `video_frequency` iterations.
@@ -179,21 +178,25 @@ def train_ppo_vec(env, policy, config, logger=None,
                 val_buf[step] = value
                 done_buf[step] = torch.as_tensor(
                     np.asarray(done, dtype=np.float32), device=device)
-                # Episode-boundary split + terminal obs for truncation bootstrap.
-                # Fall back gracefully if an env predates the new step contract.
-                truncated = info.get("truncated")
-                terminated = info.get("terminated")
-                if truncated is None:
-                    truncated = np.zeros(n_envs, dtype=np.float32)
-                    terminated = np.asarray(done, dtype=np.float32)
-                trunc_buf[step] = torch.as_tensor(
-                    np.asarray(truncated, dtype=np.float32), device=device)
-                term_buf[step] = torch.as_tensor(
-                    np.asarray(terminated, dtype=np.float32), device=device)
-                term_obs_raw = info.get("terminal_obs", next_obs)
-                term_obs_buf[step] = torch.as_tensor(
-                    obs_norm.normalize(term_obs_raw),
-                    dtype=torch.float32, device=device)
+
+                # Time-limit bookkeeping. Fall back to treating every done as
+                # a true terminal if the env doesn't provide the split.
+                terminated = np.asarray(
+                    info.get("terminated", done), dtype=np.float32)
+                truncated = np.asarray(
+                    info.get("truncated", np.zeros_like(terminated)),
+                    dtype=np.float32)
+                term_buf[step] = torch.as_tensor(terminated, device=device)
+                trunc_buf[step] = torch.as_tensor(truncated, device=device)
+                # On a truncation the returned next_obs is a reset state, so
+                # the bootstrap value must come from the TERMINAL obs.
+                if truncated.any() and "terminal_obs" in info:
+                    tobs = obs_norm.normalize(np.asarray(info["terminal_obs"]))
+                    truncval_buf[step] = policy.get_value(
+                        torch.as_tensor(tobs, dtype=torch.float32,
+                                        device=device))
+                else:
+                    truncval_buf[step] = 0.0
 
                 running_ep_r += reward
                 running_ep_len += 1
@@ -237,32 +240,25 @@ def train_ppo_vec(env, policy, config, logger=None,
         rew_norm_buf = rew_buf / max(1e-8, float(ret_norm.rms.std))
 
         # ── GAE ──
-        # Conventions in this buffer: done_buf[t]/term_buf[t]/trunc_buf[t] flag
-        # whether the transition AT step t ended the episode, and val_buf[t+1]
-        # is V(s_{t+1}). So the episode-end mask for step t is the CURRENT
-        # step's flag (term/trunc[t]) — NOT [t+1] (that was an off-by-one that
-        # leaked value across boundaries). On truncation we bootstrap from
-        # V(terminal_obs[t]) (the real s_{t+1}, pre-reset); on true termination
-        # the bootstrap is zeroed; the GAE trace is cut on either.
         with torch.no_grad():
             next_value = policy.get_value(obs_t)
-            term_values = policy.get_value(
-                term_obs_buf.reshape(n_steps * n_envs, obs_dim)
-            ).reshape(n_steps, n_envs)
 
         advantages = torch.zeros_like(rew_norm_buf)
         gae = torch.zeros(n_envs, device=device)
         for t in reversed(range(n_steps)):
-            next_val_default = next_value if t == n_steps - 1 else val_buf[t + 1]
-            # V(s_{t+1}): terminal_obs on truncation, observed next state else.
-            boot = torch.where(trunc_buf[t].bool(), term_values[t],
-                               next_val_default)
-            nonterminal = 1.0 - term_buf[t]          # zero only on TRUE failure
-            cont = 1.0 - done_buf[t]                 # cut trace on any ep end
+            next_val = next_value if t == n_steps - 1 else val_buf[t + 1]
+            # On truncation the stored next state is a reset obs; bootstrap
+            # from the terminal-obs value instead.
+            boot = torch.where(trunc_buf[t] > 0, truncval_buf[t], next_val)
+            # Zero the bootstrap ONLY on a true terminal; reset the GAE trace
+            # on ANY episode end (uses the CURRENT step's flags — done_buf[t]
+            # marks that THIS step ended the episode).
+            nonterminal = 1.0 - term_buf[t]
+            notdone = 1.0 - done_buf[t]
             delta = (rew_norm_buf[t]
                      + config.gamma * boot * nonterminal
                      - val_buf[t])
-            gae = delta + config.gamma * config.gae_lambda * cont * gae
+            gae = delta + config.gamma * config.gae_lambda * notdone * gae
             advantages[t] = gae
         returns = advantages + val_buf
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -274,12 +270,9 @@ def train_ppo_vec(env, policy, config, logger=None,
             var_y = float(np.var(y_true))
             explained_var = float(1.0 - np.var(y_true - y_pred) / (var_y + 1e-8))
 
-        # NOTE: exploration std (policy.actor_log_std) is a LEARNED parameter,
-        # driven by the entropy bonus (entropy_coef) + policy gradient. We used
-        # to overwrite it every iteration with a fixed wall-clock schedule,
-        # which silently discarded both the optimizer update and the entropy
-        # bonus (entropy_coef became a dead knob and exploration shrank on a
-        # timer regardless of progress). Removed — std now adapts to the task.
+        # Exploration std is the learnable `actor_log_std`, driven by the
+        # entropy bonus + policy gradient (NOT a fixed wall-clock schedule —
+        # that overwrite made entropy_coef a no-op).
 
         # ── Flatten for mini-batching ──
         b_obs = obs_buf.reshape(n_steps * n_envs, obs_dim)
@@ -376,7 +369,11 @@ def train_ppo_vec(env, policy, config, logger=None,
             mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
             ml = float(np.mean(ep_lengths)) if ep_lengths else 0.0
             sr = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
-            mean_robot_z = _mean_trunk_height(obs_buf, obs_norm)
+            # obs_buf holds NORMALIZED obs; un-normalize the root-height
+            # channel (index 0) for a human-readable metric.
+            mean_robot_z = (float(obs_buf[:, :, 0].mean())
+                            * float(obs_norm.std[0])
+                            + float(obs_norm.mean[0]))
             metrics = {
                 "mean_reward": mr, "std_reward": sr, "mean_length": ml,
                 "mean_robot_z": mean_robot_z,
@@ -515,10 +512,11 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     logp_buf = torch.zeros(n_steps, n_envs, device=device)
     rew_buf = torch.zeros(n_steps, n_envs, n_groups, device=device)
     val_buf = torch.zeros(n_steps, n_envs, n_groups, device=device)
-    done_buf = torch.zeros(n_steps, n_envs, device=device)        # terminated|truncated
-    term_buf = torch.zeros(n_steps, n_envs, device=device)        # TRUE termination
-    trunc_buf = torch.zeros(n_steps, n_envs, device=device)       # timeout truncation
-    term_obs_buf = torch.zeros(n_steps, n_envs, obs_dim, device=device)
+    done_buf = torch.zeros(n_steps, n_envs, device=device)
+    # Episode-end split for correct per-group GAE (see train_ppo_vec).
+    term_buf = torch.zeros(n_steps, n_envs, device=device)
+    trunc_buf = torch.zeros(n_steps, n_envs, device=device)
+    truncval_buf = torch.zeros(n_steps, n_envs, n_groups, device=device)
 
     for iteration in range(num_iterations):
         if (video_supported and not video_recording
@@ -552,19 +550,21 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 val_buf[step] = value
                 done_buf[step] = torch.as_tensor(
                     np.asarray(done, dtype=np.float32), device=device)
-                truncated = info.get("truncated")
-                terminated = info.get("terminated")
-                if truncated is None:
-                    truncated = np.zeros(n_envs, dtype=np.float32)
-                    terminated = np.asarray(done, dtype=np.float32)
-                trunc_buf[step] = torch.as_tensor(
-                    np.asarray(truncated, dtype=np.float32), device=device)
-                term_buf[step] = torch.as_tensor(
-                    np.asarray(terminated, dtype=np.float32), device=device)
-                term_obs_raw = info.get("terminal_obs", next_obs)
-                term_obs_buf[step] = torch.as_tensor(
-                    obs_norm.normalize(term_obs_raw),
-                    dtype=torch.float32, device=device)
+
+                terminated = np.asarray(
+                    info.get("terminated", done), dtype=np.float32)
+                truncated = np.asarray(
+                    info.get("truncated", np.zeros_like(terminated)),
+                    dtype=np.float32)
+                term_buf[step] = torch.as_tensor(terminated, device=device)
+                trunc_buf[step] = torch.as_tensor(truncated, device=device)
+                if truncated.any() and "terminal_obs" in info:
+                    tobs = obs_norm.normalize(np.asarray(info["terminal_obs"]))
+                    truncval_buf[step] = policy.get_value(
+                        torch.as_tensor(tobs, dtype=torch.float32,
+                                        device=device))  # (N, G)
+                else:
+                    truncval_buf[step] = 0.0
 
                 running_ep_r += reward
                 running_ep_len += 1
@@ -607,28 +607,21 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             rew_norm_buf[..., g] = rg / max(1e-8, float(rn.rms.std))
 
         # ── Per-group GAE ──
-        # Same boundary semantics as train_ppo_vec, applied per group: the
-        # ep-end mask for step t is the CURRENT step's flag (off-by-one fix),
-        # truncation bootstraps V(terminal_obs[t]) per group, true termination
-        # zeroes it, and the trace is cut on either.
         with torch.no_grad():
             next_value = policy.get_value(obs_t)  # (N, G)
-            term_values = policy.get_value(
-                term_obs_buf.reshape(n_steps * n_envs, obs_dim)
-            ).reshape(n_steps, n_envs, n_groups)
 
         advantages = torch.zeros_like(rew_norm_buf)  # (T, N, G)
         gae = torch.zeros(n_envs, n_groups, device=device)
         for t in reversed(range(n_steps)):
-            next_val_default = next_value if t == n_steps - 1 else val_buf[t + 1]
-            trunc_t = trunc_buf[t].unsqueeze(-1).bool()      # (N,1)
-            boot = torch.where(trunc_t, term_values[t], next_val_default)
-            nonterminal = 1.0 - term_buf[t].unsqueeze(-1)    # (N,1)
-            cont = 1.0 - done_buf[t].unsqueeze(-1)           # (N,1)
+            next_val = next_value if t == n_steps - 1 else val_buf[t + 1]
+            boot = torch.where((trunc_buf[t] > 0).unsqueeze(-1),
+                               truncval_buf[t], next_val)
+            nonterminal = (1.0 - term_buf[t]).unsqueeze(-1)  # (N, 1)
+            notdone = (1.0 - done_buf[t]).unsqueeze(-1)
             delta = (rew_norm_buf[t]
                      + config.gamma * boot * nonterminal
                      - val_buf[t])
-            gae = delta + config.gamma * config.gae_lambda * cont * gae
+            gae = delta + config.gamma * config.gae_lambda * notdone * gae
             advantages[t] = gae
         returns = advantages + val_buf  # (T, N, G) per-group value targets
 
@@ -638,9 +631,10 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
         adv_norm = (adv_flat - adv_flat.mean(0, keepdim=True)) \
             / (adv_flat.std(0, keepdim=True) + 1e-8)
         agg_adv = (adv_norm * gw).sum(-1)  # (T*N,)
-        # Re-standardize the aggregate: a weighted sum of G unit-std groups has
-        # std ≈ ||gw|| (~√G), which would inflate the effective policy-gradient
-        # step vs the single-critic path. Bring it back to unit std.
+        # Re-standardize the aggregated advantage so its scale doesn't depend
+        # on n_groups / group_weights (a weighted sum of unit-std groups has
+        # std ~sqrt(Σw²)); keeps the effective policy step on par with
+        # single-critic PPO, which normalizes its advantage the same way.
         agg_adv = (agg_adv - agg_adv.mean()) / (agg_adv.std() + 1e-8)
 
         # Per-group explained variance (diagnostic).
@@ -653,8 +647,8 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 ev_per_group.append(
                     float(1.0 - np.var(yt[:, g] - yp[:, g]) / (var_y + 1e-8)))
 
-        # exploration std is a learned parameter (entropy_coef + PG), no longer
-        # overwritten by a wall-clock schedule — see note in train_ppo_vec.
+        # Exploration std = learnable actor_log_std (entropy bonus + PG),
+        # not a fixed wall-clock schedule.
 
         # ── Flatten ──
         b_obs = obs_buf.reshape(n_steps * n_envs, obs_dim)
@@ -747,7 +741,9 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
             ml = float(np.mean(ep_lengths)) if ep_lengths else 0.0
             sr = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
-            mean_robot_z = _mean_trunk_height(obs_buf, obs_norm)
+            mean_robot_z = (float(obs_buf[:, :, 0].mean())
+                            * float(obs_norm.std[0])
+                            + float(obs_norm.mean[0]))
             metrics = {
                 "mean_reward": mr, "std_reward": sr, "mean_length": ml,
                 "mean_robot_z": mean_robot_z,
@@ -842,6 +838,9 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
         rew_buf = torch.zeros(n_steps, device=device)
         val_buf = torch.zeros(n_steps, device=device)
         done_buf = torch.zeros(n_steps, device=device)
+        term_buf = torch.zeros(n_steps, device=device)
+        trunc_buf = torch.zeros(n_steps, device=device)
+        truncval_buf = torch.zeros(n_steps, device=device)
 
         with torch.no_grad():
             for step in range(n_steps):
@@ -860,6 +859,20 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
                 val_buf[step] = value.squeeze(0)
                 done_buf[step] = float(done)
 
+                # Time-limit split for correct bootstrapping (see vec path).
+                terminated = float(np.asarray(info.get("terminated", done)).any())
+                truncated = float(np.asarray(info.get("truncated", 0.0)).any())
+                term_buf[step] = terminated
+                trunc_buf[step] = truncated
+                if truncated and "terminal_obs" in info:
+                    tobs = np.asarray(info["terminal_obs"])
+                    if tobs.ndim > 1:
+                        tobs = tobs[0]
+                    tnorm = obs_norm.normalize(tobs)
+                    truncval_buf[step] = policy.get_value(
+                        torch.as_tensor(tnorm, dtype=torch.float32,
+                                        device=device).unsqueeze(0)).squeeze(0)
+
                 episode_reward += float(reward)
                 episode_length += 1
                 total_steps += 1
@@ -877,9 +890,8 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
                     ep_components = {}
                     episode_reward = 0.0
                     episode_length = 0
-                    next_obs = env.reset()
-                    if isinstance(next_obs, dict):
-                        next_obs = next_obs[0]
+                    # NOTE: env.step() already auto-resets internally and
+                    # returns the fresh obs, so we do NOT reset again here.
 
                 obs_norm.update(next_obs)
                 obs_t = torch.as_tensor(obs_norm.normalize(next_obs),
@@ -898,13 +910,15 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
         gae = 0.0
         for t in reversed(range(n_steps)):
             next_val = next_value if t == n_steps - 1 else val_buf[t + 1]
-            # ep-end mask is the CURRENT step's done (off-by-one fix). This
-            # debug/single-env path treats every done as terminal (no separate
-            # truncation bootstrap — the vec path does the full treatment).
-            next_done = done_buf[t]
-            delta = (rew_buf_n[t] + config.gamma * next_val
-                     * (1 - next_done) - val_buf[t])
-            gae = delta + config.gamma * config.gae_lambda * (1 - next_done) * gae
+            # Bootstrap from the terminal-obs value on truncation; mask only
+            # on a true terminal; reset the trace on any episode end. Uses the
+            # CURRENT step's flags (off-by-one fix).
+            boot = truncval_buf[t] if float(trunc_buf[t]) > 0 else next_val
+            nonterminal = 1.0 - float(term_buf[t])
+            notdone = 1.0 - float(done_buf[t])
+            delta = (rew_buf_n[t] + config.gamma * boot * nonterminal
+                     - val_buf[t])
+            gae = delta + config.gamma * config.gae_lambda * notdone * gae
             advantages[t] = gae
         returns = advantages + val_buf
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -915,8 +929,7 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
             var_y = float(np.var(y_true))
             explained_var = float(1.0 - np.var(y_true - y_pred) / (var_y + 1e-8))
 
-        # exploration std is learned (entropy_coef + PG) — schedule overwrite
-        # removed; see note in train_ppo_vec.
+        # Exploration std = learnable actor_log_std (entropy bonus + PG).
 
         approx_kl = 0.0
         clip_frac = 0.0
@@ -992,7 +1005,9 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
             mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
             ml = float(np.mean(ep_lengths)) if ep_lengths else 0.0
             sr = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
-            mean_robot_z = _mean_trunk_height(obs_buf, obs_norm)
+            mean_robot_z = (float(obs_buf[:, 0].mean())
+                            * float(obs_norm.std[0])
+                            + float(obs_norm.mean[0]))
             metrics = {
                 "mean_reward": mr, "std_reward": sr, "mean_length": ml,
                 "mean_robot_z": mean_robot_z,
@@ -1030,18 +1045,6 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
 
 
 # ─── helpers ───────────────────────────────────────────────────────────
-
-
-def _mean_trunk_height(obs_buf, obs_norm) -> float:
-    """True mean trunk height (metres) for logging.
-
-    `obs_buf` holds NORMALIZED observations; channel 0 is root height (see
-    skills/common_obs). We previously logged `obs_buf[..., 2]` — that's the
-    normalized projected-gravity y-channel, not height. Un-normalize channel 0
-    (affine, so order with the mean doesn't matter) back to metres.
-    """
-    norm_h = float(obs_buf[..., 0].mean().detach().cpu())
-    return norm_h * float(obs_norm.std[0]) + float(obs_norm.mean[0])
 
 
 def _log_metrics(logger, metrics: dict, step: int) -> None:

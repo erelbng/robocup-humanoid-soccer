@@ -113,8 +113,8 @@ class SkillEnv(ABC):
     # joint pose, clipped to ±ACTION_DELTA_MAX radians per control step.
     # This ensures a near-zero-initialised network holds the default
     # standing pose (rather than commanding all joints to 0), which is
-    # critical for skills that start near the desired pose (standup easy
-    # pool, walk). Subclasses can tighten this for fine-grained skills.
+    # critical for skills that start near the desired pose (walk).
+    # Subclasses can tighten this for fine-grained skills.
     ACTION_DELTA_MAX: float = 0.5
 
     # Episode-termination thresholds (override in subclasses if needed).
@@ -321,6 +321,12 @@ class SkillEnv(ABC):
                       f"({type(e).__name__}: {e}); push DR + assist are "
                       "no-ops. Other DR still applies.")
                 self._warned_wrench = True
+
+    def _get_action_scale(self) -> float:
+        """Multiplicative scale applied to the residual action BEFORE clipping.
+        Override in subclasses to implement a β action-amplitude curriculum
+        (HoST, arXiv:2502.08378). Default: 1.0 (no scaling)."""
+        return 1.0
 
     def _assist_wrench(self) -> Tuple[np.ndarray, np.ndarray]:
         """Optional skill-provided external wrench on the base, summed on
@@ -621,6 +627,9 @@ class SkillEnv(ABC):
         # holds the default standing pose on step 0 instead of collapsing
         # to all-zeros, which was the cause of the floor local optimum in
         # early standup training.
+        scale = self._get_action_scale()
+        if scale != 1.0:
+            action = action * float(scale)
         action = np.clip(action, -self.ACTION_DELTA_MAX, self.ACTION_DELTA_MAX)
         targets = np.clip(
             self._default_action[None, :] + action,
@@ -657,34 +666,33 @@ class SkillEnv(ABC):
 
         self.step_count += 1
 
-        # `terminal_obs` is the TRUE final observation of this transition
-        # (state s_{t+1}), read BEFORE any auto-reset. The trainer needs it to
-        # bootstrap the value on a timeout (truncation) instead of throwing the
-        # post-reset frame at GAE.
+        # Obs at the post-physics state. For envs about to reset this is the
+        # TERMINAL obs (returned in info for value bootstrapping); for the
+        # rest it is simply the next obs.
         terminal_obs = self._get_obs()
         reward, components = self._compute_skill_reward(action)
         done = self._check_skill_done()
-
-        # Split `done` into TRUE termination (a failure: fall / ball-lost /
-        # kick-event) vs TRUNCATION (hit the episode-horizon timeout). The
-        # timeout is universally `step_count >= MAX_EPISODE_STEPS` across all
-        # skills, so we can derive the split here without changing any
-        # `_check_skill_done` override's contract. GAE zeroes the bootstrap
-        # only on true termination and bootstraps V(terminal_obs) on
-        # truncation — matters a lot for standup, which ends ONLY by timeout.
+        # Separate true termination from time-limit truncation: a timeout is
+        # NOT a terminal state — its value must still be bootstrapped in GAE,
+        # whereas a true terminal (e.g. a fall) must not. Standup is
+        # timeout-only, so every episode end here is a truncation.
         truncated = self.step_count >= self.MAX_EPISODE_STEPS
-        terminated = done & (~truncated)
+        terminated = np.asarray(done) & ~truncated
 
         self._episode_reward += reward
         self._last_action = action  # delta (residual), not absolute target
 
-        # Auto-reset done envs and return the FRESH post-reset frame for them
-        # (reset() returns a full _get_obs()), so the policy's first action of
-        # each new episode is chosen from the new initial state — not the
-        # stale terminal frame. Non-done envs keep `terminal_obs` (unchanged).
-        obs = terminal_obs
         if done.any():
-            obs = self.reset(envs_idx=np.where(done)[0])
+            didx = np.where(done)[0]
+            self.reset(envs_idx=didx)
+            # Return the FRESH post-reset obs for the envs that reset, so the
+            # next action is chosen from the actual new state rather than the
+            # discarded terminal obs. Non-reset envs keep their obs unchanged.
+            fresh = self._get_obs()
+            obs = terminal_obs.copy()
+            obs[didx] = fresh[didx]
+        else:
+            obs = terminal_obs
 
         info = {
             "episode_reward": self._episode_reward.copy(),
@@ -692,10 +700,11 @@ class SkillEnv(ABC):
             "reward_components": components,
             # (N, G) per-group reward for multi-critic PPO, or None.
             "group_rewards": self._group_rewards,
-            # Episode-boundary signals for correct GAE bootstrapping.
-            "terminated": terminated,        # true failure → zero bootstrap
-            "truncated": truncated,          # timeout → bootstrap terminal_obs
-            "terminal_obs": terminal_obs,    # raw s_{t+1}; trainer normalizes
+            # Time-limit handling for correct GAE bootstrapping. `terminal_obs`
+            # is the pre-reset obs; `truncated`/`terminated` split episode-end.
+            "terminal_obs": terminal_obs,
+            "terminated": terminated,
+            "truncated": truncated,
         }
         return obs, reward, done, info
 

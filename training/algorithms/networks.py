@@ -53,6 +53,13 @@ def orthogonal_init(module: nn.Module, gain: float = math.sqrt(2.0),
 
 # ─── PPO Actor-Critic ──────────────────────────────────────────────────
 
+# Bounds for the PPO actor's learned per-action log_std. The upper bound
+# (max≈0 ⇒ std≤1.0) is the load-bearing one: it caps a std runaway the way
+# the SAC actor's LOG_STD_MAX does. The lower bound just keeps std from
+# collapsing to zero.
+PPO_LOG_STD_MIN = -5.0
+PPO_LOG_STD_MAX = 0.0
+
 
 class PPOActorCritic(nn.Module):
     """rsl_rl-style ActorCritic.
@@ -118,7 +125,12 @@ class PPOActorCritic(nn.Module):
 
     def _action_dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
         mean = self.actor_head(self.actor_trunk(obs))
-        std = self.actor_log_std.exp().expand_as(mean)
+        # Hard upper bound on log_std (like the SAC actor) so the learned
+        # per-action std cannot run away. max≈0 ⇒ std≤1.0. The param itself
+        # is unconstrained; clamping the forward pass zeroes the gradient when
+        # saturated, which is the standard SAC-style treatment.
+        log_std = self.actor_log_std.clamp(PPO_LOG_STD_MIN, PPO_LOG_STD_MAX)
+        std = log_std.exp().expand_as(mean)
         return torch.distributions.Normal(mean, std)
 
     def act(self, obs: torch.Tensor, deterministic: bool = False

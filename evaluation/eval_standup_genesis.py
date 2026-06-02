@@ -42,7 +42,6 @@ def main():
     cfg = StandupConfig()
     cfg.num_envs = args.num_envs
     cfg.assist_force_enabled = False    # evaluate the UNAIDED policy
-    cfg.easy_pool_enabled = False       # all fallen starts (no easy curriculum)
 
     # Teacher checkpoints are privileged (obs_dim 94); a student/single is 78.
     # Infer from the checkpoint's actor input width.
