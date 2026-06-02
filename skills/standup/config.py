@@ -234,7 +234,12 @@ class StandupConfig:
     # shaping and small penalties. Each critic fits one homogeneous-scale
     # group; advantages are normalized per group then weighted-summed.
     # Standup-only (the other skills keep single-critic PPO).
-    use_multi_critic: bool = False
+    use_multi_critic: bool = True   # run #3: HoST's core standup fix. Runs #1-2
+                                    # (single-critic) both plateaued at a ~0.31 m
+                                    # kneel — the value net can't fit the +400
+                                    # success pulse mixed with dense shaping, so
+                                    # the gradient toward reliably standing is too
+                                    # weak. One critic per (task,reg,success) group.
     # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
     # success). Bias toward `task` early to drive the get-up; `reg` is ~0
     # in the discovery stage anyway (its weights are zeroed).
@@ -305,8 +310,13 @@ class StandupConfig:
     # Sustained-success thresholds (END of curriculum — see _start values
     # below). A standup is "done" once `success_hold_steps` consecutive
     # frames satisfy both upright and height conditions.
-    target_height: float = 0.55
-    upright_threshold: float = 0.92            # cosine ~23° tilt max
+    target_height: float = 0.50               # run #3: 0.55→0.50 so the success
+                                              # bonus is reachable from a ~0.40 m
+                                              # rise (was unreachable from the
+                                              # 0.31 m kneel), pulling the policy
+                                              # off the squat. standing_tall still
+                                              # ramps to 0.55 for full extension.
+    upright_threshold: float = 0.88            # run #3: 0.92→0.88 (cosine ~28°)
     success_hold_steps: int = 50               # 1.0 s at 50 Hz
 
     # Curricula on the success criteria. All three independently ramp
