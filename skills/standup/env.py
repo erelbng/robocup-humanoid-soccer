@@ -158,7 +158,7 @@ class K1StandupEnv(SkillEnv):
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
 
-        # ── Pose difficulty curriculum (L0–L2) ────────────────────────────
+        # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
         # Named-pose pools built lazily alongside the settle pool.
@@ -453,24 +453,36 @@ class K1StandupEnv(SkillEnv):
     def _sample_reset_from_level(self, n: int) -> tuple:
         """Return (pos, quat, jpos) for n envs based on the current pose level.
 
-        L0 → supine + prone (50/50)    — core recovery
-        L1 → all 4 named poses equally — + side_left + side_right
-        L2 → named (1-frac) + random fallen (frac) — full robustness
+        L0 → supine only              — easiest single entry pose
+        L1 → supine + prone (50/50)   — add the harder front recovery
+        L2 → all 4 named poses equally — + side_left + side_right
+        L3 → named (1-frac) + random fallen (frac) — full robustness
+
+        Supine and prone are *different motor strategies* (supine: roll/sit
+        up, tuck knees; prone: arm push-up → tuck → stand) and prone also
+        pulls toward the cobra. Mixing both 50/50 from step 0 averages the
+        gradients so the policy masters neither early. L0 isolates supine so
+        the policy builds a foundation on one pose before prone is added —
+        and each stage gets its own reachable EMA gate instead of one combined
+        rate that the lagging pose drags below threshold.
         """
         level = self._pose_level
         names = ["supine", "prone", "side_left", "side_right"]
 
         if level <= 0:
+            return self._sample_from_pool("supine", n)
+
+        if level == 1:
             choice = self.rng.integers(0, 2, size=n)
             return self._gather_by_choice(
                 [("supine", choice == 0), ("prone", choice == 1)], n)
 
-        if level == 1:
+        if level == 2:
             choice = self.rng.integers(0, 4, size=n)
             return self._gather_by_choice(
                 [(nm, choice == i) for i, nm in enumerate(names)], n)
 
-        # L2+: named poses + random fallen mix
+        # L3+: named poses + random fallen mix
         n_random = int(round(n * self.cfg.pose_mix_random_frac))
         n_named = n - n_random
         pos = np.empty((n, 3), dtype=np.float32)

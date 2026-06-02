@@ -221,23 +221,31 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    # ── Pose difficulty curriculum (discrete, L0–L2) ──────────────────────
+    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
     # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
-    #   L0: supine + prone (50/50)    — core recovery (back & front)
-    #   L1: all 4 named poses (25% each) — + side_left + side_right
-    #   L2: named 50% + random fallen 50% — full robustness
+    #   L0: supine only               — easiest single entry pose
+    #   L1: supine + prone (50/50)    — add the harder front recovery
+    #   L2: all 4 named poses (25% each) — + side_left + side_right
+    #   L3: named 50% + random fallen 50% — full robustness
     #
-    # Recovery from fully-fallen poses is bootstrapped by the decaying assist
-    # force. Set pose_curriculum_start_level=2 to train directly on the full
-    # mixed distribution (no curriculum ramp).
+    # Supine (roll/sit up) and prone (arm push-up → tuck → stand) are
+    # different motor strategies, and prone additionally pulls toward the
+    # cobra. Training both 50/50 from the start averages the gradients so the
+    # policy learns neither cleanly, and the combined success EMA stalls below
+    # the gate when one pose lags — so prone is held back to L1 and gets there
+    # only after supine is solid. Recovery from fully-fallen poses is
+    # bootstrapped by the decaying assist force. Set
+    # pose_curriculum_start_level=3 to train directly on the full mixed
+    # distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
 
     # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length = (num_levels - 1) = 2.
-    pose_level_thresholds: tuple = (0.50, 0.60)
+    # transition from level i → i+1. Length = (num_levels - 1) = 3.
+    #   L0→L1 (supine solid before adding prone), L1→L2, L2→L3.
+    pose_level_thresholds: tuple = (0.50, 0.50, 0.60)
 
     # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
     # threshold before advancing. Prevents a single lucky spike triggering a
@@ -259,7 +267,7 @@ class StandupConfig:
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
 
-    # L2: random-pool fraction (rest drawn equally from the 4 named poses).
+    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
