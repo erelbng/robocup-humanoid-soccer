@@ -343,6 +343,22 @@ class StandupConfig:
     recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
     recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
 
+    # ── Standup-only leg PD gains (override K1RobotConfig) ───────────────────
+    # The shared default is kp=40 on all legs — lowered from 200 for WALK
+    # sim2real, but far too soft for standup: at kp=40 the policy needs a ~1 rad
+    # joint error to command meaningful torque, so it can't make the fast,
+    # precise corrections needed to balance on extended legs (runs #1-5 all
+    # collapsed even from a stable crouch). Booster's own booster_gym T1 config
+    # uses kp 200/200/50, kd 5/5/1 — restore that for standup ONLY (applied to
+    # this process's robot_cfg in K1StandupEnv.__init__; walk keeps kp=40).
+    # Arms/head keep the shared defaults.
+    kp_hip: float = 200.0
+    kp_knee: float = 200.0
+    kp_ankle: float = 50.0
+    kd_hip: float = 5.0
+    kd_knee: float = 5.0
+    kd_ankle: float = 1.0
+
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
     # real robot doesn't have. Set True to remove the contact dims from

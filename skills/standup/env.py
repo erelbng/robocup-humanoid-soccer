@@ -124,6 +124,22 @@ class K1StandupEnv(SkillEnv):
         super().__init__(**kwargs)
         self.MAX_EPISODE_STEPS = self.cfg.max_episode_steps
 
+        # Standup-only leg PD gains: override the soft shared defaults (kp=40,
+        # tuned for walk) with stiffer Booster-style gains so the policy has the
+        # control authority to balance on extended legs and push to standing.
+        # Mutating this process's robot_cfg only (each skill trains in its own
+        # process); read later by SkillEnv._build_per_joint_gains at scene build.
+        # Arms/head keep the shared defaults.
+        self.robot_cfg.kp_hip = self.cfg.kp_hip
+        self.robot_cfg.kp_knee = self.cfg.kp_knee
+        self.robot_cfg.kp_ankle = self.cfg.kp_ankle
+        self.robot_cfg.kd_hip = self.cfg.kd_hip
+        self.robot_cfg.kd_knee = self.cfg.kd_knee
+        self.robot_cfg.kd_ankle = self.cfg.kd_ankle
+        print(f"[standup] leg gains overridden: kp hip/knee/ankle="
+              f"{self.cfg.kp_hip:.0f}/{self.cfg.kp_knee:.0f}/{self.cfg.kp_ankle:.0f} "
+              f"kd={self.cfg.kd_hip:.0f}/{self.cfg.kd_knee:.0f}/{self.cfg.kd_ankle:.0f}")
+
         # Settle pool — built lazily on first reset (needs scene + robot).
         self._pool_pos: Optional[np.ndarray] = None
         self._pool_quat: Optional[np.ndarray] = None
