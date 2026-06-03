@@ -314,7 +314,10 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
-    def _build_pose_pool(self, pose, keep_upright: bool = False) -> dict:
+    def _build_pose_pool(self, pose, keep_upright: bool = False,
+                         quat_noise_rad: float = None,
+                         joint_jitter_rad: float = None,
+                         settle_steps: int = None) -> dict:
         """Spawn all envs at a StandupPose, briefly settle, snapshot.
 
         Orientation noise (σ = cfg.pose_pool_quat_noise_rad) is composed on top
@@ -331,6 +334,11 @@ class K1StandupEnv(SkillEnv):
         c = self.cfg
         N = self.num_envs
         all_idx = np.arange(N)
+
+        # Per-pool noise/settle overrides (crouch pools pass tighter values).
+        qn = c.pose_pool_quat_noise_rad if quat_noise_rad is None else quat_noise_rad
+        jj = c.pose_pool_joint_jitter_rad if joint_jitter_rad is None else joint_jitter_rad
+        ss = c.pose_pool_settle_steps if settle_steps is None else settle_steps
 
         _empty = {"pos": np.zeros((0, 3), dtype=np.float32),
                   "quat": np.zeros((0, 4), dtype=np.float32),
@@ -354,7 +362,7 @@ class K1StandupEnv(SkillEnv):
 
         for round_idx in range(c.pose_pool_rounds):
             # Compose base quat with small random tilt noise.
-            noise = _small_tilt_quat(N, c.pose_pool_quat_noise_rad, self.rng)
+            noise = _small_tilt_quat(N, qn, self.rng)
             quat = _quat_mul(noise, base_quat)  # noise on top of base pose
 
             pos = np.zeros((N, 3), dtype=np.float32)
@@ -364,7 +372,7 @@ class K1StandupEnv(SkillEnv):
             jpos_target = (np.tile(jpos_ref, (N, 1))
                            + self.rng.standard_normal((N, self.act_dim))
                               .astype(np.float32)
-                              * self.cfg.pose_pool_joint_jitter_rad)
+                              * jj)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)
@@ -378,7 +386,7 @@ class K1StandupEnv(SkillEnv):
                       f"(round {round_idx}) failed: {e}")
                 continue
 
-            for _ in range(c.pose_pool_settle_steps):
+            for _ in range(ss):
                 self.scene.step()
 
             try:
@@ -442,7 +450,11 @@ class K1StandupEnv(SkillEnv):
                     d_hip=self.cfg.recovery_crouch_delta_hip,
                     d_knee=self.cfg.recovery_crouch_delta_knee,
                     d_ankle=self.cfg.recovery_crouch_delta_ankle)
-                pool = self._build_pose_pool(cpose, keep_upright=True)
+                pool = self._build_pose_pool(
+                    cpose, keep_upright=True,
+                    quat_noise_rad=self.cfg.recovery_crouch_quat_noise_rad,
+                    joint_jitter_rad=self.cfg.recovery_crouch_joint_jitter_rad,
+                    settle_steps=self.cfg.recovery_crouch_settle_steps)
                 self._crouch_pools[s] = pool
                 print(f"[standup] crouch pool R{s} "
                       f"(spawn_h={heights[s]}, bend={scales[s]}): "

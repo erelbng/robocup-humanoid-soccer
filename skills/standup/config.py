@@ -334,6 +334,14 @@ class StandupConfig:
     # Cumulative env-steps the EMA must stay above threshold before advancing
     # (same mechanism as the pose curriculum's pose_advance_sustain_steps).
     recovery_advance_sustain_steps: int = 1_000_000
+    # Crouch pools are statically MARGINAL (a squat needs active balance), so —
+    # unlike the passively-stable fallen pools — they must spawn with SMALL
+    # noise or they topple during settling and the pool builds (near-)empty
+    # (→ silent fallback to fallen sampling, defeating the curriculum). Tight
+    # tilt/joint noise + a shorter settle keep the squat upright.
+    recovery_crouch_quat_noise_rad: float = 0.05    # ≈ ±3° tilt
+    recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
+    recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
