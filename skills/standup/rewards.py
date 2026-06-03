@@ -158,6 +158,31 @@ def feet_under_base_score(foot_xy: np.ndarray, base_xy: np.ndarray,
     return (score[:, 0] * score[:, 1]).astype(np.float32)
 
 
+def feet_tuck_signal(foot_z: np.ndarray, foot_xy: np.ndarray,
+                     base_xy: np.ndarray,
+                     foot_max_z: float = 0.12,
+                     d_max: float = 0.40) -> np.ndarray:
+    """Dense [0, 1] reward for BOTH feet grounded AND tucked under the base —
+    the squat-ready stance, paid regardless of trunk height/orientation.
+
+    This is the missing motor primitive behind the stubborn ~0.30 m plateau
+    (runs #1-3): the policy raises its torso but leaves its legs splayed flat,
+    so its feet never come under its body and it can never push to standing.
+    `feet_under_base_score` exists but is only used to GATE the end-of-motion
+    stand rewards (multiplied by trunk-up / upright factors), so it gives ~0
+    gradient while the robot is still low — exactly when the tuck must happen.
+    This term is UNGATED by trunk pose: a sprawled robot with feet on the floor
+    gets a smooth gradient that pulls its grounded feet inward toward under the
+    hips, building the squat stance from which the other terms (height,
+    standing_tall, explosive_rise) then drive the push-up.
+
+    grounded (both feet near floor) × under_base (both feet under the base xy).
+    """
+    grounded = _feet_grounded_score(foot_z, foot_max_z)
+    under = feet_under_base_score(foot_xy, base_xy, d_max=d_max)
+    return (grounded * under).astype(np.float32)
+
+
 def standing_on_feet_mask(foot_z: np.ndarray, foot_xy: np.ndarray,
                            base_xy: np.ndarray,
                            foot_max_z: float = 0.12,
@@ -444,6 +469,17 @@ def compute_standup_reward(
         trunk_max_z=standing_tall_max_z,
     ) * under_base
 
+    # Feet-tuck — dense, trunk-pose-UNGATED reward for both feet grounded AND
+    # under the base (the squat-ready stance). Teaches the missing primitive
+    # behind the sprawled ~0.30 m plateau: pull the grounded feet under the
+    # hips so the other terms can then drive the push to standing.
+    if foot_xy is not None:
+        tuck = feet_tuck_signal(
+            foot_z, foot_xy, root_pos[:, :2],
+            foot_max_z=foot_grounded_max_z, d_max=feet_under_base_soft_d)
+    else:
+        tuck = np.zeros(root_pos.shape[0], dtype=np.float32)
+
     w = weights
 
     # ── per-group decomposition (multi-critic PPO) ──
@@ -455,6 +491,7 @@ def compute_standup_reward(
         + w.height * h
         + w.upright_progress * progress
         + w.explosive_rise * rise
+        + w.feet_tuck * tuck
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
     ).astype(np.float32)
@@ -496,6 +533,7 @@ def compute_standup_reward(
         "sustained_rate": float(np.mean(sustained_now)),
         "achieved_sustained_rate": float(np.mean(achieved_sustained)),
         "post_success_standing": float(np.mean(post_success)),
+        "feet_tuck": float(np.mean(tuck)),
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
         "feet_under_base": float(np.mean(under_base)),

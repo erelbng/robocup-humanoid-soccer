@@ -40,6 +40,13 @@ class StandupRewardWeights:
                                        # (3.0→4.0 with the kneel-attractor fix:
                                        #  more upward drive off the squat)
 
+    # Feet-tuck — run #4 fix for the stubborn ~0.30 m sprawl plateau (runs #1-3
+    # all raised the torso but left legs splayed flat, feet never under the
+    # body). Dense, trunk-pose-UNGATED reward for both feet grounded AND tucked
+    # under the base → teaches the squat-ready stance the policy never found.
+    # A TASK term (drives the get-up) → ON in the discovery stage.
+    feet_tuck: float = 6.0             # weight on grounded × feet_under_base
+
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
     # rolls at ±π/2). Phase-gated on a [0.5, 0.85] band so arms are
