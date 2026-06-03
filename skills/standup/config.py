@@ -304,6 +304,37 @@ class StandupConfig:
     # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50
 
+    # ── Reverse start-state (height) get-up curriculum ──────────────────────
+    # The OUTER curriculum that addresses the stubborn ~0.30 m sprawl plateau
+    # (runs #1-4: the policy raises its torso but never tucks its feet under to
+    # push up). Start the robot near standing (a stable upright crouch) so it
+    # only learns the easy FINISH, then move the start progressively further
+    # from the goal (squat → deep squat → ... → full fallen) as success-EMA
+    # passes a gate. Mastering "stand from a squat" first bootstraps the full
+    # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
+    # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
+    # existing L0-L3 fallen-pose curriculum unchanged.
+    recovery_curriculum_enabled: bool = True
+    # Stage to start at. 0 = shallowest crouch. Set to len(recovery_crouch_heights)
+    # (the final stage) to DISABLE the ramp and train directly on fallen poses.
+    recovery_start_stage: int = 0
+    # Spawn trunk-z for each crouch stage (descending = deeper squat / harder).
+    # Settling resolves the exact resting height; these are spawn heights.
+    recovery_crouch_heights: tuple = (0.47, 0.38, 0.30)
+    # Squat depth per crouch stage: flexion delta = bend_scale × (d_hip,d_knee,
+    # d_ankle), added to the default standing pose. Larger = deeper.
+    recovery_bend_scales: tuple = (0.5, 1.0, 1.5)
+    recovery_crouch_delta_hip: float = -0.6
+    recovery_crouch_delta_knee: float = 0.9
+    recovery_crouch_delta_ankle: float = -0.5
+    # EMA success thresholds to advance R0→R1→R2→R_final (length = num crouch
+    # stages = len(recovery_crouch_heights)). Crouches are easy so gates are
+    # high; the last gate (entering full-fallen) is a touch lower.
+    recovery_stage_thresholds: tuple = (0.60, 0.55, 0.50)
+    # Cumulative env-steps the EMA must stay above threshold before advancing
+    # (same mechanism as the pose curriculum's pose_advance_sustain_steps).
+    recovery_advance_sustain_steps: int = 1_000_000
+
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
     # real robot doesn't have. Set True to remove the contact dims from

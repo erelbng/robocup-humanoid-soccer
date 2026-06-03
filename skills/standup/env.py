@@ -165,6 +165,19 @@ class K1StandupEnv(SkillEnv):
         # {pose_name: {"pos": (M,3), "quat": (M,4), "jpos": (M,22), "size": int}}
         self._named_pools: dict = {}
 
+        # ── Reverse-height get-up curriculum (R0..R_final) ────────────────
+        # Outer curriculum: start near standing (upright crouch) and move the
+        # start progressively more fallen. Stages 0..K-1 sample from crouch
+        # pools; the final stage K hands off to the fallen-pose L0-L3 curriculum.
+        self._recovery_final_stage: int = len(self.cfg.recovery_crouch_heights)
+        self._recovery_stage: int = (
+            self.cfg.recovery_start_stage
+            if self.cfg.recovery_curriculum_enabled
+            else self._recovery_final_stage)
+        self._recovery_sustain_steps: int = 0
+        # Crouch start pools built lazily in _build_all_pools. {stage: pool}.
+        self._crouch_pools: dict = {}
+
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
         self._hand_links = None
@@ -301,13 +314,19 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
-    def _build_pose_pool(self, pose) -> dict:
-        """Spawn all envs at a named StandupPose, briefly settle, snapshot.
+    def _build_pose_pool(self, pose, keep_upright: bool = False) -> dict:
+        """Spawn all envs at a StandupPose, briefly settle, snapshot.
 
         Orientation noise (σ = cfg.pose_pool_quat_noise_rad) is composed on top
         of the reference quat so each sample is a physically distinct variant.
         Returns {"pos", "quat", "jpos", "size"}. Returns size=0 on failure
         (does NOT raise) so the caller can fall back gracefully.
+
+        `keep_upright=False` (default) keeps only FALLEN settled states (for the
+        supine/prone/side fallen pools). `keep_upright=True` inverts the filter
+        to keep only UPRIGHT, off-ground settled states — used to build the
+        reverse-height curriculum's crouch/squat start pools, which are
+        deliberately upright (so the standard fallen filter would discard them).
         """
         c = self.cfg
         N = self.num_envs
@@ -372,8 +391,13 @@ class K1StandupEnv(SkillEnv):
                 continue
 
             up = upright_signal(q)
-            max_z = pose.trunk_height + c.pose_pool_max_height_margin
-            ok = (p[:, 2] < max_z) & (up < c.pool_max_upright)
+            if keep_upright:
+                # Crouch pools: keep clearly-UPRIGHT, off-ground settled states
+                # (a stable squat), discard any that toppled during settling.
+                ok = (up > 0.7) & (p[:, 2] > 0.12)
+            else:
+                max_z = pose.trunk_height + c.pose_pool_max_height_margin
+                ok = (p[:, 2] < max_z) & (up < c.pool_max_upright)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -398,11 +422,32 @@ class K1StandupEnv(SkillEnv):
         Order matters only for the settle pool (goes last so it leaves envs
         in the most neutral state for training).
         """
-        from envs.standup import all_poses
+        from envs.standup import all_poses, make_crouch_pose
         for pose in all_poses():
             pool = self._build_pose_pool(pose)
             self._named_pools[pose.name] = pool
             print(f"[standup] pose pool '{pose.name}': {pool['size']} states")
+
+        # Reverse-height curriculum: upright crouch/squat start pools (R0..R_K-1).
+        self._crouch_pools = {}
+        if self.cfg.recovery_curriculum_enabled:
+            heights = self.cfg.recovery_crouch_heights
+            scales = self.cfg.recovery_bend_scales
+            for s in range(len(heights)):
+                cpose = make_crouch_pose(
+                    f"crouch{s}", self._default_action,
+                    self.robot_cfg.joint_names,
+                    bend_scale=float(scales[s]),
+                    trunk_height=float(heights[s]),
+                    d_hip=self.cfg.recovery_crouch_delta_hip,
+                    d_knee=self.cfg.recovery_crouch_delta_knee,
+                    d_ankle=self.cfg.recovery_crouch_delta_ankle)
+                pool = self._build_pose_pool(cpose, keep_upright=True)
+                self._crouch_pools[s] = pool
+                print(f"[standup] crouch pool R{s} "
+                      f"(spawn_h={heights[s]}, bend={scales[s]}): "
+                      f"{pool['size']} states")
+
         self._build_settle_pool()  # leaves envs in fallen state
 
     # ── pool sampling helpers ─────────────────────────────────────
@@ -449,6 +494,28 @@ class K1StandupEnv(SkillEnv):
                 quat[mask] = q
                 jpos[mask] = j
         return pos, quat, jpos
+
+    def _sample_reset(self, n: int) -> tuple:
+        """Top-level reset sampler honoring the reverse-height curriculum.
+
+        While in a crouch stage (R < R_final), sample from that stage's upright
+        crouch pool; at the final stage, hand off to the fallen-pose L0-L3
+        curriculum. Falls back to the fallen sampler if a crouch pool is empty.
+        """
+        if (self.cfg.recovery_curriculum_enabled
+                and self._recovery_stage < self._recovery_final_stage):
+            pool = self._crouch_pools.get(self._recovery_stage)
+            if pool is not None and pool.get("size", 0) > 0:
+                idx = self.rng.integers(0, pool["size"], size=n)
+                return (pool["pos"][idx].copy(),
+                        pool["quat"][idx].copy(),
+                        pool["jpos"][idx].copy())
+            warn_attr = f"_crouch_warn_{self._recovery_stage}"
+            if not getattr(self, warn_attr, False):
+                print(f"[standup] WARNING: crouch pool R{self._recovery_stage} "
+                      f"empty, falling back to fallen-pose sampling")
+                setattr(self, warn_attr, True)
+        return self._sample_reset_from_level(n)
 
     def _sample_reset_from_level(self, n: int) -> tuple:
         """Return (pos, quat, jpos) for n envs based on the current pose level.
@@ -586,7 +653,7 @@ class K1StandupEnv(SkillEnv):
             self._build_all_pools()
 
         n = envs_idx.shape[0]
-        pos, quat, jpos = self._sample_reset_from_level(n)
+        pos, quat, jpos = self._sample_reset(n)
 
         # Small Gaussian joint jitter adds continuous variation on top of
         # the discrete pool — effectively infinite unique starting states.
@@ -717,6 +784,33 @@ class K1StandupEnv(SkillEnv):
 
     # ── pose curriculum advancement ───────────────────────────────
 
+    def _maybe_advance_recovery_stage(self) -> None:
+        """Advance the reverse-height curriculum stage R→R+1 once the success
+        EMA has held above the stage threshold for recovery_advance_sustain_steps
+        cumulative env-steps. Never regresses; caps at the final (fallen) stage.
+        """
+        if not self.cfg.recovery_curriculum_enabled:
+            return
+        if self._recovery_stage >= self._recovery_final_stage:
+            return
+        thresholds = self.cfg.recovery_stage_thresholds
+        threshold = (thresholds[self._recovery_stage]
+                     if self._recovery_stage < len(thresholds)
+                     else thresholds[-1])
+        if self._success_rate_ema >= threshold:
+            self._recovery_sustain_steps += self.num_envs
+            if self._recovery_sustain_steps >= self.cfg.recovery_advance_sustain_steps:
+                old = self._recovery_stage
+                self._recovery_stage += 1
+                self._recovery_sustain_steps = 0
+                tag = (f"R{self._recovery_stage}"
+                       if self._recovery_stage < self._recovery_final_stage
+                       else "R_final (fallen poses)")
+                print(f"[standup] recovery curriculum: R{old} → {tag} "
+                      f"(EMA={self._success_rate_ema:.3f})")
+        else:
+            self._recovery_sustain_steps = 0
+
     def _maybe_advance_level(self) -> None:
         """Advance pose curriculum level when EMA has been above threshold
         for pose_advance_sustain_steps cumulative env-steps. Never regresses.
@@ -829,10 +923,15 @@ class K1StandupEnv(SkillEnv):
         )
         components["success_rate_ema"] = self._success_rate_ema
 
-        # Pose curriculum advancement.
-        self._maybe_advance_level()
+        # Curriculum advancement. The reverse-height (recovery) curriculum is
+        # the OUTER stage; the fallen-pose L0-L3 curriculum only starts
+        # advancing once we've reached the final (fallen) recovery stage.
+        self._maybe_advance_recovery_stage()
+        if self._recovery_stage >= self._recovery_final_stage:
+            self._maybe_advance_level()
 
         components["pose_curriculum_level"] = float(self._pose_level)
+        components["recovery_stage"] = float(self._recovery_stage)
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now

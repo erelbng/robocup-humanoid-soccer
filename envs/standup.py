@@ -128,6 +128,52 @@ def all_poses() -> List[StandupPose]:
     return [supine(), prone(), side_left(), side_right()]
 
 
+# ─── Upright crouch/squat poses (reverse start-state get-up curriculum) ──────
+#
+# These are NOT fallen poses — they are stable, UPRIGHT crouches at descending
+# heights used by the reverse-height curriculum: the policy first learns to
+# finish standing from a shallow crouch (easy), then from progressively deeper
+# squats, before finally tackling the full fallen→stand get-up. Built from the
+# robot's DEFAULT standing pose plus a flexion delta on hip-pitch / knee /
+# ankle-pitch (scaled per stage), torso kept upright (identity quaternion).
+# Deriving from the known default (rather than hand-tuned absolute angles) keeps
+# the squat geometrically consistent with the standing pose across joint conventions.
+
+
+def make_crouch_pose(name: str,
+                     default_jpos,
+                     joint_names,
+                     bend_scale: float,
+                     trunk_height: float,
+                     d_hip: float = -0.6,
+                     d_knee: float = 0.9,
+                     d_ankle: float = -0.5) -> StandupPose:
+    """Build an upright crouch `StandupPose` = default standing pose + a
+    `bend_scale`-scaled flexion delta on the leg pitch joints.
+
+    Sign convention (from K1 default standing hip=-0.2, knee=+0.4, ankle=-0.25):
+    deeper squat = more-negative hip-pitch, more-positive knee, more-negative
+    ankle-pitch — so the defaults d_hip<0, d_knee>0, d_ankle<0 deepen the squat
+    while keeping the feet flat under the torso. Non-leg joints (arms/head) are
+    left at the default (not added to the dict → env keeps them at default).
+    `trunk_quat` is identity (upright). Physics settling resolves the exact
+    resting height; `trunk_height` is just the spawn height.
+    """
+    targets = {}
+    for i, jn in enumerate(joint_names):
+        if i >= len(default_jpos):
+            break
+        lo = jn.lower()
+        base = float(default_jpos[i])
+        if "hip" in lo and "pitch" in lo:
+            targets[jn] = base + bend_scale * d_hip
+        elif "knee" in lo:
+            targets[jn] = base + bend_scale * d_knee
+        elif "ankle" in lo and "pitch" in lo:
+            targets[jn] = base + bend_scale * d_ankle
+    return StandupPose(name, targets, (1.0, 0.0, 0.0, 0.0), trunk_height)
+
+
 # ─── Reward components specific to standup ──────────────────────────
 
 
