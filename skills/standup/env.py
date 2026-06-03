@@ -28,7 +28,7 @@ from typing import Optional
 import numpy as np
 
 from skills.base import CommandSpec, SkillEnv
-from skills.common_obs import _to_np
+from skills.common_obs import _to_np, projected_gravity
 from skills.standup.config import StandupConfig, discovery_weights
 from skills.standup.rewards import (STANDUP_CRITIC_GROUPS,
                                      compute_standup_reward,
@@ -140,6 +140,10 @@ class K1StandupEnv(SkillEnv):
         # window — preventing accidental "stood for a few frames then
         # collapsed" trajectories from collecting the same reward.
         self._achieved_sustained = np.zeros(self.num_envs, dtype=bool)
+        # Per-env "started on the back" flag (supine, incl. back-lying random
+        # poses), set from the reset orientation. Gates the supine_anti_flip
+        # penalty so only back-starts are taxed for rolling face-down.
+        self._start_supine = np.zeros(self.num_envs, dtype=bool)
         self._prev_prev_action = np.zeros((self.num_envs, self.act_dim),
                                           dtype=np.float32)
         # Cumulative env-steps seen by the policy (sum over all parallel
@@ -161,6 +165,15 @@ class K1StandupEnv(SkillEnv):
         # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
+        # Env-step count at which the CURRENT level started. All easing
+        # curricula (assist, hold_steps, upright/height thresholds, pose-mix
+        # bias) measure progress RELATIVE to this, not the global clock — so
+        # every level-up re-grants the assist bootstrap + loosened success
+        # criteria for the freshly-introduced (hardest) pose. Without this the
+        # global clock expires (horizons 25–150M) long before the hard poses
+        # arrive (performance-gated, ~180M+), leaving a brand-new pose facing
+        # the hardest criteria with zero assist → success ≈ 0 → gate stuck.
+        self._level_start_env_steps: int = 0
         # Named-pose pools built lazily alongside the settle pool.
         # {pose_name: {"pos": (M,3), "quat": (M,4), "jpos": (M,22), "size": int}}
         self._named_pools: dict = {}
@@ -330,6 +343,12 @@ class K1StandupEnv(SkillEnv):
         # Base orientation tiled to (N, 4).
         base_quat = np.tile(
             np.array([pose.trunk_quat], dtype=np.float32), (N, 1))
+        # Nominal body-frame gravity for this pose's lying CLASS — used to
+        # reject settled states that rolled into a different class (e.g. a
+        # side pose tipping onto its back/belly). supine≈(+1,0,0),
+        # prone≈(-1,0,0), side_left≈(0,+1,0), side_right≈(0,-1,0).
+        g_expected = projected_gravity(
+            np.array([pose.trunk_quat], dtype=np.float32))[0]
 
         pool_pos, pool_quat, pool_jpos = [], [], []
 
@@ -339,7 +358,8 @@ class K1StandupEnv(SkillEnv):
             quat = _quat_mul(noise, base_quat)  # noise on top of base pose
 
             pos = np.zeros((N, 3), dtype=np.float32)
-            pos[:, 2] = pose.trunk_height + 0.05  # small clearance above floor
+            # Per-pose spawn clearance (side poses need more — see StandupPose).
+            pos[:, 2] = pose.trunk_height + pose.spawn_clearance
 
             # Small joint jitter so pool entries aren't rigidly identical.
             jpos_target = (np.tile(jpos_ref, (N, 1))
@@ -373,7 +393,13 @@ class K1StandupEnv(SkillEnv):
 
             up = upright_signal(q)
             max_z = pose.trunk_height + c.pose_pool_max_height_margin
-            ok = (p[:, 2] < max_z) & (up < c.pool_max_upright)
+            # Orientation-class gate: settled gravity must still align with the
+            # pose's nominal direction, else the robot rolled into a different
+            # lying class (the side→back/belly drift) and must be dropped.
+            class_dot = projected_gravity(q) @ g_expected     # (N,)
+            ok = ((p[:, 2] < max_z)
+                  & (up < c.pool_max_upright)
+                  & (class_dot > c.pose_pool_orient_dot_min))
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -453,56 +479,59 @@ class K1StandupEnv(SkillEnv):
     def _sample_reset_from_level(self, n: int) -> tuple:
         """Return (pos, quat, jpos) for n envs based on the current pose level.
 
-        L0 → supine only              — easiest single entry pose
-        L1 → supine + prone (50/50)   — add the harder front recovery
-        L2 → all 4 named poses equally — + side_left + side_right
-        L3 → named (1-frac) + random fallen (frac) — full robustness
+        L0 → prone only               — easiest single entry pose (belly)
+        L1 → prone + supine           — add the back recovery
+        L2 → all 4 named poses        — + side_left + side_right
+        L3 → named + random fallen    — full robustness
 
-        Supine and prone are *different motor strategies* (supine: roll/sit
-        up, tuck knees; prone: arm push-up → tuck → stand) and prone also
-        pulls toward the cobra. Mixing both 50/50 from step 0 averages the
-        gradients so the policy masters neither early. L0 isolates supine so
-        the policy builds a foundation on one pose before prone is added —
-        and each stage gets its own reachable EMA gate instead of one combined
-        rate that the lagging pose drags below threshold.
+        Prone and supine are *different motor strategies* (prone: arm push-up
+        → tuck → stand; supine: roll/sit up, tuck knees), so they are added
+        one level at a time rather than mixed 50/50 from step 0.
+
+        On every level-up the sampler BIASES toward the just-introduced
+        pose(s) and relaxes back to the level's base mix over
+        `pose_mix_bias_env_steps` (per-level clock). This points the fresh
+        capacity at the hard new pose and makes success_rate_ema reflect IT,
+        so the advance gate measures progress on the new pose instead of
+        being dominated by the already-mastered ones.
         """
+        # Category order: [supine, prone, side_left, side_right, random].
+        cats = ("supine", "prone", "side_left", "side_right", "random")
         level = self._pose_level
-        names = ["supine", "prone", "side_left", "side_right"]
 
+        # Base distribution + indices of the pose(s) NEWLY introduced here.
         if level <= 0:
-            return self._sample_from_pool("supine", n)
+            base = np.array([0., 1., 0., 0., 0.], dtype=np.float64)
+            new = ()
+        elif level == 1:
+            base = np.array([0.5, 0.5, 0., 0., 0.], dtype=np.float64)
+            new = (0,)                               # supine
+        elif level == 2:
+            base = np.array([0.25, 0.25, 0.25, 0.25, 0.], dtype=np.float64)
+            new = (2, 3)                             # side_left, side_right
+        else:
+            rf = float(self.cfg.pose_mix_random_frac)
+            nf = (1.0 - rf) / 4.0
+            base = np.array([nf, nf, nf, nf, rf], dtype=np.float64)
+            new = (4,)                               # random
 
-        if level == 1:
-            choice = self.rng.integers(0, 2, size=n)
-            return self._gather_by_choice(
-                [("supine", choice == 0), ("prone", choice == 1)], n)
+        # Decaying bias toward the freshly-introduced pose(s).
+        if new and self.cfg.pose_mix_bias_start > 0.0:
+            b = self.cfg.pose_mix_bias_start * (
+                1.0 - self._curriculum_progress(self.cfg.pose_mix_bias_env_steps))
+            if b > 0.0:
+                new_dist = np.zeros(5, dtype=np.float64)
+                for i in new:
+                    new_dist[i] = 1.0
+                new_dist /= new_dist.sum()
+                base = (1.0 - b) * base + b * new_dist
 
-        if level == 2:
-            choice = self.rng.integers(0, 4, size=n)
-            return self._gather_by_choice(
-                [(nm, choice == i) for i, nm in enumerate(names)], n)
-
-        # L3+: named poses + random fallen mix
-        n_random = int(round(n * self.cfg.pose_mix_random_frac))
-        n_named = n - n_random
-        pos = np.empty((n, 3), dtype=np.float32)
-        quat = np.empty((n, 4), dtype=np.float32)
-        jpos = np.empty((n, self.act_dim), dtype=np.float32)
-        if n_named > 0:
-            choice = self.rng.integers(0, 4, size=n_named)
-            pn, qn, jn = self._gather_by_choice(
-                [(nm, choice == i) for i, nm in enumerate(names)], n_named)
-            pos[:n_named] = pn
-            quat[:n_named] = qn
-            jpos[:n_named] = jn
-        if n_random > 0:
-            pr, qr, jr = self._sample_from_pool("random", n_random)
-            pos[n_named:] = pr
-            quat[n_named:] = qr
-            jpos[n_named:] = jr
-        # Shuffle to avoid positional bias across parallel envs.
-        perm = self.rng.permutation(n)
-        return pos[perm], quat[perm], jpos[perm]
+        base /= base.sum()  # guard against fp drift before sampling
+        choice = self.rng.choice(5, size=n, p=base)
+        # _gather_by_choice handles the "random" settle pool and skips empty
+        # masks; per-env choice already avoids positional bias (no shuffle).
+        return self._gather_by_choice(
+            [(cats[i], choice == i) for i in range(5)], n)
 
     # ── contact-link lookup (after scene.build) ───────────────────
 
@@ -613,14 +642,14 @@ class K1StandupEnv(SkillEnv):
     # ── curricula ─────────────────────────────────────────────────
     #
     # Three independent linear ramps from `_start` → final values over
-    # their respective horizon, all driven by `_total_env_steps_seen`.
-    # Together they let the policy discover a partial standup at loose
-    # criteria, then tighten toward deployment quality without ever
-    # losing the gradient.
+    # their respective horizon, measured on the PER-LEVEL clock (env-steps
+    # since the current level started). Together they let the policy discover
+    # a partial standup at loose criteria, then tighten toward deployment
+    # quality — and crucially RE-loosen for each newly-introduced pose.
 
     def _curriculum_progress(self, horizon_env_steps: int) -> float:
-        return min(self._total_env_steps_seen / max(int(horizon_env_steps), 1),
-                   1.0)
+        elapsed = self._total_env_steps_seen - self._level_start_env_steps
+        return min(max(elapsed, 0) / max(int(horizon_env_steps), 1), 1.0)
 
     def _current_hold_steps(self) -> int:
         c = self.cfg
@@ -654,7 +683,10 @@ class K1StandupEnv(SkillEnv):
 
         A multiplicative TIME-DECAY backstop (1.0 → 0.0 over
         `assist_curriculum_env_steps`) guarantees weaning even if the policy
-        plateaus below the target and would otherwise lean forever."""
+        plateaus below the target and would otherwise lean forever. It runs
+        on the PER-LEVEL clock (see `_curriculum_progress`), so it resets to
+        ~1.0 on every level-up — the assist can fully recover for each new
+        pose instead of being stuck at 0 from an expired global clock."""
         if not self.cfg.assist_force_enabled:
             return 0.0
         target = max(self.cfg.assist_success_target, 1e-6)
@@ -733,8 +765,12 @@ class K1StandupEnv(SkillEnv):
                 old = self._pose_level
                 self._pose_level += 1
                 self._pose_level_sustain_steps = 0
+                # Restart the per-level easing clock: the new (hardest) pose
+                # re-gets the assist bootstrap + loosened hold/upright/height
+                # criteria + a fresh mix-bias toward itself.
+                self._level_start_env_steps = self._total_env_steps_seen
                 print(f"[standup] pose curriculum: L{old} → L{self._pose_level} "
-                      f"(EMA={self._success_rate_ema:.3f})")
+                      f"(EMA={self._success_rate_ema:.3f}); easing curricula reset")
         else:
             # EMA fell below threshold — reset sustain counter (no regression).
             self._pose_level_sustain_steps = 0
@@ -799,6 +835,7 @@ class K1StandupEnv(SkillEnv):
             foot_z=foot_z,
             foot_xy=foot_xy,
             feet_ok=feet_ok,
+            start_supine=self._start_supine,
             weights=self._reward_weights,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
             default_joint_pos=self._default_action,
@@ -878,5 +915,18 @@ class K1StandupEnv(SkillEnv):
             quat = _to_np(self.robot.get_quat())
             self._prev_upright[envs_idx] = upright_signal(
                 quat[envs_idx]).astype(np.float32)
+            # Body-frame gravity-x > +0.5 ⇔ lying on the back (supine). Side
+            # (~0) and prone (-1) are excluded by orientation. Additionally
+            # gate by a pose-level WINDOW so the anti-flip only arms where the
+            # detour appears (default: L1 only) — NOT in L0 discovery, and
+            # never on a back-lying RANDOM start in L2/L3. Must match the
+            # rewards-side penalty (max(0, -proj_g_x)): both treat supine as
+            # g_x>0 and the belly-flip as g_x<0.
+            armed = (self.cfg.supine_anti_flip_min_level
+                     <= self._pose_level
+                     <= self.cfg.supine_anti_flip_max_level)
+            g = projected_gravity(quat[envs_idx])
+            self._start_supine[envs_idx] = (g[:, 0] > 0.5) & bool(armed)
         except Exception:
             self._prev_upright[envs_idx] = -1.0
+            self._start_supine[envs_idx] = False

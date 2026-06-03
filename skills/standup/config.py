@@ -88,6 +88,19 @@ class StandupRewardWeights:
     # trajectory. Pulls the policy out of the squat local optimum.
     standing_tall: float = 5.0
 
+    # Anti-detour penalty for BACK (supine) starts — teaches a direct
+    # back-recovery instead of the "roll onto the belly / cobra, then push
+    # up" detour. Body-frame gravity-x is −1 when supine, +1 when prone,
+    # ~0 when upright or on a side, so max(0, proj_g_x) is >0 ONLY once a
+    # back-start robot has flipped face-down. Gated to supine-start envs
+    # (detected from the reset orientation), so prone recovery is untouched.
+    # A clean sit-up/roll-up keeps proj_g_x ≤ 0 and pays nothing. NOT zeroed
+    # in the discovery stage (it shapes *which* strategy is found). 0 = off.
+    # Best used as a fine-tune on a policy that already stands (--init-from):
+    # it then pushes the existing motion off the flip route. Raise if the
+    # progress reward still makes the detour worthwhile.
+    supine_anti_flip: float = 3.0
+
 
 # Regularizer weights zeroed in the "discovery" reward stage. These are
 # motion-quality / deployability shaping terms — useful for a SMOOTH final
@@ -228,18 +241,17 @@ class StandupConfig:
     # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
-    #   L0: supine only               — easiest single entry pose
-    #   L1: supine + prone (50/50)    — add the harder front recovery
+    #   L0: prone only                — easiest single entry pose (belly)
+    #   L1: prone + supine (50/50)    — add the back recovery
     #   L2: all 4 named poses (25% each) — + side_left + side_right
     #   L3: named 50% + random fallen 50% — full robustness
     #
-    # Supine (roll/sit up) and prone (arm push-up → tuck → stand) are
-    # different motor strategies, and prone additionally pulls toward the
-    # cobra. Training both 50/50 from the start averages the gradients so the
-    # policy learns neither cleanly, and the combined success EMA stalls below
-    # the gate when one pose lags — so prone is held back to L1 and gets there
-    # only after supine is solid. Recovery from fully-fallen poses is
-    # bootstrapped by the decaying assist force. Set
+    # Prone (arm push-up → tuck → stand) and supine (roll/sit up) are
+    # different motor strategies. Training both 50/50 from the start averages
+    # the gradients so the policy learns neither cleanly, and the combined
+    # success EMA stalls below the gate when one pose lags — so supine is held
+    # back to L1 and gets there only after prone is solid. Recovery from
+    # fully-fallen poses is bootstrapped by the decaying assist force. Set
     # pose_curriculum_start_level=3 to train directly on the full mixed
     # distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
@@ -247,11 +259,25 @@ class StandupConfig:
 
     # EMA threshold to advance FROM each level. Element i controls the
     # transition from level i → i+1. Length = (num_levels - 1) = 3.
-    #   L0→L1 (supine solid before adding prone), L1→L2, L2→L3.
+    #   L0→L1 (prone solid before adding supine), L1→L2, L2→L3.
     # Set just below assist_success_target (0.60) so advancement requires
     # genuine, largely-unassisted competence — by the time the success EMA
     # hits 0.55 the performance-coupled assist is already low (~0.08).
     pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
+
+    # Pose-level WINDOW [min, max] (inclusive) in which `supine_anti_flip` is
+    # armed. Default = only L1:
+    #   * L0 (prone-only, belly) has no back starts yet, so there is nothing
+    #     for the anti-flip to act on — leave it free (pure discovery).
+    #   * L1 (prone+supine) is where back starts are introduced, and the
+    #     freshly-learned prone arm-push gets misapplied to those back starts
+    #     (roll-to-belly / cobra detour) → arm the anti-flip here to force
+    #     direct back-recovery.
+    #   * L2 (side poses) / L3 (random) want unconstrained generalisation, and
+    #     a back-lying random start must not trigger it → off.
+    # Non-back starts are additionally exempt via the orientation test.
+    supine_anti_flip_min_level: int = 1
+    supine_anti_flip_max_level: int = 1
 
     # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
     # threshold before advancing. Prevents a single lucky spike triggering a
@@ -272,9 +298,31 @@ class StandupConfig:
     # Filter: keep pool entries with trunk_z < trunk_height + this margin.
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
+    # Orientation-CLASS filter for named-pose pools. After settling, keep only
+    # states whose body-frame gravity still points (roughly) in the pose's
+    # nominal direction — i.e. dot(g_settled, g_nominal) > this. A side pose
+    # has g≈(0,±1,0); if it rolls onto its back/belly during settle the
+    # gravity swings to (±1,0,0) → dot 0 → rejected. Guarantees a "side"
+    # start is actually on its side (not a back/belly start that drifted in),
+    # and likewise that supine/prone pools stay in-class. 0.5 ≈ within 60° of
+    # nominal; raise toward 0.7 (~45°) to be stricter, lower for more variety.
+    pose_pool_orient_dot_min: float = 0.5
 
     # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50
+
+    # Level-up mix bias. On every advance the sampler over-weights the
+    # newly-introduced pose (supine@L1, sides@L2, random@L3) by this fraction
+    # and relaxes back to the level's base mix over `pose_mix_bias_env_steps`
+    # on the PER-LEVEL clock. Concentrates fresh capacity on the hard new
+    # pose and makes success_rate_ema track it, so the advance gate measures
+    # progress on the new pose instead of being dominated/rushed by the
+    # already-mastered ones. 0 = uniform mix (no bias).
+    pose_mix_bias_start: float = 0.80
+    # Per-level horizon over which the new-pose bias decays start→0. Kept
+    # below the success-criteria horizon (25M) so the mix has relaxed to the
+    # full level distribution well before the gate can advance.
+    pose_mix_bias_env_steps: int = 15_000_000
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the

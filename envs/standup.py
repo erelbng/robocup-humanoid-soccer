@@ -71,17 +71,30 @@ class StandupPose:
     trunk_quat: Tuple[float, float, float, float]
     trunk_height: float  # initial Z of trunk so it's roughly resting on
                          # the carpet (trunk thickness ~0.10m)
+    # Vertical clearance (m) ADDED to trunk_height at spawn, before the
+    # robot free-falls and settles. 0.05 is fine for back/front lying where
+    # the trunk thickness is the lowest point. SIDE poses splay the down-arm
+    # well below the trunk centre, so spawning at +0.05 buries that arm in
+    # the floor — the PD then holds it embedded through the settle and the
+    # snapshot captures an arm-in-ground state. Side poses raise this so the
+    # whole body (arm included) starts above the floor and settles cleanly.
+    spawn_clearance: float = 0.05
 
 
 def supine() -> StandupPose:
-    # Face up: rotate +π/2 about Y axis (pitch up), trunk is on its back.
-    q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
+    # Face up (lying on the back): rotate -π/2 about Y axis. Verified via
+    # body-frame gravity — this orientation gives g_x = -1, which the env's
+    # orientation test (`g[:,0] < -0.5`) classifies as on-the-back. Paired
+    # with the arms-by-side joint preset (natural supine rest pose).
+    q = _quat_from_axis_angle((0, 1, 0), -math.pi / 2)
     return StandupPose("supine", _POSE_SUPINE, q, trunk_height=0.13)
 
 
 def prone() -> StandupPose:
-    # Face down: rotate -π/2 about Y axis.
-    q = _quat_from_axis_angle((0, 1, 0), -math.pi / 2)
+    # Face down (lying on the belly): rotate +π/2 about Y axis. Gives
+    # body-frame g_x = +1 (front faces the floor). Paired with the
+    # arms-forward joint preset — the push-up-ready prone start.
+    q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
     return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13)
 
 
@@ -116,12 +129,18 @@ _POSE_SIDE_RIGHT = {
 
 def side_left() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), math.pi / 2)
-    return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13)
+    # Larger spawn clearance: on its side the splayed down-arm reaches far
+    # below the trunk centre, so it needs ~0.30 m to clear the floor at spawn.
+    return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13,
+                       spawn_clearance=0.30)
 
 
 def side_right() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), -math.pi / 2)
-    return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13)
+    # See side_left: the down-arm needs extra clearance to avoid spawning
+    # inside the floor.
+    return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13,
+                       spawn_clearance=0.30)
 
 
 def all_poses() -> List[StandupPose]:
