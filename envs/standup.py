@@ -172,11 +172,14 @@ _POSE_SIDE_LEFT = {
     # This tripod (torso + elbow + foot) resists rolling toward belly OR back.
     "ARight_Shoulder_Pitch": 0.6, "Right_Shoulder_Roll": 0.65,
     "Right_Elbow_Pitch": 1.1,    "Right_Elbow_Yaw": 0.0,
-    # UP arm (left) — Roll 0.0 (neutral, arm rests along body side).
-    # Roll 0.3 made it reach straight skyward; neutral lets it settle
-    # to a natural horizontal/body-aligned position after settle physics.
-    "ALeft_Shoulder_Pitch": 0.1, "Left_Shoulder_Roll": 0.0,
-    "Left_Elbow_Pitch": 0.2,     "Left_Elbow_Yaw": 0.0,
+    # UP arm (left) — Roll −π/2 = the HANGING value (arms-at-sides default).
+    # The URDF joint-zero is the T-POSE (arm straight out to the side), so
+    # Roll 0.0 made the left arm point along body +Y; in side_left body +Y →
+    # world +Z, i.e. straight to the SKY (the bug). The hanging value −1.5708
+    # lays the upper arm along the body (world-horizontal); gravity then sags
+    # the forearm down so the whole arm rests laid-down beside the torso.
+    "ALeft_Shoulder_Pitch": 0.2, "Left_Shoulder_Roll": -1.5708,
+    "Left_Elbow_Pitch": 0.3,     "Left_Elbow_Yaw": 0.0,
     # BOTTOM leg (right) — Hip_Roll 0.3 floor-ward (body -Y = world floor).
     # Brings foot toward the ground; knee 0.5 for compact stable stance;
     # ankle compensates body rotation to improve foot contact.
@@ -195,9 +198,12 @@ _POSE_SIDE_RIGHT = {
     # DOWN arm (left) — FLOOR BRACE (mirror geometry, same elbow_z = +0.005 m).
     "ALeft_Shoulder_Pitch": 0.6, "Left_Shoulder_Roll": 0.65,
     "Left_Elbow_Pitch": 1.1,    "Left_Elbow_Yaw": 0.0,
-    # UP arm (right) — Roll 0.0 (neutral, arm rests along body side).
-    "ARight_Shoulder_Pitch": 0.1, "Right_Shoulder_Roll": 0.0,
-    "Right_Elbow_Pitch": 0.2,    "Right_Elbow_Yaw": 0.0,
+    # UP arm (right) — Roll +π/2 = the HANGING value (mirror of side_left).
+    # Roll 0.0 = T-pose → right arm along body −Y → world +Z (sky) in
+    # side_right. The hanging value +1.5708 lays it along the body
+    # (world-horizontal); gravity sags it down into a laid-down rest pose.
+    "ARight_Shoulder_Pitch": 0.2, "Right_Shoulder_Roll": 1.5708,
+    "Right_Elbow_Pitch": 0.3,    "Right_Elbow_Yaw": 0.0,
     # BOTTOM leg (left) — Left Hip_Roll 0.3 floor-ward (body +Y = world floor).
     "Left_Hip_Pitch": 0.2, "Left_Hip_Roll": 0.3, "Left_Hip_Yaw": 0.0,
     "Left_Knee_Pitch": 0.5, "Left_Ankle_Pitch": -0.2, "Left_Ankle_Roll": 0.2,
