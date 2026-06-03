@@ -1149,15 +1149,18 @@ class K1StandupEnv(SkillEnv):
             self._maybe_advance_level()
 
         # Report a SINGLE monotonic curriculum counter under the key the PPO
-        # level-up pump watches (training/algorithms/ppo.py): recovery stages
-        # R0..R(K-1) first, then pose levels L0..L3 once at the final recovery
-        # stage. This way Karl's log_std-pump + LR-reset (b09d769) fires on
-        # EVERY curriculum advance — recovery stage-ups included — so entropy
-        # decays over time and jumps back up at each level-up, exactly the
-        # intended schedule. (Before: the pump only saw pose_curriculum_level,
-        # which stays 0 throughout the entire recovery phase → no re-explore.)
-        components["pose_curriculum_level"] = float(
-            self._recovery_stage + self._pose_level)
+        # level-up pump watches (training/algorithms/ppo.py), so Karl's
+        # log_std-pump + LR-reset (b09d769) fires on every curriculum advance —
+        # entropy decays over time and jumps back up at each level-up.
+        # With the recovery curriculum DISABLED (the current config) this is
+        # exactly Karl's pose level L0..L3. (If the recovery curriculum is
+        # re-enabled, prepend its stages R0..R(K-1) so the pump fires on those
+        # advances too — they're 0 while disabled.)
+        if self.cfg.recovery_curriculum_enabled:
+            curriculum_level = self._recovery_stage + self._pose_level
+        else:
+            curriculum_level = self._pose_level
+        components["pose_curriculum_level"] = float(curriculum_level)
         components["recovery_stage"] = float(self._recovery_stage)
         components["pose_level"] = float(self._pose_level)
 

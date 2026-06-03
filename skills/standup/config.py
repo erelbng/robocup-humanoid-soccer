@@ -393,7 +393,15 @@ class StandupConfig:
     # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
     # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
     # existing L0-L3 fallen-pose curriculum unchanged.
-    recovery_curriculum_enabled: bool = True
+    #
+    # DISABLED (mergefixes): per project decision we run ONLY Karl's pose-
+    # difficulty curriculum (L0-L3, _sample_reset_from_level / _maybe_advance_
+    # level) and no other start-state curriculum. With this False the env sets
+    # _recovery_stage = _recovery_final_stage at construction, so _sample_reset
+    # hands off to Karl's pose curriculum from step 0 and the crouch pools are
+    # never built. (The recovery code is kept, dormant + correct, behind this
+    # flag in case it's wanted again.)
+    recovery_curriculum_enabled: bool = False
     # Stage to start at. 0 = shallowest crouch. Set to len(recovery_crouch_heights)
     # (the final stage) to DISABLE the ramp and train directly on fallen poses.
     recovery_start_stage: int = 0
