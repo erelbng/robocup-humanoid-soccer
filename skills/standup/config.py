@@ -527,8 +527,14 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.005  # 0.002→0.005 (kneel-attractor fix): more
-                                 # exploration to escape the squat local optimum
+    entropy_coef: float = 0.002  # Restored 0.005→0.002 (mergefixes): at 0.005
+                                 # the entropy bonus out-earned the (hard)
+                                 # standup gradient → entropy RAN AWAY (observed
+                                 # 20→27.5, std→0.84/cap) and the policy never
+                                 # committed to a coherent get-up. Karl's design
+                                 # (b09d769) needs entropy to DECAY over time and
+                                 # be re-injected only at level-ups via the
+                                 # log_std pump — incompatible with a high coef.
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5

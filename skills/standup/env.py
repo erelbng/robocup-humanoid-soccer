@@ -381,10 +381,11 @@ class K1StandupEnv(SkillEnv):
         N = self.num_envs
         all_idx = np.arange(N)
 
-        # Per-pool noise/settle overrides (crouch pools pass tighter values).
+        # Per-pool noise overrides (crouch pools pass tighter values). The
+        # settle-step override is resolved further down, after `is_side` is
+        # known, so an explicit override (crouch) wins over the side default.
         qn = c.pose_pool_quat_noise_rad if quat_noise_rad is None else quat_noise_rad
         jj = c.pose_pool_joint_jitter_rad if joint_jitter_rad is None else joint_jitter_rad
-        ss = c.pose_pool_settle_steps if settle_steps is None else settle_steps
 
         _empty = {"pos": np.zeros((0, 3), dtype=np.float32),
                   "quat": np.zeros((0, 4), dtype=np.float32),
@@ -422,8 +423,12 @@ class K1StandupEnv(SkillEnv):
         # target side class. Higher rejection rate → more rounds to compensate.
         is_side = pose.name.startswith("side_")
         n_rounds = c.pose_pool_side_rounds if is_side else c.pose_pool_rounds
-        settle_steps = (c.pose_pool_side_settle_steps
-                        if is_side else c.pose_pool_settle_steps)
+        # Settle length: an explicit caller override (crouch pools, which need
+        # a SHORT settle to stay upright) wins; otherwise side poses settle
+        # briefly (they roll out of side-lying) and the rest use the default.
+        if settle_steps is None:
+            settle_steps = (c.pose_pool_side_settle_steps
+                            if is_side else c.pose_pool_settle_steps)
 
         for round_idx in range(n_rounds):
             # Compose base quat with small random tilt noise.
@@ -465,27 +470,38 @@ class K1StandupEnv(SkillEnv):
                 continue
 
             up = upright_signal(q)
-            max_z = pose.trunk_height + c.pose_pool_max_height_margin
-            # Orientation-class gate: settled gravity must still align with the
-            # pose's nominal direction, else the robot rolled into a different
-            # lying class (the side→back/belly drift) and must be dropped.
-            class_dot = projected_gravity(q) @ g_expected     # (N,)
-            # Penetration gate: the lowest foot/hand link must sit above the
-            # floor (within -eps). Large quat/joint noise can rotate a limb
-            # under the spawn clearance and the PD holds it embedded through
-            # the settle; replaying such a snapshot pins the limb in the ground
-            # and feeds negative contact-z into the reward. Reject it.
+            # Penetration gate (applies to BOTH pool kinds): the lowest
+            # foot/hand link must sit above the floor (within -eps). Large
+            # quat/joint noise can rotate a limb under the spawn clearance and
+            # the PD holds it embedded through the settle; replaying such a
+            # snapshot pins the limb in the ground and feeds negative contact-z
+            # into the reward. Reject it.
             min_contact_z = self._min_contact_link_z()
-            ok = ((p[:, 2] < max_z)
-                  & (up < c.pool_max_upright)
-                  & (class_dot > c.pose_pool_orient_dot_min)
-                  & (min_contact_z > -c.pose_pool_penetration_eps))
-            # Side-pose height guard: a robot that rolled to supine/prone
-            # despite the arm-brace settles at trunk_z ≈ 0.06 m. Any state
-            # below pose_pool_side_min_trunk_z has rolled into the wrong
-            # class — reject even if the orientation filter barely passed.
-            if is_side:
-                ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
+            if keep_upright:
+                # Crouch/squat pools (reverse-height recovery curriculum):
+                # keep clearly-UPRIGHT, off-ground settled states (a stable
+                # squat) and discard any that toppled during settling. The
+                # fallen-specific orientation/height gates below DON'T apply —
+                # they would reject exactly the upright states we want.
+                ok = ((up > 0.7)
+                      & (p[:, 2] > 0.12)
+                      & (min_contact_z > -c.pose_pool_penetration_eps))
+            else:
+                max_z = pose.trunk_height + c.pose_pool_max_height_margin
+                # Orientation-class gate: settled gravity must still align with
+                # the pose's nominal direction, else the robot rolled into a
+                # different lying class (side→back/belly drift) → drop it.
+                class_dot = projected_gravity(q) @ g_expected     # (N,)
+                ok = ((p[:, 2] < max_z)
+                      & (up < c.pool_max_upright)
+                      & (class_dot > c.pose_pool_orient_dot_min)
+                      & (min_contact_z > -c.pose_pool_penetration_eps))
+                # Side-pose height guard: a robot that rolled to supine/prone
+                # despite the arm-brace settles at trunk_z ≈ 0.06 m. Any state
+                # below pose_pool_side_min_trunk_z has rolled into the wrong
+                # class — reject even if the orientation filter barely passed.
+                if is_side:
+                    ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -570,6 +586,34 @@ class K1StandupEnv(SkillEnv):
             self._named_pools[pose.name] = pool
             print(f"[standup] pose pool '{pose.name}': {pool['size']} states "
                   f"(forced settle)")
+
+        # Reverse-height recovery curriculum: build the upright crouch/squat
+        # START pools R0..R(K-1). (This loop was dropped in the d2ee216 merge —
+        # without it self._crouch_pools stays empty and _sample_reset silently
+        # falls back to fallen-pose sampling, defeating the whole curriculum.)
+        self._crouch_pools = {}
+        if self.cfg.recovery_curriculum_enabled:
+            heights = self.cfg.recovery_crouch_heights
+            scales = self.cfg.recovery_bend_scales
+            for s in range(len(heights)):
+                cpose = make_crouch_pose(
+                    f"crouch{s}", self._default_action,
+                    self.robot_cfg.joint_names,
+                    bend_scale=float(scales[s]),
+                    trunk_height=float(heights[s]),
+                    d_hip=self.cfg.recovery_crouch_delta_hip,
+                    d_knee=self.cfg.recovery_crouch_delta_knee,
+                    d_ankle=self.cfg.recovery_crouch_delta_ankle)
+                pool = self._build_pose_pool(
+                    cpose, keep_upright=True,
+                    quat_noise_rad=self.cfg.recovery_crouch_quat_noise_rad,
+                    joint_jitter_rad=self.cfg.recovery_crouch_joint_jitter_rad,
+                    settle_steps=self.cfg.recovery_crouch_settle_steps)
+                self._crouch_pools[s] = pool
+                print(f"[standup] crouch pool R{s} "
+                      f"(spawn_h={heights[s]}, bend={scales[s]}): "
+                      f"{pool['size']} states")
+
         self._build_settle_pool()  # leaves envs in fallen state
         # NOTE: _extract_side_pools_from_settle() is intentionally NOT called
         # here. The forced-settle pool (arm-brace config, 500-step settle,
@@ -1104,8 +1148,18 @@ class K1StandupEnv(SkillEnv):
         if self._recovery_stage >= self._recovery_final_stage:
             self._maybe_advance_level()
 
-        components["pose_curriculum_level"] = float(self._pose_level)
+        # Report a SINGLE monotonic curriculum counter under the key the PPO
+        # level-up pump watches (training/algorithms/ppo.py): recovery stages
+        # R0..R(K-1) first, then pose levels L0..L3 once at the final recovery
+        # stage. This way Karl's log_std-pump + LR-reset (b09d769) fires on
+        # EVERY curriculum advance — recovery stage-ups included — so entropy
+        # decays over time and jumps back up at each level-up, exactly the
+        # intended schedule. (Before: the pump only saw pose_curriculum_level,
+        # which stays 0 throughout the entire recovery phase → no re-explore.)
+        components["pose_curriculum_level"] = float(
+            self._recovery_stage + self._pose_level)
         components["recovery_stage"] = float(self._recovery_stage)
+        components["pose_level"] = float(self._pose_level)
 
         self._success_streak = new_streak
         self._sustained_now = sustained_now
