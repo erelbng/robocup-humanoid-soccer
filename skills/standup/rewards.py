@@ -319,6 +319,7 @@ def compute_standup_reward(
     foot_z: np.ndarray,              # (N, 2) world-frame z of left/right foot
     foot_xy: np.ndarray = None,      # (N, 2, 2) world-frame xy of left/right foot
     feet_ok: np.ndarray = None,      # (N,) bool — standing_on_feet_mask (success gate)
+    start_supine: np.ndarray = None, # (N,) bool — episode started on the back
     weights=None,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
     default_joint_pos: np.ndarray = None,
@@ -480,6 +481,18 @@ def compute_standup_reward(
     else:
         tuck = np.zeros(root_pos.shape[0], dtype=np.float32)
 
+    # Anti-detour penalty for back (supine) starts — discourage rolling
+    # face-DOWN (toward prone) on the way up. Body-frame gravity-x is +1
+    # supine (on the back), -1 prone (belly-down), ~0 upright/side, so
+    # max(0, -proj_g_x) is >0 only once a back-start robot has flipped
+    # belly-down (the roll-to-prone / cobra detour). A clean sit-up/roll-up
+    # keeps proj_g_x ≥ 0 → zero penalty. Gated to supine-start envs so prone
+    # recovery is untouched.
+    flip = np.maximum(0.0, -projected_gravity(root_quat)[:, 0]).astype(np.float32)
+    if start_supine is not None:
+        flip = flip * start_supine.astype(np.float32)
+    supine_flip_pen = flip
+
     w = weights
 
     # ── per-group decomposition (multi-critic PPO) ──
@@ -494,6 +507,7 @@ def compute_standup_reward(
         + w.feet_tuck * tuck
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
+        - w.supine_anti_flip * supine_flip_pen
     ).astype(np.float32)
     r_reg = (
         - w.arm_pose_dev * arm_dev
@@ -536,6 +550,7 @@ def compute_standup_reward(
         "feet_tuck": float(np.mean(tuck)),
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
+        "supine_anti_flip": float(np.mean(supine_flip_pen)),
         "feet_under_base": float(np.mean(under_base)),
         "mean_foot_z": float(np.mean(foot_z)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),

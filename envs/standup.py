@@ -39,13 +39,27 @@ _POSE_SUPINE = {
     "Right_Knee_Pitch": 0.4, "Right_Ankle_Pitch": -0.2, "Right_Ankle_Roll": 0.0,
 }
 
-# Lying face down: arms forward, knees slightly bent.
+# Lying face down: arms in push-up-ready position, knees slightly bent.
+#
+# ELBOW PENETRATION ANALYSIS (prone: body +X → world -Z, i.e. DOWN):
+#   In prone the trunk rests at z ≈ 0.13 m. Shoulder pitch controls how far
+#   the arm swings toward the floor (body +X = world -Z). The elbow hangs at:
+#       elbow_z ≈ trunk_z − upper_arm_len × sin(shoulder_pitch)
+#   At trunk_z = 0.13 m, upper_arm ≈ 0.25 m:
+#       pitch = 0.80 → elbow_z ≈ −0.049 m  (UNDERGROUND by 5 cm!)
+#       pitch = 0.65 → elbow_z ≈ −0.021 m  (still underground)
+#       pitch = 0.50 → elbow_z ≈ +0.010 m  (just above floor — safe reference)
+#   The pool penetration filter (eps=0.02) rejects the underground states, but
+#   the reference pose itself should be safe so that even after reset-time
+#   joint jitter (±0.10 rad → worst-case pitch = 0.60 → elbow ≈ −0.011 m,
+#   just above the −0.02 rejection threshold) the filter keeps the state.
+#   Using 0.50 rad keeps the reference elbow firmly above the floor.
 _POSE_PRONE = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.1,
-    "ALeft_Shoulder_Pitch": 0.8, "Left_Shoulder_Roll": 0.0,
-    "Left_Elbow_Pitch": -0.5, "Left_Elbow_Yaw": 0.0,
-    "ARight_Shoulder_Pitch": 0.8, "Right_Shoulder_Roll": 0.0,
-    "Right_Elbow_Pitch": -0.5, "Right_Elbow_Yaw": 0.0,
+    "ALeft_Shoulder_Pitch": 0.5, "Left_Shoulder_Roll": 0.0,
+    "Left_Elbow_Pitch": -0.4, "Left_Elbow_Yaw": 0.0,
+    "ARight_Shoulder_Pitch": 0.5, "Right_Shoulder_Roll": 0.0,
+    "Right_Elbow_Pitch": -0.4, "Right_Elbow_Yaw": 0.0,
     "Left_Hip_Pitch": 0.2, "Left_Hip_Roll": 0.0, "Left_Hip_Yaw": 0.0,
     "Left_Knee_Pitch": -0.3, "Left_Ankle_Pitch": 0.1, "Left_Ankle_Roll": 0.0,
     "Right_Hip_Pitch": 0.2, "Right_Hip_Roll": 0.0, "Right_Hip_Yaw": 0.0,
@@ -71,57 +85,141 @@ class StandupPose:
     trunk_quat: Tuple[float, float, float, float]
     trunk_height: float  # initial Z of trunk so it's roughly resting on
                          # the carpet (trunk thickness ~0.10m)
+    # Vertical clearance (m) ADDED to trunk_height at spawn, before the
+    # robot free-falls and settles. A limb that hangs more than this below
+    # the trunk centre spawns INSIDE the floor — the PD then holds it
+    # embedded through the settle and the snapshot captures a limb-in-ground
+    # state (which, replayed at reset, pins the limb and corrupts the contact
+    # reward). SIDE poses splay the down-arm far below the trunk → 0.30.
+    # BACK/FRONT poses don't splay an arm, but the large pool quat/joint
+    # noise (±17°) can still rotate a foot well below the trunk centre, so a
+    # tiny 0.05 clearance is NOT safe — use ≥0.12 (default below) and let the
+    # pose-pool penetration filter reject any residual buried-limb snapshots.
+    spawn_clearance: float = 0.13
 
 
 def supine() -> StandupPose:
-    # Face up: rotate +π/2 about Y axis (pitch up), trunk is on its back.
-    q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
+    # Face up (lying on the back): rotate -π/2 about Y axis. Verified via
+    # body-frame gravity — this orientation gives g_x = -1, which the env's
+    # orientation test (`g[:,0] < -0.5`) classifies as on-the-back. Paired
+    # with the arms-by-side joint preset (natural supine rest pose).
+    q = _quat_from_axis_angle((0, 1, 0), -math.pi / 2)
     return StandupPose("supine", _POSE_SUPINE, q, trunk_height=0.13)
 
 
 def prone() -> StandupPose:
-    # Face down: rotate -π/2 about Y axis.
-    q = _quat_from_axis_angle((0, 1, 0), -math.pi / 2)
+    # Face down (lying on the belly): rotate +π/2 about Y axis. Gives
+    # body-frame g_x = +1 (front faces the floor). Paired with the
+    # arms-forward joint preset — the push-up-ready prone start.
+    q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
     return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13)
 
 
-# Lying on LEFT side (right side up). Left arm (ground contact) angled forward
-# and bent for push-up leverage; right arm (airborne) relaxed against body.
-# Physics settling resolves the final contact configuration.
+# ── Side-pose joint targets ──────────────────────────────────────────────
+#
+# ROTATION ANALYSIS (determines which arm/leg is the "down" limb):
+#
+#   side_left  quat = rot(X, +π/2):  body -Y → world -Z (FLOOR).
+#     ∴ RIGHT side on floor: RIGHT arm is DOWN arm, RIGHT leg is BOTTOM leg.
+#
+#   side_right quat = rot(X, -π/2):  body +Y → world -Z (FLOOR).
+#     ∴ LEFT side on floor: LEFT arm is DOWN arm, LEFT leg is BOTTOM leg.
+#
+# SHOULDER ROLL convention (verified by code + shell):
+#   Right arm roll > 0 → arm toward body -Y → floor-ward in side_left  ← USE for DOWN arm brace
+#   Left  arm roll > 0 → arm toward body +Y → floor-ward in side_right ← USE for DOWN arm brace
+#   (Same sign lifts the UP arm away from the floor in the other pose variant)
+#
+# HIP ROLL convention (assumed same pattern):
+#   Right hip roll > 0 → right leg toward body -Y → floor-ward in side_left
+#   Left  hip roll > 0 → left  leg toward body +Y → floor-ward in side_right
+#
+# STABILISATION STRATEGY (floor-brace tripod):
+#   The robot must stay on its side through the settle physics. Without a brace
+#   the PD joint torques roll the trunk within ~60 steps of landing.
+#   Three contact points create a stable tripod:
+#     1) Torso/shoulder against floor (natural)
+#     2) DOWN ARM ELBOW on the floor — the key stabiliser. The arm is pitched
+#        strongly forward (1.2 rad) so the upper-arm end (elbow) just clears the
+#        floor (+0.04 m at trunk_z=0.13 m), then rolled floor-ward (0.4 rad) so
+#        it settles flush. Large elbow-bend (1.1 rad) makes the elbow joint — NOT
+#        the hand — the forward contact point.
+#     3) BOTTOM FOOT on the floor. Hip roll floors-ward pushes the foot down.
+#        Slight knee bend (0.5 rad) and ankle compensate for the body rotation.
+#   The UP arm rests on/above the body (sky-ward roll); top leg is relaxed.
+#
+# ELBOW GEOMETRY for DOWN arm (side_left, trunk at 0.13 m):
+#   Arm neutral = body -Z (hanging down in upright). Roll > 0 rotates toward
+#   body -Y (floor in side_left) for right arm; toward body +Y (floor in
+#   side_right) for left arm.
+#   arm_body = (sin(P), ∓sin(R)·cos(P), -cos(R)·cos(P))   [∓ = right/left]
+#   In world (side_left, R_bw·(x,y,z)=(x,-z,y)):
+#     arm_world_z = -sin(R)·cos(P)
+#     elbow_world_z = trunk_z + arm_world_z · upper_arm_len
+#
+#   P=0.6, R=0.65 → elbow_z = 0.13 - sin(0.65)·cos(0.6)·0.25 = +0.005 m ✓
+#   Elbow just 5 mm above floor at settled height → contacts floor after settle.
+#   P=0.6, R=0.50 → elbow_z = +0.031 m (floats; less stable, avoids penetration).
+#   At SPAWN (trunk_z = 0.13+0.45 = 0.58 m): elbow_spawn_z = 0.455 m → safe ✓.
+#   Large Elbow_Pitch (1.1 rad) bends forearm back so ELBOW JOINT = contact point.
+
+# side_left: RIGHT arm is DOWN arm, RIGHT leg is BOTTOM leg.
 _POSE_SIDE_LEFT = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.0,
-    "ALeft_Shoulder_Pitch": 0.5,  "Left_Shoulder_Roll": -0.5,
-    "Left_Elbow_Pitch": -0.5,     "Left_Elbow_Yaw": 0.0,
-    "ARight_Shoulder_Pitch": -0.2, "Right_Shoulder_Roll": 0.3,
-    "Right_Elbow_Pitch": 0.0,     "Right_Elbow_Yaw": 0.0,
-    "Left_Hip_Pitch": -0.1,  "Left_Hip_Roll": 0.0,  "Left_Hip_Yaw": 0.0,
-    "Left_Knee_Pitch": 0.3,  "Left_Ankle_Pitch": -0.1, "Left_Ankle_Roll": 0.0,
-    "Right_Hip_Pitch": -0.1, "Right_Hip_Roll": 0.0, "Right_Hip_Yaw": 0.0,
-    "Right_Knee_Pitch": 0.3, "Right_Ankle_Pitch": -0.1, "Right_Ankle_Roll": 0.0,
+    # DOWN arm (right) — FLOOR BRACE.
+    # Pitch 0.6 + Roll 0.65 places elbow +0.005 m above floor → settles to contact.
+    # Elbow_Pitch 1.1 makes the elbow joint (not the hand) the brace contact.
+    # This tripod (torso + elbow + foot) resists rolling toward belly OR back.
+    "ARight_Shoulder_Pitch": 0.6, "Right_Shoulder_Roll": 0.65,
+    "Right_Elbow_Pitch": 1.1,    "Right_Elbow_Yaw": 0.0,
+    # UP arm (left) — Roll 0.3 sky-ward (body +Y = world up in side_left).
+    # Keeps arm clear of floor; elbow 20 cm above ground.
+    "ALeft_Shoulder_Pitch": 0.1, "Left_Shoulder_Roll": 0.3,
+    "Left_Elbow_Pitch": 0.2,     "Left_Elbow_Yaw": 0.0,
+    # BOTTOM leg (right) — Hip_Roll 0.3 floor-ward (body -Y = world floor).
+    # Brings foot toward the ground; knee 0.5 for compact stable stance;
+    # ankle compensates body rotation to improve foot contact.
+    "Right_Hip_Pitch": 0.2, "Right_Hip_Roll": 0.3, "Right_Hip_Yaw": 0.0,
+    "Right_Knee_Pitch": 0.5, "Right_Ankle_Pitch": -0.2, "Right_Ankle_Roll": -0.2,
+    # TOP leg (left) — slight opposite roll lifts leg away; relaxed.
+    "Left_Hip_Pitch": 0.1, "Left_Hip_Roll": 0.15, "Left_Hip_Yaw": 0.0,
+    "Left_Knee_Pitch": 0.3, "Left_Ankle_Pitch": -0.1, "Left_Ankle_Roll": 0.1,
 }
 
-# Lying on RIGHT side — mirror of _POSE_SIDE_LEFT.
+# side_right: LEFT arm is DOWN arm, LEFT leg is BOTTOM leg (mirror of side_left).
+# By symmetry: same pitch/roll magnitudes, sign of Roll flips floor direction
+# (left arm roll > 0 → body +Y = world floor in side_right) → same brace result.
 _POSE_SIDE_RIGHT = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.0,
-    "ALeft_Shoulder_Pitch": -0.2, "Left_Shoulder_Roll": -0.3,
-    "Left_Elbow_Pitch": 0.0,      "Left_Elbow_Yaw": 0.0,
-    "ARight_Shoulder_Pitch": 0.5, "Right_Shoulder_Roll": 0.5,
-    "Right_Elbow_Pitch": -0.5,    "Right_Elbow_Yaw": 0.0,
-    "Left_Hip_Pitch": -0.1,  "Left_Hip_Roll": 0.0,  "Left_Hip_Yaw": 0.0,
-    "Left_Knee_Pitch": 0.3,  "Left_Ankle_Pitch": -0.1, "Left_Ankle_Roll": 0.0,
-    "Right_Hip_Pitch": -0.1, "Right_Hip_Roll": 0.0, "Right_Hip_Yaw": 0.0,
-    "Right_Knee_Pitch": 0.3, "Right_Ankle_Pitch": -0.1, "Right_Ankle_Roll": 0.0,
+    # DOWN arm (left) — FLOOR BRACE (mirror geometry, same elbow_z = +0.005 m).
+    "ALeft_Shoulder_Pitch": 0.6, "Left_Shoulder_Roll": 0.65,
+    "Left_Elbow_Pitch": 1.1,    "Left_Elbow_Yaw": 0.0,
+    # UP arm (right) — Roll 0.3 sky-ward (body -Y = world up in side_right).
+    "ARight_Shoulder_Pitch": 0.1, "Right_Shoulder_Roll": 0.3,
+    "Right_Elbow_Pitch": 0.2,    "Right_Elbow_Yaw": 0.0,
+    # BOTTOM leg (left) — Left Hip_Roll 0.3 floor-ward (body +Y = world floor).
+    "Left_Hip_Pitch": 0.2, "Left_Hip_Roll": 0.3, "Left_Hip_Yaw": 0.0,
+    "Left_Knee_Pitch": 0.5, "Left_Ankle_Pitch": -0.2, "Left_Ankle_Roll": 0.2,
+    # TOP leg (right) — slight roll lifts leg away; relaxed.
+    "Right_Hip_Pitch": 0.1, "Right_Hip_Roll": 0.15, "Right_Hip_Yaw": 0.0,
+    "Right_Knee_Pitch": 0.3, "Right_Ankle_Pitch": -0.1, "Right_Ankle_Roll": -0.1,
 }
 
 
 def side_left() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), math.pi / 2)
-    return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13)
+    # Side poses need generous spawn clearance: the down-arm extends below
+    # the trunk centre, so a small clearance buries it at spawn and the PD
+    # holds it embedded through the settle. 0.45 m ensures the whole body
+    # (including the down shoulder/elbow) spawns well above the floor.
+    return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13,
+                       spawn_clearance=0.45)
 
 
 def side_right() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), -math.pi / 2)
-    return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13)
+    return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13,
+                       spawn_clearance=0.45)
 
 
 def all_poses() -> List[StandupPose]:
