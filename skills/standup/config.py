@@ -412,5 +412,21 @@ class StandupConfig:
     obs_dim: int = 0
     act_dim: int = 22
 
+    # ── Level-up exploration / LR reset (training.algorithms.ppo) ──────
+    # The env resets assist / success-criteria / pose-mix on every pose
+    # level-up, but exploration and LR also need a reset — a new pose class
+    # needs a fresh motor program, yet by then entropy has decayed and the
+    # adaptive LR has ratcheted down (~1.3e-4), so the new behaviour is barely
+    # explored. On each level-up the trainer:
+    #   * pumps the actor's per-action log_std by `level_up_log_std_pump`
+    #     (additive, then clamped) → re-injects exploration (the std reset),
+    #   * snaps LR back to `learning_rate` if `level_up_reset_lr` → full
+    #     learning speed for the new task (the LR reset).
+    level_up_log_std_pump: float = 0.5     # 0 disables the exploration pump
+    level_up_reset_lr: bool = True
+    # Adaptive-LR KL target. Slightly above the 0.01 default so the LR doesn't
+    # ratchet down as aggressively during late-curriculum learning.
+    desired_kl: float = 0.015
+
     rewards: StandupRewardWeights = field(
         default_factory=lambda: StandupRewardWeights())
