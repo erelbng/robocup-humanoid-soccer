@@ -28,8 +28,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from training.algorithms.networks import PPOActorCritic
+from training.algorithms.networks import (PPOActorCritic, PPO_LOG_STD_MAX,
+                                           PPO_LOG_STD_MIN)
 from training.normalizers import RunningMeanStd, ReturnNormalizer
+
+
+def _apply_level_up_reset(policy, optimizer, base_lr, pump_log_std, reset_lr):
+    """Re-inject exploration + LR headroom when the pose curriculum advances.
+
+    A newly-introduced pose class needs a fresh motor program, but by the time
+    it arrives the entropy has decayed and the adaptive LR has ratcheted down,
+    so resetting only the assist/criteria/mix (env side) isn't enough — the
+    policy barely explores the new behaviour. This pumps the actor's per-action
+    log_std up by a fixed amount (additive, then clamped to the usual bounds)
+    to restore exploration, and optionally snaps the LR back to its start value
+    so the new task gets full learning speed. Returns the (possibly reset) lr,
+    or None if LR was left untouched.
+    """
+    if pump_log_std and pump_log_std > 0.0 and hasattr(policy, "actor_log_std"):
+        with torch.no_grad():
+            policy.actor_log_std.add_(float(pump_log_std))
+            policy.actor_log_std.clamp_(PPO_LOG_STD_MIN, PPO_LOG_STD_MAX)
+    if reset_lr:
+        for g in optimizer.param_groups:
+            g["lr"] = base_lr
+        return base_lr
+    return None
 
 
 # ─── checkpoint I/O ────────────────────────────────────────────────────
@@ -96,7 +120,15 @@ def train_ppo_vec(env, policy, config, logger=None,
         policy = PPOActorCritic(config.obs_dim, config.act_dim)
     policy = policy.to(device)
     lr = float(config.learning_rate)
+    base_lr = lr
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
+
+    # Per-skill overrides (curriculum skills like standup expose these; others
+    # fall through to the defaults so behaviour is unchanged).
+    desired_kl = float(getattr(config, "desired_kl", desired_kl))
+    pump_log_std = float(getattr(config, "level_up_log_std_pump", 0.5))
+    reset_lr_on_level_up = bool(getattr(config, "level_up_reset_lr", True))
+    last_pose_level = int(getattr(config, "pose_curriculum_start_level", 0))
 
     n_envs = env.num_envs
     n_steps = int(config.n_steps)
@@ -161,6 +193,9 @@ def train_ppo_vec(env, policy, config, logger=None,
             video_recording = True
             video_frames = []
 
+        # Highest pose-curriculum level seen this iteration (level-up reset).
+        pose_level_now = last_pose_level
+
         # ── Collect rollout ──
         with torch.no_grad():
             for step in range(n_steps):
@@ -210,8 +245,12 @@ def train_ppo_vec(env, policy, config, logger=None,
                         running_ep_r[i] = 0.0
                         running_ep_len[i] = 0
 
-                for k, v in info.get("reward_components", {}).items():
+                comps = info.get("reward_components", {})
+                for k, v in comps.items():
                     comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
+                if "pose_curriculum_level" in comps:
+                    pose_level_now = max(pose_level_now,
+                                         int(comps["pose_curriculum_level"]))
 
                 # Capture a frame for video logging if active
                 if video_recording:
@@ -364,6 +403,19 @@ def train_ppo_vec(env, policy, config, logger=None,
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
+        # ── Pose-curriculum level-up: re-explore + LR headroom ──
+        # The env already reset assist/criteria/mix for the new pose; the
+        # policy side needs the matching reset, else decayed entropy + a
+        # ratcheted-down LR mean the new motor program is barely explored.
+        if pose_level_now > last_pose_level:
+            new_lr = _apply_level_up_reset(policy, optimizer, base_lr,
+                                           pump_log_std, reset_lr_on_level_up)
+            if new_lr is not None:
+                lr = new_lr
+            print(f"[ppo] pose level {last_pose_level}→{pose_level_now}: "
+                  f"log_std +{pump_log_std:.2f}, lr→{lr:.1e} (re-explore)")
+            last_pose_level = pose_level_now
+
         # ── Logging ──
         if iteration % 10 == 0 or len(ep_rewards) > 0:
             mr = float(np.mean(ep_rewards)) if ep_rewards else 0.0
@@ -469,7 +521,14 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     assert gw.shape == (n_groups,), f"group_weights must be {n_groups}-dim"
 
     lr = float(config.learning_rate)
+    base_lr = lr
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
+
+    # Per-skill overrides (see train_ppo_vec).
+    desired_kl = float(getattr(config, "desired_kl", desired_kl))
+    pump_log_std = float(getattr(config, "level_up_log_std_pump", 0.5))
+    reset_lr_on_level_up = bool(getattr(config, "level_up_reset_lr", True))
+    last_pose_level = int(getattr(config, "pose_curriculum_start_level", 0))
 
     n_envs = env.num_envs
     n_steps = int(config.n_steps)
@@ -525,6 +584,9 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             video_recording = True
             video_frames = []
 
+        # Highest pose-curriculum level seen this iteration (level-up reset).
+        pose_level_now = last_pose_level
+
         # ── Collect rollout ──
         with torch.no_grad():
             for step in range(n_steps):
@@ -577,8 +639,12 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                         running_ep_r[i] = 0.0
                         running_ep_len[i] = 0
 
-                for k, v in info.get("reward_components", {}).items():
+                comps = info.get("reward_components", {})
+                for k, v in comps.items():
                     comp_queues.setdefault(k, deque(maxlen=200)).append(float(v))
+                if "pose_curriculum_level" in comps:
+                    pose_level_now = max(pose_level_now,
+                                         int(comps["pose_curriculum_level"]))
 
                 if video_recording:
                     frame = env.render_frame()
@@ -735,6 +801,16 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 lr = min(max_lr, lr * 1.5)
             for grp in optimizer.param_groups:
                 grp["lr"] = lr
+
+        # ── Pose-curriculum level-up: re-explore + LR headroom ──
+        if pose_level_now > last_pose_level:
+            new_lr = _apply_level_up_reset(policy, optimizer, base_lr,
+                                           pump_log_std, reset_lr_on_level_up)
+            if new_lr is not None:
+                lr = new_lr
+            print(f"[ppo-mc] pose level {last_pose_level}→{pose_level_now}: "
+                  f"log_std +{pump_log_std:.2f}, lr→{lr:.1e} (re-explore)")
+            last_pose_level = pose_level_now
 
         # ── Logging ──
         if iteration % 10 == 0 or len(ep_rewards) > 0:

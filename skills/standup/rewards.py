@@ -158,6 +158,31 @@ def feet_under_base_score(foot_xy: np.ndarray, base_xy: np.ndarray,
     return (score[:, 0] * score[:, 1]).astype(np.float32)
 
 
+def feet_tuck_signal(foot_z: np.ndarray, foot_xy: np.ndarray,
+                     base_xy: np.ndarray,
+                     foot_max_z: float = 0.12,
+                     d_max: float = 0.40) -> np.ndarray:
+    """Dense [0, 1] reward for BOTH feet grounded AND tucked under the base —
+    the squat-ready stance, paid regardless of trunk height/orientation.
+
+    This is the missing motor primitive behind the stubborn ~0.30 m plateau
+    (runs #1-3): the policy raises its torso but leaves its legs splayed flat,
+    so its feet never come under its body and it can never push to standing.
+    `feet_under_base_score` exists but is only used to GATE the end-of-motion
+    stand rewards (multiplied by trunk-up / upright factors), so it gives ~0
+    gradient while the robot is still low — exactly when the tuck must happen.
+    This term is UNGATED by trunk pose: a sprawled robot with feet on the floor
+    gets a smooth gradient that pulls its grounded feet inward toward under the
+    hips, building the squat stance from which the other terms (height,
+    standing_tall, explosive_rise) then drive the push-up.
+
+    grounded (both feet near floor) × under_base (both feet under the base xy).
+    """
+    grounded = _feet_grounded_score(foot_z, foot_max_z)
+    under = feet_under_base_score(foot_xy, base_xy, d_max=d_max)
+    return (grounded * under).astype(np.float32)
+
+
 def standing_on_feet_mask(foot_z: np.ndarray, foot_xy: np.ndarray,
                            base_xy: np.ndarray,
                            foot_max_z: float = 0.12,
@@ -294,6 +319,7 @@ def compute_standup_reward(
     foot_z: np.ndarray,              # (N, 2) world-frame z of left/right foot
     foot_xy: np.ndarray = None,      # (N, 2, 2) world-frame xy of left/right foot
     feet_ok: np.ndarray = None,      # (N,) bool — standing_on_feet_mask (success gate)
+    start_supine: np.ndarray = None, # (N,) bool — episode started on the back
     weights=None,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
     default_joint_pos: np.ndarray = None,
@@ -444,6 +470,29 @@ def compute_standup_reward(
         trunk_max_z=standing_tall_max_z,
     ) * under_base
 
+    # Feet-tuck — dense, trunk-pose-UNGATED reward for both feet grounded AND
+    # under the base (the squat-ready stance). Teaches the missing primitive
+    # behind the sprawled ~0.30 m plateau: pull the grounded feet under the
+    # hips so the other terms can then drive the push to standing.
+    if foot_xy is not None:
+        tuck = feet_tuck_signal(
+            foot_z, foot_xy, root_pos[:, :2],
+            foot_max_z=foot_grounded_max_z, d_max=feet_under_base_soft_d)
+    else:
+        tuck = np.zeros(root_pos.shape[0], dtype=np.float32)
+
+    # Anti-detour penalty for back (supine) starts — discourage rolling
+    # face-DOWN (toward prone) on the way up. Body-frame gravity-x is +1
+    # supine (on the back), -1 prone (belly-down), ~0 upright/side, so
+    # max(0, -proj_g_x) is >0 only once a back-start robot has flipped
+    # belly-down (the roll-to-prone / cobra detour). A clean sit-up/roll-up
+    # keeps proj_g_x ≥ 0 → zero penalty. Gated to supine-start envs so prone
+    # recovery is untouched.
+    flip = np.maximum(0.0, -projected_gravity(root_quat)[:, 0]).astype(np.float32)
+    if start_supine is not None:
+        flip = flip * start_supine.astype(np.float32)
+    supine_flip_pen = flip
+
     w = weights
 
     # ── per-group decomposition (multi-critic PPO) ──
@@ -455,8 +504,10 @@ def compute_standup_reward(
         + w.height * h
         + w.upright_progress * progress
         + w.explosive_rise * rise
+        + w.feet_tuck * tuck
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
+        - w.supine_anti_flip * supine_flip_pen
     ).astype(np.float32)
     r_reg = (
         - w.arm_pose_dev * arm_dev
@@ -496,8 +547,10 @@ def compute_standup_reward(
         "sustained_rate": float(np.mean(sustained_now)),
         "achieved_sustained_rate": float(np.mean(achieved_sustained)),
         "post_success_standing": float(np.mean(post_success)),
+        "feet_tuck": float(np.mean(tuck)),
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
+        "supine_anti_flip": float(np.mean(supine_flip_pen)),
         "feet_under_base": float(np.mean(under_base)),
         "mean_foot_z": float(np.mean(foot_z)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),

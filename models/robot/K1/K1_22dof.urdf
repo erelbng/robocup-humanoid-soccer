@@ -695,7 +695,7 @@
     <limit
       lower="-3.0"
       upper="2.21"
-      effort="30"
+      effort="68.0"
       velocity="7.1"
     />
   </joint>
@@ -753,7 +753,7 @@
     <limit
       lower="-0.4"
       upper="1.57"
-      effort="35"
+      effort="76.0"
       velocity="12.9"
     />
   </joint>
@@ -811,7 +811,7 @@
     <limit
       lower="-1."
       upper="1."
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
@@ -877,7 +877,7 @@
     <limit
       lower="0."
       upper="2.23"
-      effort="40"
+      effort="112.0"
       velocity="12.5"
     />
   </joint>
@@ -927,7 +927,7 @@
     <limit
       lower="-0.87"
       upper="0.345"
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
@@ -963,11 +963,10 @@
     </visual>
     <collision>
       <origin
-        xyz="0 0 0"
+        xyz="0.026 0 -0.02"
         rpy="0 0 0" />
       <geometry>
-        <mesh
-          filename="meshes/Left_Foot.STL" />
+        <box size="0.18 0.07 0.036" />
       </geometry>
     </collision>
   </link>
@@ -986,7 +985,7 @@
     <limit
       lower="-0.345"
       upper="0.345"
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
@@ -1037,7 +1036,7 @@
     <limit
       lower="-3.0"
       upper="2.21"
-      effort="30"
+      effort="68.0"
       velocity="7.1"
     />
   </joint>
@@ -1095,7 +1094,7 @@
     <limit
       lower="-1.57"
       upper="0.4"
-      effort="35"
+      effort="76.0"
       velocity="12.9"
   />
   </joint>
@@ -1153,7 +1152,7 @@
     <limit
       lower="-1."
       upper="1."
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
@@ -1219,7 +1218,7 @@
     <limit
       lower="0."
       upper="2.23"
-      effort="40"
+      effort="112.0"
       velocity="12.5"
     />
   </joint>
@@ -1269,7 +1268,7 @@
     <limit
       lower="-0.87"
       upper="0.345"
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
@@ -1305,11 +1304,10 @@
     </visual>
     <collision>
       <origin
-        xyz="0 0 0"
+        xyz="0.026 0 -0.02"
         rpy="0 0 0" />
       <geometry>
-        <mesh
-          filename="meshes/Right_Foot.STL" />
+        <box size="0.18 0.07 0.036" />
       </geometry>
     </collision>
   </link>
@@ -1328,7 +1326,7 @@
     <limit
       lower="-0.345"
       upper="0.345"
-      effort="20"
+      effort="38.3"
       velocity="18.1"
     />
   </joint>
