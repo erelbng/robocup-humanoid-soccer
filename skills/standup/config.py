@@ -430,18 +430,14 @@ class StandupConfig:
     recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
     recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
 
-    # ── Standup leg gains: frequency-based, matching Booster's real K1 ───────
-    # Booster's own K1 Isaac config (booster_train assets/robots/booster.py +
-    # actuator.py) does NOT use a flat kp — it derives per-joint gains from a
-    # natural frequency + damping ratio and the joint's reflected inertia:
-    #     kp = armature · (2π·f_n)²        kd = 2·ζ·armature·(2π·f_n)   (f_n in Hz)
-    # with f_n=4 Hz, ζ=1.5 (hip/ankle) / 1.0 (knee). Because our K1RobotConfig
-    # armatures already match Booster's actuator classes, computing kp/kd from
-    # them reproduces K1's REAL gains: ~kp hip-pitch 30 / knee 60 / ankle 36
-    # (vs the wrong flat kp=40 of runs #1-5 and the way-too-stiff T1 kp=200 of
-    # run #6). Applied to legs only in K1StandupEnv._build_per_joint_gains;
-    # arms/head keep the K1RobotConfig group gains.
-    use_frequency_gains: bool = True
+    # ── Standup leg gains ────────────────────────────────────────────────────
+    # DISABLED (2026-06-03): the frequency-derived gains (kp ~30/60/36, kd
+    # 3.6–4.8) were too soft on kp and over-damped. We now use the per-group
+    # gains in K1RobotConfig, which were set to NaoHTWK's own K1 RL config
+    # (htwk-gym envs/K1/Parameter_Walk.yaml): kp Hip/Knee 100, Ankle 50; kd
+    # Hip/Knee 2, Ankle 1 — the authoritative reference for this robot. Set
+    # use_frequency_gains=True only to revisit the natural-frequency scheme.
+    use_frequency_gains: bool = False
     gain_natural_freq_hz: float = 4.0
     gain_damping_ratio_leg: float = 1.5
     gain_damping_ratio_knee: float = 1.0
