@@ -89,22 +89,23 @@ class K1RobotConfig:
     # in the skill env's _init_genesis() when it calls set_dofs_kp.
     kp: float = 30.0      # legacy uniform fallback
     kd: float = 1.0
-    # Per-joint-group PD gains. LOWERED toward canonical Genesis locomotion
-    # (the official go2 example uses kp=20 / kd=0.5) from the previous T1-style
-    # kp=200 / kd=5. Reasoning (2026-05-30): kp=200 is ~10× canonical and makes
-    # the controller near-rigidly position-locked, so the policy overfits
-    # Genesis's exact contact response and transfers terribly to MuJoCo (100%
-    # → 0%). Compliant low-gain control is inherently more robust across
-    # physics engines (and keeps torques realistic without a clamp). K1 is
-    # heavier than go2, so legs sit a bit above 20 (≈40) rather than exactly
-    # go2's 20. Revisit if the standup needs more authority.
-    kp_hip:   float = 40.0
-    kp_knee:  float = 40.0
-    kp_ankle: float = 40.0
+    # Per-joint-group PD gains. LEG gains set to NaoHTWK's own K1 RL config
+    # (github.com/NaoHTWK/htwk-gym envs/K1/Parameter_Walk.yaml) — the
+    # authoritative reference for THIS robot (same 0.002 dt / decimation-10 /
+    # default angles as us): stiffness {Hip:100, Knee:100, Ankle:50}, damping
+    # {Hip:2, Knee:2, Ankle:1}. Replaces the earlier guesses (flat kp=40, and
+    # standup's frequency-derived ~30/60/36) which were far too soft on kp — the
+    # legs couldn't hold the robot up. Ankle is intentionally softer (50/1):
+    # ankles have less mechanical authority. Arm/head kept as before (htwk-gym's
+    # walk policy doesn't actuate them; Booster's B1 SDK example uses shoulder
+    # ~40 / elbow ~20 / head ~5, so our 20/10 is in range).
+    kp_hip:   float = 100.0
+    kp_knee:  float = 100.0
+    kp_ankle: float = 50.0
     kp_arm:   float = 20.0
     kp_head:  float = 10.0
-    kd_hip:   float = 1.0
-    kd_knee:  float = 1.0
+    kd_hip:   float = 2.0
+    kd_knee:  float = 2.0
     kd_ankle: float = 1.0
     kd_arm:   float = 0.5
     kd_head:  float = 0.5

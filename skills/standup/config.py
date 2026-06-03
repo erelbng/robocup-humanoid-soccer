@@ -26,8 +26,9 @@ class StandupRewardWeights:
     # 5.0 to 10.0 because the policy got stuck in a sit/kneel attractor
     # (z ≈ 0.25, up ≈ 0.85) where Δup ≈ 0; a stronger progress weight
     # amplifies the tiny gradient that pulls the policy onward.
-    upright_progress: float = 15.0     # weight on max(0, up_t - up_{t-1})
-                                       # (10→15 with the kneel-attractor fix)
+    upright_progress: float = 10.0     # weight on max(0, up_t - up_{t-1})
+                                       # (restored to Karl's e52b48b value;
+                                       #  Eric's 15 was for his recovery curric.)
 
     # Explosive-rise shaping — direct per-step reward for a fast UPWARD trunk
     # velocity while still low (gated to the recovery phase, vanishing near
@@ -36,16 +37,20 @@ class StandupRewardWeights:
     # rate-capped, speed-independent `upright_progress` term doesn't pay for.
     # A TASK term (drives the get-up) → stays ON in the discovery stage; it is
     # deliberately NOT in `_DISCOVERY_ZEROED_WEIGHTS`.
-    explosive_rise: float = 4.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
-                                       # (3.0→4.0 with the kneel-attractor fix:
-                                       #  more upward drive off the squat)
+    explosive_rise: float = 0.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
+                                       # (0 = Karl's e52b48b config; this term
+                                       #  did not exist on his branch. Code kept
+                                       #  in rewards.py, inert at weight 0.)
 
     # Feet-tuck — run #4 fix for the stubborn ~0.30 m sprawl plateau (runs #1-3
     # all raised the torso but left legs splayed flat, feet never under the
     # body). Dense, trunk-pose-UNGATED reward for both feet grounded AND tucked
     # under the base → teaches the squat-ready stance the policy never found.
     # A TASK term (drives the get-up) → ON in the discovery stage.
-    feet_tuck: float = 6.0             # weight on grounded × feet_under_base
+    feet_tuck: float = 0.0             # weight on grounded × feet_under_base
+                                       # (0 = Karl's e52b48b config; this term
+                                       #  did not exist on his branch. Code kept
+                                       #  in rewards.py, inert at weight 0.)
 
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
@@ -71,8 +76,9 @@ class StandupRewardWeights:
     # realistic standup time range: a 1 s stand pays ~330, a 2 s stand
     # ~150, a 3 s stand ~100, a 4 s stand ~55. Sub-second standups still
     # get the largest pulse but slow ones are no longer disqualified.
-    time_penalty: float = 3.5          # per step until sustained-success
-                                       # (≥2.5 to make floor net-negative:
+    time_penalty: float = 3.0          # per step until sustained-success
+                                       # (restored to Karl's e52b48b value;
+                                       #  ≥2.5 to make floor net-negative:
                                        #  upright≈0.5×3 + height≈0.3 − 3.0 < 0)
     success_bonus: float = 400.0       # paid on streak completion, scaled
                                        #   by exp(-t_first / tau)
@@ -105,11 +111,9 @@ class StandupRewardWeights:
     # reward is unchanged (no destabilising regression), but full
     # extension pays an extra ~5/step → ~1250 over the post-squat
     # trajectory. Pulls the policy out of the squat local optimum.
-    # Bumped 5.0→10.0 (2026-06-02): run #1 converged to a ~0.32 m kneel and
-    # plateaued there for 40M steps. This is the dense, monotone "go higher"
-    # term, so doubling it makes rising squat→full-height worth clearly more
-    # than sitting stably at the kneel — the targeted kneel-attractor fix.
-    standing_tall: float = 10.0
+    # Restored to Karl's e52b48b value (5.0); Eric's 10.0 was a kneel-attractor
+    # fix tuned for his recovery curriculum, which we no longer run.
+    standing_tall: float = 5.0
 
     # Anti-detour penalty for BACK (supine) starts — teaches a direct
     # back-recovery instead of the "roll onto the belly / cobra, then push
@@ -254,12 +258,13 @@ class StandupConfig:
     # shaping and small penalties. Each critic fits one homogeneous-scale
     # group; advantages are normalized per group then weighted-summed.
     # Standup-only (the other skills keep single-critic PPO).
-    use_multi_critic: bool = True   # run #3: HoST's core standup fix. Runs #1-2
-                                    # (single-critic) both plateaued at a ~0.31 m
-                                    # kneel — the value net can't fit the +400
-                                    # success pulse mixed with dense shaping, so
-                                    # the gradient toward reliably standing is too
-                                    # weak. One critic per (task,reg,success) group.
+    use_multi_critic: bool = False  # Restored to Karl's e52b48b config (single
+                                    # critic). Eric's multi-critic was a run-#3
+                                    # fix for his recovery-curriculum setup; we
+                                    # now run Karl's curriculum + rewards, which
+                                    # used a single critic. (n_critics=1 keeps the
+                                    # original param names → existing single-critic
+                                    # checkpoints load unchanged.)
     # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
     # success). Bias toward `task` early to drive the get-up; `reg` is ~0
     # in the discovery stage anyway (its weights are zeroed).
@@ -393,7 +398,15 @@ class StandupConfig:
     # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
     # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
     # existing L0-L3 fallen-pose curriculum unchanged.
-    recovery_curriculum_enabled: bool = True
+    #
+    # DISABLED (mergefixes): per project decision we run ONLY Karl's pose-
+    # difficulty curriculum (L0-L3, _sample_reset_from_level / _maybe_advance_
+    # level) and no other start-state curriculum. With this False the env sets
+    # _recovery_stage = _recovery_final_stage at construction, so _sample_reset
+    # hands off to Karl's pose curriculum from step 0 and the crouch pools are
+    # never built. (The recovery code is kept, dormant + correct, behind this
+    # flag in case it's wanted again.)
+    recovery_curriculum_enabled: bool = False
     # Stage to start at. 0 = shallowest crouch. Set to len(recovery_crouch_heights)
     # (the final stage) to DISABLE the ramp and train directly on fallen poses.
     recovery_start_stage: int = 0
@@ -422,18 +435,14 @@ class StandupConfig:
     recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
     recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
 
-    # ── Standup leg gains: frequency-based, matching Booster's real K1 ───────
-    # Booster's own K1 Isaac config (booster_train assets/robots/booster.py +
-    # actuator.py) does NOT use a flat kp — it derives per-joint gains from a
-    # natural frequency + damping ratio and the joint's reflected inertia:
-    #     kp = armature · (2π·f_n)²        kd = 2·ζ·armature·(2π·f_n)   (f_n in Hz)
-    # with f_n=4 Hz, ζ=1.5 (hip/ankle) / 1.0 (knee). Because our K1RobotConfig
-    # armatures already match Booster's actuator classes, computing kp/kd from
-    # them reproduces K1's REAL gains: ~kp hip-pitch 30 / knee 60 / ankle 36
-    # (vs the wrong flat kp=40 of runs #1-5 and the way-too-stiff T1 kp=200 of
-    # run #6). Applied to legs only in K1StandupEnv._build_per_joint_gains;
-    # arms/head keep the K1RobotConfig group gains.
-    use_frequency_gains: bool = True
+    # ── Standup leg gains ────────────────────────────────────────────────────
+    # DISABLED (2026-06-03): the frequency-derived gains (kp ~30/60/36, kd
+    # 3.6–4.8) were too soft on kp and over-damped. We now use the per-group
+    # gains in K1RobotConfig, which were set to NaoHTWK's own K1 RL config
+    # (htwk-gym envs/K1/Parameter_Walk.yaml): kp Hip/Knee 100, Ankle 50; kd
+    # Hip/Knee 2, Ankle 1 — the authoritative reference for this robot. Set
+    # use_frequency_gains=True only to revisit the natural-frequency scheme.
+    use_frequency_gains: bool = False
     gain_natural_freq_hz: float = 4.0
     gain_damping_ratio_leg: float = 1.5
     gain_damping_ratio_knee: float = 1.0
@@ -451,13 +460,11 @@ class StandupConfig:
     # Sustained-success thresholds (END of curriculum — see _start values
     # below). A standup is "done" once `success_hold_steps` consecutive
     # frames satisfy both upright and height conditions.
-    target_height: float = 0.50               # run #3: 0.55→0.50 so the success
-                                              # bonus is reachable from a ~0.40 m
-                                              # rise (was unreachable from the
-                                              # 0.31 m kneel), pulling the policy
-                                              # off the squat. standing_tall still
-                                              # ramps to 0.55 for full extension.
-    upright_threshold: float = 0.88            # run #3: 0.92→0.88 (cosine ~28°)
+    target_height: float = 0.55               # restored to Karl's e52b48b value
+                                              # (Eric lowered to 0.50 for his
+                                              # recovery curriculum).
+    upright_threshold: float = 0.92            # restored to Karl's e52b48b value
+                                              # (cosine ~23°; Eric used 0.88).
     success_hold_steps: int = 50               # 1.0 s at 50 Hz
 
     # Curricula on the success criteria. All three independently ramp
@@ -506,15 +513,11 @@ class StandupConfig:
     standing_tall_max_z: float = 0.55          # signal saturates at K1 standing height
 
     # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
-    # τ=45 steps (0.9 s): steepened from 60 alongside the explosive-rise reward
-    # to pull harder toward a snappy get-up. The speed reward must have a real
-    # GRADIENT in the range standups actually occur. Diagnosis (2026-05-30):
-    # with τ=150, observed stands clustered ~70 steps (1.4 s) and never got
-    # faster — exp(-t/150) is nearly flat there. At τ=45, 70→45 steps is
-    # 0.21→0.37 (+74%), a strong pull toward faster.
-    # NOTE: realizable (≤40 N·m) standups are torque-limited to ~2 s, so if the
-    # policy can't reach the steep part of the curve, relax τ back toward 60.
-    time_to_stand_tau_steps: float = 45.0
+    # Restored to Karl's e52b48b value τ=60 (Eric steepened to 45 alongside his
+    # explosive-rise reward, which we no longer use). The speed reward still has
+    # a usable gradient in the range standups occur: at τ=60, 70→45 steps is
+    # 0.31→0.47 (+52%).
+    time_to_stand_tau_steps: float = 60.0
 
     # Velocity cap (m/s) for the explosive-rise reward: upward trunk velocity
     # is clipped to [0, v_cap] then normalised, so the term saturates at a
@@ -527,8 +530,14 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.005  # 0.002→0.005 (kneel-attractor fix): more
-                                 # exploration to escape the squat local optimum
+    entropy_coef: float = 0.002  # Restored 0.005→0.002 (mergefixes): at 0.005
+                                 # the entropy bonus out-earned the (hard)
+                                 # standup gradient → entropy RAN AWAY (observed
+                                 # 20→27.5, std→0.84/cap) and the policy never
+                                 # committed to a coherent get-up. Karl's design
+                                 # (b09d769) needs entropy to DECAY over time and
+                                 # be re-injected only at level-ups via the
+                                 # log_std pump — incompatible with a high coef.
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
