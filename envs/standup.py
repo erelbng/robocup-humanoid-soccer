@@ -172,9 +172,10 @@ _POSE_SIDE_LEFT = {
     # This tripod (torso + elbow + foot) resists rolling toward belly OR back.
     "ARight_Shoulder_Pitch": 0.6, "Right_Shoulder_Roll": 0.65,
     "Right_Elbow_Pitch": 1.1,    "Right_Elbow_Yaw": 0.0,
-    # UP arm (left) — Roll 0.3 sky-ward (body +Y = world up in side_left).
-    # Keeps arm clear of floor; elbow 20 cm above ground.
-    "ALeft_Shoulder_Pitch": 0.1, "Left_Shoulder_Roll": 0.3,
+    # UP arm (left) — Roll 0.0 (neutral, arm rests along body side).
+    # Roll 0.3 made it reach straight skyward; neutral lets it settle
+    # to a natural horizontal/body-aligned position after settle physics.
+    "ALeft_Shoulder_Pitch": 0.1, "Left_Shoulder_Roll": 0.0,
     "Left_Elbow_Pitch": 0.2,     "Left_Elbow_Yaw": 0.0,
     # BOTTOM leg (right) — Hip_Roll 0.3 floor-ward (body -Y = world floor).
     # Brings foot toward the ground; knee 0.5 for compact stable stance;
@@ -194,8 +195,8 @@ _POSE_SIDE_RIGHT = {
     # DOWN arm (left) — FLOOR BRACE (mirror geometry, same elbow_z = +0.005 m).
     "ALeft_Shoulder_Pitch": 0.6, "Left_Shoulder_Roll": 0.65,
     "Left_Elbow_Pitch": 1.1,    "Left_Elbow_Yaw": 0.0,
-    # UP arm (right) — Roll 0.3 sky-ward (body -Y = world up in side_right).
-    "ARight_Shoulder_Pitch": 0.1, "Right_Shoulder_Roll": 0.3,
+    # UP arm (right) — Roll 0.0 (neutral, arm rests along body side).
+    "ARight_Shoulder_Pitch": 0.1, "Right_Shoulder_Roll": 0.0,
     "Right_Elbow_Pitch": 0.2,    "Right_Elbow_Yaw": 0.0,
     # BOTTOM leg (left) — Left Hip_Roll 0.3 floor-ward (body +Y = world floor).
     "Left_Hip_Pitch": 0.2, "Left_Hip_Roll": 0.3, "Left_Hip_Yaw": 0.0,

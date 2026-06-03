@@ -9,10 +9,12 @@ off-screen render to ``<out_dir>/<pool>/<pool>_NNN.png``.
 Each filename embeds two diagnostics so problems are visible at a glance:
 
   * ``z`` — trunk (base-link) height.
-  * ``minc`` — the LOWEST foot/hand link z. For a clean pose this is ≳ 0;
-    a negative value means a limb is stuck in the floor (the penetration
-    bug). Such frames are additionally prefixed with ``PEN_`` and counted
-    in the per-run ``manifest.json``.
+  * ``minc`` — the LOWEST COLLISION-MESH VERTEX z of the whole robot (via
+    ``robot.get_verts()`` — the actual geometry, not link origins). For a
+    clean pose this is ≳ 0 (something rests on the floor); a clearly negative
+    value means a limb is stuck in the floor (the penetration bug). Such
+    frames are additionally prefixed with ``PEN_`` and counted in the per-run
+    ``manifest.json``.
 
 This is the visual counterpart to the pose-pool penetration filter
 (`pose_pool_penetration_eps`) and the raised `spawn_clearance` — run it to
