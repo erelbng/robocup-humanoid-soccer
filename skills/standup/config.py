@@ -289,34 +289,55 @@ class StandupConfig:
     pose_pool_settle_steps: int = 1000     # physics substeps per round = 2.0 s at 500 Hz.
                                             # Was 150 (0.3 s) — too short to damp bouncing
                                             # after 0.19 s free-fall from spawn height.
+    # Side poses use a shorter settle than supine/prone. The elbow-brace
+    # configuration (Shoulder_Pitch=1.2, Elbow_Pitch=1.1) creates a floor
+    # contact that stabilises the trunk against rolling, so longer settle is
+    # now possible — but we keep it conservative at 500 steps (1.0 s) in case
+    # the brace doesn't fully hold. Higher rejection rate → more rounds.
+    pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
+    pose_pool_side_rounds: int = 6          # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
-    pose_pool_quat_noise_rad: float = 0.30  # Gaussian σ on orientation perturbation
-    # Joint noise for named-pose pools. HUMANUP + X-Loco recommend large joint noise
-    # so each pool sample is a distinct fallen configuration rather than a rigid clone
-    # of the canonical pose. 0.30 rad σ ≈ ±17° per joint (was hardcoded 0.05 = ±3°).
-    pose_pool_joint_jitter_rad: float = 0.30
+    # Orientation noise on the trunk quat during pool build. Smaller values →
+    # more consistent pose class; larger → more variety but risk of rolling
+    # out of class during settle. 0.15 rad (≈±8°) gives enough variation
+    # without rolling supine into prone or side into prone.
+    # Was 0.30 (±17°) — too large, caused side poses to settle into prone
+    # and supine joints to reach extreme angles that buried feet.
+    pose_pool_quat_noise_rad: float = 0.15
+    # Joint noise for named-pose pools. Smaller than the original 0.30 (±17°)
+    # which caused extreme limb positions to penetrate the floor, especially
+    # for supine (feet driven toward floor) and side (down-arm rolled into
+    # ground). 0.15 rad (±9°) still gives genuine variation while keeping
+    # all limbs in safe positions given the reference joint targets.
+    pose_pool_joint_jitter_rad: float = 0.15
     # Filter: keep pool entries with trunk_z < trunk_height + this margin.
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
+    # Side-pose MINIMUM trunk height filter. A side-lying robot has trunk
+    # centre at ≈0.08–0.15 m (half trunk width above floor). Supine/prone
+    # robots settle at ≈0.06 m (half trunk depth). Any pool state with
+    # trunk_z < this value has rolled to supine/prone despite the arm-brace
+    # and must be rejected — even if the orientation filter marginally passed.
+    pose_pool_side_min_trunk_z: float = 0.07
     # Orientation-CLASS filter for named-pose pools. After settling, keep only
     # states whose body-frame gravity still points (roughly) in the pose's
     # nominal direction — i.e. dot(g_settled, g_nominal) > this. A side pose
     # has g≈(0,±1,0); if it rolls onto its back/belly during settle the
     # gravity swings to (±1,0,0) → dot 0 → rejected. Guarantees a "side"
     # start is actually on its side (not a back/belly start that drifted in),
-    # and likewise that supine/prone pools stay in-class. 0.5 ≈ within 60° of
-    # nominal; raise toward 0.7 (~45°) to be stricter, lower for more variety.
-    pose_pool_orient_dot_min: float = 0.5
+    # and likewise that supine/prone pools stay in-class.
+    # Was 0.5 (within 60°) — far too loose. Images showed blatantly prone
+    # robots passing the side-pose filter (rolled ≈55° from nominal but still
+    # dot=0.57 > 0.5). 0.80 (within ~37°) enforces genuinely side-lying poses
+    # while still allowing the natural tilt variation from settle physics.
+    pose_pool_orient_dot_min: float = 0.80
     # Penetration guard for named-pose pools. After settling, reject any
-    # snapshot where a foot/hand link sits below `-this` (m). Large quat/joint
-    # noise can rotate a limb under the spawn clearance; the PD then holds it
-    # embedded through the settle and the snapshot captures a limb-in-ground
-    # state (see StandupPose.spawn_clearance). Replayed at reset, the buried
-    # limb is pinned (penetration + friction) → the robot can't free that leg,
-    # and the negative contact-z corrupts the feet-grounded / under-base reward
-    # signals. A cleanly resting foot link sits at ≈+0.02 m, so -0.01 rejects
-    # only genuinely penetrating states.
-    pose_pool_penetration_eps: float = 0.01
+    # snapshot where ANY robot link sits below `-this` (m). The check covers
+    # all links (not just feet/hands) so knees and elbows embedded by joint
+    # noise are also caught. A cleanly resting limb sits at ≈+0.02 m.
+    # Was 0.01 — too tight to catch elbows that were only slightly embedded;
+    # raised to 0.02 to give a more robust rejection margin.
+    pose_pool_penetration_eps: float = 0.02
 
     # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50

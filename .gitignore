@@ -129,3 +129,5 @@ core.*
 .claude/
 CLAUDE.local.md
 GEMINI.local.md
+
+pose_pool_shots/

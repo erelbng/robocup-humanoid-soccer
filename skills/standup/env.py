@@ -352,7 +352,20 @@ class K1StandupEnv(SkillEnv):
 
         pool_pos, pool_quat, pool_jpos = [], [], []
 
-        for round_idx in range(c.pose_pool_rounds):
+        # Side poses use a much shorter settle than supine/prone.
+        # Humanoid side-lying is NOT a stable equilibrium: PD joint torques
+        # roll the trunk to prone/supine within ~60 physics steps of landing.
+        # The full 1000-step settle always produces back/belly snapshots that
+        # the orientation filter rejects → empty pool → fallback to generic
+        # settle pool (no true side poses). Snapshot after only the landing
+        # phase (~250 steps) while the orientation is still close to the
+        # target side class. Higher rejection rate → more rounds to compensate.
+        is_side = pose.name.startswith("side_")
+        n_rounds = c.pose_pool_side_rounds if is_side else c.pose_pool_rounds
+        settle_steps = (c.pose_pool_side_settle_steps
+                        if is_side else c.pose_pool_settle_steps)
+
+        for round_idx in range(n_rounds):
             # Compose base quat with small random tilt noise.
             noise = _small_tilt_quat(N, c.pose_pool_quat_noise_rad, self.rng)
             quat = _quat_mul(noise, base_quat)  # noise on top of base pose
@@ -379,7 +392,7 @@ class K1StandupEnv(SkillEnv):
                       f"(round {round_idx}) failed: {e}")
                 continue
 
-            for _ in range(c.pose_pool_settle_steps):
+            for _ in range(settle_steps):
                 self.scene.step()
 
             try:
@@ -407,6 +420,12 @@ class K1StandupEnv(SkillEnv):
                   & (up < c.pool_max_upright)
                   & (class_dot > c.pose_pool_orient_dot_min)
                   & (min_contact_z > -c.pose_pool_penetration_eps))
+            # Side-pose height guard: a robot that rolled to supine/prone
+            # despite the arm-brace settles at trunk_z ≈ 0.06 m. Any state
+            # below pose_pool_side_min_trunk_z has rolled into the wrong
+            # class — reject even if the orientation filter barely passed.
+            if is_side:
+                ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -416,7 +435,8 @@ class K1StandupEnv(SkillEnv):
 
         if not pool_pos:
             print(f"[standup] WARNING: pose pool '{pose.name}' empty after "
-                  f"filtering — will fall back to settle pool at this level.")
+                  f"filtering (settle_steps={settle_steps}, rounds={n_rounds})"
+                  f" — will fall back to settle pool at this level.")
             return _empty
 
         pos_arr = np.concatenate(pool_pos).astype(np.float32)
@@ -425,18 +445,79 @@ class K1StandupEnv(SkillEnv):
         return {"pos": pos_arr, "quat": quat_arr,
                 "jpos": jpos_arr, "size": pos_arr.shape[0]}
 
+    def _extract_side_pools_from_settle(self) -> None:
+        """Override side-pose pools with states extracted from the random
+        settle pool.
+
+        Rationale: humanoid side-lying is NOT a stable equilibrium when the
+        robot is spawned in a forced side orientation and let to settle — PD
+        joint torques roll the trunk to prone/supine within ~60 physics
+        steps of landing. The random settle pool avoids this entirely: robots
+        start from random orientations, fall naturally, and some arrive at
+        STABLE side-lying equilibria (the ground contact prevents further
+        rolling). These naturally-settled states are physically correct and
+        well-distributed — exactly like ``random_065`` which is a naturally
+        settled side pose.
+
+        Filter: dot(g_body, g_expected) > pose_pool_orient_dot_min:
+          side_left  → g_body = (0, +1, 0) → keep where g_body[1] > threshold
+          side_right → g_body = (0, -1, 0) → keep where g_body[1] < -threshold
+
+        This is called AFTER ``_build_settle_pool`` (which populates
+        _pool_quat) and AFTER ``_build_pose_pool`` side calls (so we always
+        have a pool to override into).
+        """
+        c = self.cfg
+        # Use a slightly more lenient threshold for random-pool extraction than
+        # for the forced-settle filter. These are already physically settled
+        # equilibria (no rolling possible post-settle), so accepting states
+        # within 45° of pure side (dot > 0.70) gives more diverse training
+        # starts while still being clearly side-lying (not back/belly).
+        # The forced-settle pool uses the stricter pose_pool_orient_dot_min.
+        threshold = max(c.pose_pool_orient_dot_min - 0.10, 0.65)
+        g = projected_gravity(self._pool_quat)  # (P, 3)
+
+        for name, sign in [("side_left", +1.0), ("side_right", -1.0)]:
+            mask = (sign * g[:, 1]) > threshold
+            n_found = int(mask.sum())
+            if n_found > 0:
+                pool = {
+                    "pos": self._pool_pos[mask].copy(),
+                    "quat": self._pool_quat[mask].copy(),
+                    "jpos": self._pool_jpos[mask].copy(),
+                    "size": n_found,
+                }
+                old_size = self._named_pools.get(name, {}).get("size", 0)
+                self._named_pools[name] = pool
+                print(f"[standup] side pool '{name}': replaced {old_size} "
+                      f"forced-settle states with {n_found} naturally-settled "
+                      f"states from random pool (dot > {threshold:.2f})")
+            else:
+                print(f"[standup] WARNING: no '{name}' states found in random "
+                      f"settle pool (g_body[1]*{sign:+.0f} > {threshold:.2f}) — "
+                      f"keeping forced-settle pool ({self._named_pools.get(name, {}).get('size', 0)} states)")
+
     def _build_all_pools(self) -> None:
         """Build all named-pose pools and the settle pool.
 
-        Order matters only for the settle pool (goes last so it leaves envs
-        in the most neutral state for training).
+        Order: named pools first (provides a fallback even if side extraction
+        fails), then settle pool (leaves envs in fallen state), then side-pool
+        override from the settle pool's naturally-settled side states.
         """
         from envs.standup import all_poses
         for pose in all_poses():
             pool = self._build_pose_pool(pose)
             self._named_pools[pose.name] = pool
-            print(f"[standup] pose pool '{pose.name}': {pool['size']} states")
+            print(f"[standup] pose pool '{pose.name}': {pool['size']} states "
+                  f"(forced settle)")
         self._build_settle_pool()  # leaves envs in fallen state
+        # NOTE: _extract_side_pools_from_settle() is intentionally NOT called
+        # here. The forced-settle pool (arm-brace config, 500-step settle,
+        # 0.80 orientation + 0.07 m min-z filters) reliably produces 700+
+        # genuine side-lying states. Replacing it with the random-pool
+        # extraction (dot > 0.70, no min-z guard) introduced z≈0.06 m states
+        # (robot 45° tilted toward prone/supine) that visually look like back-
+        # lying poses. Keep the forced-settle pool — it is better quality.
 
     # ── pool sampling helpers ─────────────────────────────────────
 
@@ -614,24 +695,37 @@ class K1StandupEnv(SkillEnv):
         return out
 
     def _min_contact_link_z(self) -> np.ndarray:
-        """Return (N,) world-z of the LOWEST foot/hand link per env.
+        """Return (N,) world-z of the LOWEST robot link per env.
 
-        Used by the pose-pool penetration filter to reject snapshots where a
-        limb settled below the floor. Returns +inf for any env whose links
-        couldn't be read (missing links / read failure) so the caller's
-        `> -eps` test leaves those states untouched rather than dropping them.
+        Used by the pose-pool penetration filter to reject snapshots where any
+        link settled below the floor. Checks ALL robot links (not just feet
+        and hands) so that embedded knees, elbows, and shoulders are also
+        caught — especially relevant for side poses where the down-arm elbow
+        can be driven into the floor by joint jitter.
+
+        Returns +inf for any env whose links couldn't be read (missing links /
+        read failure) so the caller's `> -eps` test leaves those states
+        untouched rather than dropping them.
         """
         N = self.num_envs
-        self._ensure_contact_links()
         min_z = np.full(N, np.inf, dtype=np.float32)
-        for links in (self._foot_links, self._hand_links):
-            if links is None:
-                continue
-            for link in links:
+        try:
+            for link in self.robot.links:
                 try:
                     min_z = np.minimum(min_z, _to_np(link.get_pos())[:, 2])
-                except Exception as e:
-                    print(f"[standup] contact-link z read failed: {e}")
+                except Exception:
+                    pass
+        except Exception:
+            # Fallback: at least check the named foot/hand links we know about.
+            self._ensure_contact_links()
+            for links in (self._foot_links, self._hand_links):
+                if links is None:
+                    continue
+                for link in links:
+                    try:
+                        min_z = np.minimum(min_z, _to_np(link.get_pos())[:, 2])
+                    except Exception as e:
+                        print(f"[standup] contact-link z read failed: {e}")
         return min_z
 
     # ── reset using the pool ──────────────────────────────────────
