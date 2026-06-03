@@ -72,13 +72,16 @@ class StandupPose:
     trunk_height: float  # initial Z of trunk so it's roughly resting on
                          # the carpet (trunk thickness ~0.10m)
     # Vertical clearance (m) ADDED to trunk_height at spawn, before the
-    # robot free-falls and settles. 0.05 is fine for back/front lying where
-    # the trunk thickness is the lowest point. SIDE poses splay the down-arm
-    # well below the trunk centre, so spawning at +0.05 buries that arm in
-    # the floor — the PD then holds it embedded through the settle and the
-    # snapshot captures an arm-in-ground state. Side poses raise this so the
-    # whole body (arm included) starts above the floor and settles cleanly.
-    spawn_clearance: float = 0.05
+    # robot free-falls and settles. A limb that hangs more than this below
+    # the trunk centre spawns INSIDE the floor — the PD then holds it
+    # embedded through the settle and the snapshot captures a limb-in-ground
+    # state (which, replayed at reset, pins the limb and corrupts the contact
+    # reward). SIDE poses splay the down-arm far below the trunk → 0.30.
+    # BACK/FRONT poses don't splay an arm, but the large pool quat/joint
+    # noise (±17°) can still rotate a foot well below the trunk centre, so a
+    # tiny 0.05 clearance is NOT safe — use ≥0.12 (default below) and let the
+    # pose-pool penetration filter reject any residual buried-limb snapshots.
+    spawn_clearance: float = 0.13
 
 
 def supine() -> StandupPose:

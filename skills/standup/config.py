@@ -307,6 +307,16 @@ class StandupConfig:
     # and likewise that supine/prone pools stay in-class. 0.5 ≈ within 60° of
     # nominal; raise toward 0.7 (~45°) to be stricter, lower for more variety.
     pose_pool_orient_dot_min: float = 0.5
+    # Penetration guard for named-pose pools. After settling, reject any
+    # snapshot where a foot/hand link sits below `-this` (m). Large quat/joint
+    # noise can rotate a limb under the spawn clearance; the PD then holds it
+    # embedded through the settle and the snapshot captures a limb-in-ground
+    # state (see StandupPose.spawn_clearance). Replayed at reset, the buried
+    # limb is pinned (penetration + friction) → the robot can't free that leg,
+    # and the negative contact-z corrupts the feet-grounded / under-base reward
+    # signals. A cleanly resting foot link sits at ≈+0.02 m, so -0.01 rejects
+    # only genuinely penetrating states.
+    pose_pool_penetration_eps: float = 0.01
 
     # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50

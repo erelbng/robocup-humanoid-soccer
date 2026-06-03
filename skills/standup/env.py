@@ -397,9 +397,16 @@ class K1StandupEnv(SkillEnv):
             # pose's nominal direction, else the robot rolled into a different
             # lying class (the side→back/belly drift) and must be dropped.
             class_dot = projected_gravity(q) @ g_expected     # (N,)
+            # Penetration gate: the lowest foot/hand link must sit above the
+            # floor (within -eps). Large quat/joint noise can rotate a limb
+            # under the spawn clearance and the PD holds it embedded through
+            # the settle; replaying such a snapshot pins the limb in the ground
+            # and feeds negative contact-z into the reward. Reject it.
+            min_contact_z = self._min_contact_link_z()
             ok = ((p[:, 2] < max_z)
                   & (up < c.pool_max_upright)
-                  & (class_dot > c.pose_pool_orient_dot_min))
+                  & (class_dot > c.pose_pool_orient_dot_min)
+                  & (min_contact_z > -c.pose_pool_penetration_eps))
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -605,6 +612,27 @@ class K1StandupEnv(SkillEnv):
         except Exception as e:
             print(f"[standup] foot pos read failed: {e}")
         return out
+
+    def _min_contact_link_z(self) -> np.ndarray:
+        """Return (N,) world-z of the LOWEST foot/hand link per env.
+
+        Used by the pose-pool penetration filter to reject snapshots where a
+        limb settled below the floor. Returns +inf for any env whose links
+        couldn't be read (missing links / read failure) so the caller's
+        `> -eps` test leaves those states untouched rather than dropping them.
+        """
+        N = self.num_envs
+        self._ensure_contact_links()
+        min_z = np.full(N, np.inf, dtype=np.float32)
+        for links in (self._foot_links, self._hand_links):
+            if links is None:
+                continue
+            for link in links:
+                try:
+                    min_z = np.minimum(min_z, _to_np(link.get_pos())[:, 2])
+                except Exception as e:
+                    print(f"[standup] contact-link z read failed: {e}")
+        return min_z
 
     # ── reset using the pool ──────────────────────────────────────
 
