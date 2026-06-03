@@ -58,7 +58,7 @@ is a regular PPO policy and works fine in eval.
 | **Assist-force curriculum** | Decaying upward "support" force on the trunk (HoST's infant-support trick) — the primary exploration aid. Lets the policy reach the standing pose while assisted, then weans to zero | `env._assist_wrench`, `env._current_assist_fraction` |
 | **Two-stage reward** | `reward_stage="discovery"` zeroes motion regularizers so the policy can find ANY standup; `"deploy"` re-enables them for a smooth motion (HumanUP: early regularization blocks discovery) | `config.discovery_weights`, `env._reward_weights` |
 | **Multi-critic PPO** | One value head per reward group (task/reg/success) — single critic over the mixed reward fails (HoST) | `rewards.STANDUP_CRITIC_GROUPS`, `ppo.train_ppo_multicritic_vec` |
-| Easy pool + reverse curriculum | Near-standing starts that ramp out as training progresses. **Off by default** (`easy_pool_enabled=False`) — superseded by the assist-force curriculum, which changes task difficulty rather than just start state. Running both confounds the experiment | `env._build_easy_pool`, `env._current_easy_fraction` |
+| Pose difficulty curriculum (L0–L2) | Discrete start-pose curriculum: L0 supine+prone → L1 all 4 named poses → L2 named+random-fallen mix. Advances on sustained EMA success | `config.pose_level_thresholds`, `env._sample_reset_from_level`, `env._maybe_advance_level` |
 | Contact obs (8 dims) | Foot/hand z + contact bool — tells the policy what's on the floor. **Privileged in sim2real.** | `env._read_contact_state` |
 | `upright_progress` reward | Pays per step for `Δup > 0` — breaks the side-plank attractor | `rewards.compute_standup_reward` |
 | `near_upright_gate` | Motion penalties only fire in the final balancing zone (up ∈ [0.7, 0.95]) | `rewards.near_upright_gate` |
@@ -269,7 +269,7 @@ Key signals, in order of "if this isn't trending right, something is broken":
 
 6. **`rewards/near_upright_gate`** — average gate activation. Rises with `mean_robot_z`; useful to confirm motion penalties are actually firing once balancing is reached.
 
-7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** / **`rewards/easy_start_fraction`** — the four curriculum knobs. Should ramp linearly 15→50, 0.80→0.92, 0.40→0.55, and 1.0→0.0 over the first ~25M env-steps. Use them to confirm the curricula are advancing as expected. Early in training `mean_robot_z` should be HIGH (~0.55) because most episodes start standing — this is the expected curriculum effect, not the policy succeeding from fallen starts. Watch for `mean_robot_z` and `upright_raw` STAYING high as `easy_start_fraction` drops; that's the signal the policy has learned to stand up.
+7. **`rewards/hold_steps_current`** / **`rewards/upright_threshold_current`** / **`rewards/target_height_current`** / **`rewards/pose_curriculum_level`** — the curriculum knobs. The first three ramp linearly 15→50, 0.80→0.92, 0.40→0.55 over the first ~25M env-steps; `pose_curriculum_level` steps 0→2 as the EMA success rate clears each `pose_level_thresholds` entry. Use them to confirm the curricula are advancing as expected.
 
 8. **`rewards/foot_grounded_up`** / **`rewards/mean_foot_z`** — anti-gaming signal in [0, 1]. Should climb from 0 toward 1.0 as the policy learns to put feet down with trunk lifted. If it stays near 0 while `upright` and `height` rise, the policy is gaming the dense terms with a bridge / sprawled pose — exactly the failure this term is designed to close. `mean_foot_z` is the mean of both feet z; should drop toward `foot_grounded_max_z` (0.10) and stay there once standing.
 
@@ -308,14 +308,13 @@ Three independent curricula tighten the success criteria from "reachable from a 
 - `time_to_stand_tau_steps=150` (3.0 s) — sets the shape of the terminal speed bonus. With τ=150 a 1 s stand pays ~330, 2 s ~150, 3 s ~100. The previous τ=40 decayed so fast that 3 s standups paid only ~9, less than the side-plank attractor.
 - Settle-pool params (`spawn_height_*`, `settle_steps`, `settle_pool_rounds`) — already tuned to give ~120 diverse fallen states at `vec_num_envs=32` and ~3800 at 1024.
 
-### Reverse curriculum on initial pose distribution
+### Pose difficulty curriculum
 
-- `easy_pool_enabled=True` — toggles the second initial-pose pool.
-- `start_curriculum_env_steps=25_000_000` — env-steps over which the easy-start fraction ramps from 1.0 → 0.0. Tune up (e.g. 50M) if you want the policy to spend more time learning "maintain standing" before recovering from harder falls.
-- `easy_pool_height=0.60` — spawn height for the easy pool; let it settle to standing.
-- `easy_pool_tilt_max=0.15` (rad, ~8°) — max initial trunk tilt.
-- `easy_pool_joint_jitter=0.10` (rad) — joint perturbation around the default standing pose.
-- `easy_pool_min_height=0.40` / `easy_pool_min_upright=0.70` — pool filter: only keep states that DIDN'T fall during the brief settle. Loosen if too many states get filtered out.
+- `pose_curriculum_enabled=True` — toggles the discrete L0–L2 start-pose curriculum.
+- `pose_curriculum_start_level=0` — set to 2 to train directly on the full mixed distribution (no ramp).
+- `pose_level_thresholds=(0.50, 0.60)` — EMA success rate required to advance L0→L1 and L1→L2.
+- `pose_advance_sustain_steps=1_000_000` — cumulative env-steps the EMA must stay above threshold before advancing.
+- `pose_mix_random_frac=0.50` — at L2, fraction of starts drawn from the random fallen pool (rest from the 4 named poses).
 
 ### Things you might reasonably tune
 - `upright_progress` (default 5.0) — bump higher (8–10) if the policy is still getting stuck in side-plank-like local minima.

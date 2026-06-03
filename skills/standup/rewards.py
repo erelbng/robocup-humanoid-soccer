@@ -62,6 +62,34 @@ def height_signal(root_z: np.ndarray, target: float = 0.55,
 # ─── stability penalties ──────────────────────────────────────────────
 
 
+def explosive_rise_signal(root_lin_vel: np.ndarray, root_z: np.ndarray,
+                          upright: np.ndarray,
+                          target_h: float = 0.55,
+                          v_cap: float = 0.8) -> np.ndarray:
+    """Reward in [0, 1] for moving the trunk UPWARD fast WHILE still low.
+
+    This is the direct "explosive rise" carrot the rest of the reward was
+    missing: `upright_progress` only pays for orientation change (rate-capped,
+    speed-independent total) and the speed signal is indirect (opportunity
+    cost + a terminal time bonus). This term pays per-step for a high positive
+    vertical trunk velocity during the recovery, which is exactly the snappy
+    hip/knee extension in the reference fast-standup.
+
+    Three multiplicative gates keep it honest:
+      * `rise`    — clip(v_z, 0, v_cap)/v_cap: upward only (no credit for
+                    falling), and CAPPED so a destabilising ballistic launch
+                    can't out-earn a controlled fast push.
+      * `deficit` — (target − z)/target: 1 when fully fallen, 0 at standing
+                    height, so it can't be farmed by bouncing once already up.
+      * `early`   — 1 − near_upright_gate(up): fades out as the robot nears
+                    upright, leaving the final balance to the stability terms.
+    """
+    rise = np.clip(root_lin_vel[:, 2], 0.0, v_cap) / max(v_cap, 1e-6)
+    deficit = np.clip((target_h - root_z) / max(target_h, 1e-6), 0.0, 1.0)
+    early = 1.0 - near_upright_gate(upright)
+    return (rise * deficit * early).astype(np.float32)
+
+
 def base_ang_vel_sway(ang_vel: np.ndarray) -> np.ndarray:
     """ωx² + ωy² — roll/pitch rate. Direct penalty on front/back +
     left/right sway. Yaw rate is intentionally ignored — robot may need
@@ -107,6 +135,43 @@ def _feet_grounded_score(foot_z: np.ndarray,
     foot_r = np.clip(1.0 - foot_z[:, 1] / max(foot_max_z, 1e-6),
                      0.0, 1.0)
     return foot_l * foot_r
+
+
+def feet_under_base_score(foot_xy: np.ndarray, base_xy: np.ndarray,
+                           d_max: float = 0.40) -> np.ndarray:
+    """Multiplicative AND in [0, 1] of how close each foot is to being
+    directly UNDER the base in the world horizontal plane.
+
+    This is the signal that `_feet_grounded_score` is missing: that score
+    rewards feet being LOW (z≈0), which a prone / cobra / push-up / L-sit
+    pose satisfies trivially with its legs splayed FLAT on the floor — the
+    feet are on the ground, but the robot is lying on them, not standing on
+    them. When the robot actually stands, both feet sit roughly beneath the
+    base (horizontal offset ≈ stance half-width, ~0.15 m); when the legs are
+    extended flat they are ~0.4–0.6 m away horizontally. Smooth ramp → 1 at
+    d=0 (foot under base), → 0 at d≥d_max, so PPO gets a gradient that pulls
+    the feet inward rather than a hard wall.
+    """
+    # foot_xy: (N, 2, 2) [foot, xy]; base_xy: (N, 2)
+    d = np.linalg.norm(foot_xy - base_xy[:, None, :], axis=2)  # (N, 2)
+    score = np.clip(1.0 - d / max(d_max, 1e-6), 0.0, 1.0)
+    return (score[:, 0] * score[:, 1]).astype(np.float32)
+
+
+def standing_on_feet_mask(foot_z: np.ndarray, foot_xy: np.ndarray,
+                           base_xy: np.ndarray,
+                           foot_max_z: float = 0.12,
+                           under_base_max_d: float = 0.25) -> np.ndarray:
+    """Hard boolean: both feet on the ground AND both feet under the base.
+
+    Used to GATE success detection so the success bonus / post-success
+    standing reward can only be farmed from a genuine feet-under-body stand,
+    never from an assist-propped cobra / L-sit that games upright + height
+    while the legs lie flat and splayed."""
+    grounded = (foot_z[:, 0] < foot_max_z) & (foot_z[:, 1] < foot_max_z)
+    d = np.linalg.norm(foot_xy - base_xy[:, None, :], axis=2)  # (N, 2)
+    under = (d[:, 0] < under_base_max_d) & (d[:, 1] < under_base_max_d)
+    return (grounded & under)
 
 
 def _upright_factor(upright: np.ndarray) -> np.ndarray:
@@ -189,11 +254,22 @@ def near_upright_gate(upright: np.ndarray,
 
 def success_frame_mask(quat: np.ndarray, root_z: np.ndarray,
                        target_h: float = 0.55,
-                       upright_threshold: float = 0.92) -> np.ndarray:
+                       upright_threshold: float = 0.92,
+                       feet_ok: np.ndarray = None) -> np.ndarray:
     """Per-frame 'looks standing' boolean. The env composes this with
-    a streak counter to require sustained success."""
-    return ((upright_signal(quat) > upright_threshold)
+    a streak counter to require sustained success.
+
+    `feet_ok` (optional) is the hard `standing_on_feet_mask` — when
+    provided, the frame only counts as success if the robot is ALSO
+    standing on its feet (feet grounded + under the base). This stops the
+    upright+height conditions from being farmed by an assist-propped
+    cobra / L-sit, which would otherwise collect the +400 success bonus
+    and the post-success standing reward without ever standing up."""
+    mask = ((upright_signal(quat) > upright_threshold)
             & (root_z > target_h - 0.10))
+    if feet_ok is not None:
+        mask = mask & feet_ok
+    return mask
 
 
 # ─── composite ────────────────────────────────────────────────────────
@@ -216,7 +292,9 @@ def compute_standup_reward(
     achieved_sustained: np.ndarray,  # (N,) bool — streak has reached threshold at some point this episode
     step_count: np.ndarray,          # (N,) int — control steps since reset
     foot_z: np.ndarray,              # (N, 2) world-frame z of left/right foot
-    weights,
+    foot_xy: np.ndarray = None,      # (N, 2, 2) world-frame xy of left/right foot
+    feet_ok: np.ndarray = None,      # (N,) bool — standing_on_feet_mask (success gate)
+    weights=None,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
     default_joint_pos: np.ndarray = None,
     target_height: float = 0.55,
@@ -227,6 +305,8 @@ def compute_standup_reward(
     trunk_up_min_z: float = 0.30,
     standing_tall_min_z: float = 0.30,
     standing_tall_max_z: float = 0.55,
+    feet_under_base_soft_d: float = 0.40,
+    explosive_rise_v_cap: float = 0.8,
     control_dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray, dict, dict]:
     """Returns (reward[N], frame_success[N] bool, components, group_rewards).
@@ -273,6 +353,15 @@ def compute_standup_reward(
     # only awarded for genuine forward progress.
     progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
 
+    # Explosive-rise shaping — direct per-step reward for a fast upward trunk
+    # velocity while still low. Drives the snappy hip/knee extension of the
+    # reference fast-standup that the (rate-capped, speed-independent)
+    # `progress` term doesn't pay for. Gated to the recovery phase + capped so
+    # it can't be farmed by bouncing or a destabilising ballistic launch.
+    rise = explosive_rise_signal(
+        root_lin_vel, root_pos[:, 2], up,
+        target_h=target_height, v_cap=explosive_rise_v_cap)
+
     # Arm-pose deviation — drives the final standing pose to "arms
     # hanging at the sides" (the corrected K1 default with shoulder
     # rolls at ±π/2). Phase-gated on [0.5, 0.85] so arms stay free
@@ -287,10 +376,13 @@ def compute_standup_reward(
                                         default_joint_pos) * arm_gate
 
     # Per-frame "looks standing" — env will count consecutive frames.
+    # Gated by feet_ok (feet grounded + under base) so the post-success
+    # standing reward below can't be farmed from an assist-propped cobra.
     frame_success = success_frame_mask(
         root_quat, root_pos[:, 2],
         target_h=target_height,
         upright_threshold=upright_threshold,
+        feet_ok=feet_ok,
     )
 
     # Hold-window persistence: pay while currently in the streak but not
@@ -327,17 +419,30 @@ def compute_standup_reward(
     # gets partial upright + height credit without putting its feet on
     # the floor. Smooth multiplicative gate provides gradient toward the
     # threshold even before satisfying it.
+    # Feet-under-base gate: the missing discriminator between "standing on
+    # its feet" and "lying with its feet flat". Multiplied into BOTH stand-
+    # on-feet rewards so a cobra / push-up / L-sit (legs splayed flat, feet
+    # at z≈0 but ~0.5 m behind the base) earns ~0 here even though
+    # `_feet_grounded_score` alone would pay it full credit. Smooth ramp so
+    # the policy still gets a gradient that pulls its feet inward. Defaults
+    # to 1.0 (no-op) when foot_xy is unavailable.
+    if foot_xy is not None:
+        under_base = feet_under_base_score(
+            foot_xy, root_pos[:, :2], d_max=feet_under_base_soft_d)
+    else:
+        under_base = np.ones(root_pos.shape[0], dtype=np.float32)
+
     foot_up = foot_grounded_up_signal(
         foot_z, root_pos[:, 2], up,
         foot_max_z=foot_grounded_max_z,
         trunk_min_z=trunk_up_min_z,
-    )
+    ) * under_base
     tall = standing_tall_signal(
         foot_z, root_pos[:, 2], up,
         foot_max_z=foot_grounded_max_z,
         trunk_min_z=standing_tall_min_z,
         trunk_max_z=standing_tall_max_z,
-    )
+    ) * under_base
 
     w = weights
 
@@ -349,6 +454,7 @@ def compute_standup_reward(
         w.upright * up_pos
         + w.height * h
         + w.upright_progress * progress
+        + w.explosive_rise * rise
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
     ).astype(np.float32)
@@ -374,6 +480,8 @@ def compute_standup_reward(
         "upright": float(np.mean(up_pos)),
         "upright_raw": float(np.mean(up)),
         "upright_progress": float(np.mean(progress)),
+        "explosive_rise": float(np.mean(rise)),
+        "mean_rise_vel_z": float(np.mean(root_lin_vel[:, 2])),
         "arm_pose_dev": float(np.mean(arm_dev)),
         "arm_gate": float(np.mean(arm_gate)),
         "height": float(np.mean(h)),
@@ -390,6 +498,7 @@ def compute_standup_reward(
         "post_success_standing": float(np.mean(post_success)),
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
+        "feet_under_base": float(np.mean(under_base)),
         "mean_foot_z": float(np.mean(foot_z)),
         "time_bonus_mean": float(np.mean(time_bonus_scale * sustained_now)),
         "mean_robot_z": float(np.mean(root_pos[:, 2])),
