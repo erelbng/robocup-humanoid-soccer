@@ -124,22 +124,6 @@ class K1StandupEnv(SkillEnv):
         super().__init__(**kwargs)
         self.MAX_EPISODE_STEPS = self.cfg.max_episode_steps
 
-        # Standup-only leg PD gains: override the soft shared defaults (kp=40,
-        # tuned for walk) with stiffer Booster-style gains so the policy has the
-        # control authority to balance on extended legs and push to standing.
-        # Mutating this process's robot_cfg only (each skill trains in its own
-        # process); read later by SkillEnv._build_per_joint_gains at scene build.
-        # Arms/head keep the shared defaults.
-        self.robot_cfg.kp_hip = self.cfg.kp_hip
-        self.robot_cfg.kp_knee = self.cfg.kp_knee
-        self.robot_cfg.kp_ankle = self.cfg.kp_ankle
-        self.robot_cfg.kd_hip = self.cfg.kd_hip
-        self.robot_cfg.kd_knee = self.cfg.kd_knee
-        self.robot_cfg.kd_ankle = self.cfg.kd_ankle
-        print(f"[standup] leg gains overridden: kp hip/knee/ankle="
-              f"{self.cfg.kp_hip:.0f}/{self.cfg.kp_knee:.0f}/{self.cfg.kp_ankle:.0f} "
-              f"kd={self.cfg.kd_hip:.0f}/{self.cfg.kd_knee:.0f}/{self.cfg.kd_ankle:.0f}")
-
         # Settle pool — built lazily on first reset (needs scene + robot).
         self._pool_pos: Optional[np.ndarray] = None
         self._pool_quat: Optional[np.ndarray] = None
@@ -221,6 +205,39 @@ class K1StandupEnv(SkillEnv):
 
     def _make_command_spec(self) -> CommandSpec:
         return CommandSpec.empty()
+
+    # ── K1-accurate frequency-based leg gains ──────────────────────────
+    def _build_per_joint_gains(self):
+        """Per-joint LEG gains matching Booster's real K1 Isaac config
+        (booster_train): kp = armature·(2π·f_n)², kd = 2·ζ·armature·(2π·f_n),
+        f_n in Hz. Computed from the (K1-accurate) per-joint armatures, so the
+        legs get K1's true gains (~kp hip-pitch 30 / knee 60 / ankle 36) instead
+        of the wrong flat kp=40 (runs #1-5) or T1's too-stiff kp=200 (run #6).
+        Arms/head keep the K1RobotConfig group gains (via super())."""
+        kp, kd = super()._build_per_joint_gains()
+        if not getattr(self.cfg, "use_frequency_gains", False):
+            return kp, kd
+        arm = self._build_armature()
+        w = 2.0 * np.pi * float(self.cfg.gain_natural_freq_hz)
+        shown = {}
+        for i, name in enumerate(self.robot_cfg.joint_names):
+            if i >= len(kp):
+                break
+            lo = name.lower()
+            if not (("hip" in lo) or ("knee" in lo) or ("ankle" in lo)):
+                continue
+            zeta = (self.cfg.gain_damping_ratio_knee if "knee" in lo
+                    else self.cfg.gain_damping_ratio_leg)
+            kp[i] = float(arm[i] * w * w)
+            kd[i] = float(2.0 * zeta * arm[i] * w)
+            if name.startswith("Left_"):
+                shown[name.replace("Left_", "")] = (round(kp[i], 1),
+                                                    round(kd[i], 2))
+        print(f"[standup] K1 frequency-based leg gains "
+              f"(f_n={self.cfg.gain_natural_freq_hz} Hz, ζ leg/knee="
+              f"{self.cfg.gain_damping_ratio_leg}/{self.cfg.gain_damping_ratio_knee}) "
+              f"kp,kd = {shown}")
+        return kp, kd
 
     # ── deployability accounting (used by distillation) ──────────
 

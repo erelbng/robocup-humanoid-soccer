@@ -343,21 +343,21 @@ class StandupConfig:
     recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
     recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
 
-    # ── Standup-only leg PD gains (override K1RobotConfig) ───────────────────
-    # The shared default is kp=40 on all legs — lowered from 200 for WALK
-    # sim2real, but far too soft for standup: at kp=40 the policy needs a ~1 rad
-    # joint error to command meaningful torque, so it can't make the fast,
-    # precise corrections needed to balance on extended legs (runs #1-5 all
-    # collapsed even from a stable crouch). Booster's own booster_gym T1 config
-    # uses kp 200/200/50, kd 5/5/1 — restore that for standup ONLY (applied to
-    # this process's robot_cfg in K1StandupEnv.__init__; walk keeps kp=40).
-    # Arms/head keep the shared defaults.
-    kp_hip: float = 200.0
-    kp_knee: float = 200.0
-    kp_ankle: float = 50.0
-    kd_hip: float = 5.0
-    kd_knee: float = 5.0
-    kd_ankle: float = 1.0
+    # ── Standup leg gains: frequency-based, matching Booster's real K1 ───────
+    # Booster's own K1 Isaac config (booster_train assets/robots/booster.py +
+    # actuator.py) does NOT use a flat kp — it derives per-joint gains from a
+    # natural frequency + damping ratio and the joint's reflected inertia:
+    #     kp = armature · (2π·f_n)²        kd = 2·ζ·armature·(2π·f_n)   (f_n in Hz)
+    # with f_n=4 Hz, ζ=1.5 (hip/ankle) / 1.0 (knee). Because our K1RobotConfig
+    # armatures already match Booster's actuator classes, computing kp/kd from
+    # them reproduces K1's REAL gains: ~kp hip-pitch 30 / knee 60 / ankle 36
+    # (vs the wrong flat kp=40 of runs #1-5 and the way-too-stiff T1 kp=200 of
+    # run #6). Applied to legs only in K1StandupEnv._build_per_joint_gains;
+    # arms/head keep the K1RobotConfig group gains.
+    use_frequency_gains: bool = True
+    gain_natural_freq_hz: float = 4.0
+    gain_damping_ratio_leg: float = 1.5
+    gain_damping_ratio_knee: float = 1.0
 
     # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
     # require knowing the absolute floor position — privileged info the
