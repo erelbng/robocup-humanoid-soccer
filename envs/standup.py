@@ -96,6 +96,13 @@ class StandupPose:
     # tiny 0.05 clearance is NOT safe — use ≥0.12 (default below) and let the
     # pose-pool penetration filter reject any residual buried-limb snapshots.
     spawn_clearance: float = 0.13
+    # When True, the pool build overrides the arm joint TARGETS with wide
+    # uniform-random values (within URDF joint limits) per env per round,
+    # producing diverse arm configurations (crossed / one-up-one-down / bent /
+    # twisted). The settle physics + penetration/orientation filters cull any
+    # invalid result. The arm entries in `joint_targets` then act only as a
+    # harmless fallback. Used by prone (see prone()).
+    arm_random: bool = False
 
 
 def supine() -> StandupPose:
@@ -112,7 +119,11 @@ def prone() -> StandupPose:
     # body-frame g_x = +1 (front faces the floor). Paired with the
     # arms-forward joint preset — the push-up-ready prone start.
     q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
-    return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13)
+    # arm_random: the pool build samples the 8 arm joints uniformly within
+    # their limits so prone starts show many arm configurations (crossed,
+    # one up one down, bent, twisted) rather than the single _POSE_PRONE arms.
+    return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13,
+                       arm_random=True)
 
 
 # ── Side-pose joint targets ──────────────────────────────────────────────

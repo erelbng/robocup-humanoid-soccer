@@ -174,9 +174,14 @@ def run(args):
             is_side = pool_name.startswith("side_")
             steps = (cfg.pose_pool_side_settle_steps if is_side
                      else cfg.pose_pool_settle_steps)
-            rounds = (cfg.pose_pool_side_rounds if is_side
-                      else cfg.pose_pool_rounds)
-            settle_info = f"settle={steps} steps × {rounds} rounds"
+            if is_side:
+                rounds = cfg.pose_pool_side_rounds
+            elif pool_name == "prone":
+                rounds = cfg.pose_pool_prone_rounds
+            else:
+                rounds = cfg.pose_pool_rounds
+            arm_note = " arm-random" if pool_name == "prone" else ""
+            settle_info = f"settle={steps} steps × {rounds} rounds{arm_note}"
         print(f"[eval] pool '{pool_name}': {size} states "
               f"({settle_info}) → rendering {args.per_pool} samples")
 
