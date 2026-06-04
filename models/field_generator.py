@@ -540,8 +540,8 @@ def build_soccer_field(scene, physics_only: bool = False):
     import genesis as gs
     import math
 
-    green = gs.surfaces.Default(color=(0.10, 0.55, 0.10, 1.0), roughness=0.9)
-    white = gs.surfaces.Default(color=(1.0, 1.0, 1.0, 1.0), roughness=0.6)
+    green = gs.surfaces.Default(color=(0.18, 0.45, 0.18, 1.0), roughness=0.9)
+    white = gs.surfaces.Default(color=(0.95, 0.95, 0.95, 1.0), roughness=0.6)
     post  = gs.surfaces.Default(color=(0.95, 0.95, 0.95, 1.0), roughness=0.4)
     net   = gs.surfaces.Default(color=(0.85, 0.85, 0.85, 0.35), roughness=0.9)
 
@@ -615,6 +615,46 @@ def build_soccer_field(scene, physics_only: bool = False):
                               fixed=True, collision=False),
                 surface=white,
             )
+
+        # Penalty marks + center mark (thin discs)
+        pmr = {self.f.penalty_mark_diameter / 2}
+        scene.add_entity(
+            gs.morphs.Cylinder(radius=pmr, height=line_h,
+                               pos=(0, 0, line_z), fixed=True, collision=False),
+            surface=white,
+        )
+        for sign in [1, -1]:
+            scene.add_entity(
+                gs.morphs.Cylinder(radius=pmr, height=line_h,
+                                   pos=(sign * ({hl} - {self.f.penalty_mark_distance}), 0, line_z),
+                                   fixed=True, collision=False),
+                surface=white,
+            )
+
+        # Corner arcs (quarter circles at the 4 corners)
+        car = {self.f.corner_arc_radius}
+        n_carc = 10
+        for sx in [1, -1]:
+            for sy in [1, -1]:
+                a_start = math.atan2(-sy, 0)
+                a_end = a_start - sx * sy * math.pi / 2
+                for k in range(n_carc):
+                    t0 = a_start + (a_end - a_start) * k / n_carc
+                    t1 = a_start + (a_end - a_start) * (k + 1) / n_carc
+                    x0 = sx * {hl} + car * math.cos(t0)
+                    y0 = sy * {hw} + car * math.sin(t0)
+                    x1 = sx * {hl} + car * math.cos(t1)
+                    y1 = sy * {hw} + car * math.sin(t1)
+                    cxa, cya = (x0 + x1) / 2, (y0 + y1) / 2
+                    slen = math.hypot(x1 - x0, y1 - y0)
+                    ang = math.atan2(y1 - y0, x1 - x0)
+                    scene.add_entity(
+                        gs.morphs.Box(size=(slen, {lw}, line_h),
+                                      pos=(cxa, cya, line_z),
+                                      euler=(0, 0, ang),
+                                      fixed=True, collision=False),
+                        surface=white,
+                    )
 
     # ── Goals (collidable so the ball bounces off) ────────────────
     for sign in [1, -1]:
