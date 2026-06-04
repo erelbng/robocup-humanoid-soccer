@@ -43,6 +43,10 @@ from skills.standup.rewards import (STANDUP_CRITIC_GROUPS,
 # about its support polygon during the transition.
 _FOOT_LINK_NAMES = ("left_foot_link", "right_foot_link")
 _HAND_LINK_NAMES = ("left_hand_link", "right_hand_link")
+# Trunk (torso/base) link — for the anti-slam contact-force penalty.
+_TRUNK_LINK_NAME = "Trunk"
+# Shank (lower-leg) links — proxy for "knee/shin on the ground" support.
+_KNEE_LINK_NAMES = ("Left_Shank", "Right_Shank")
 # Soft contact threshold — link z below this is treated as in-contact.
 # 0.05 m matches typical K1 mesh offsets (feet ~0.02, hands a bit higher).
 _CONTACT_Z = 0.05
@@ -223,6 +227,12 @@ class K1StandupEnv(SkillEnv):
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
         self._hand_links = None
+        self._trunk_link_idx = None
+        self._knee_link_idx = None
+        # Episode high-water mark of the upright signal — the reference for the
+        # ratcheted progress reward (only NEW uprightness beyond the best so
+        # far is paid, killing the down→up "pump" of the dolphin slam).
+        self._max_upright = np.full(self.num_envs, -1.0, dtype=np.float32)
 
         # Reward weights for the active stage. "discovery" zeroes the motion
         # regularizers so the policy can find ANY standup; "deploy" uses the
@@ -852,12 +862,50 @@ class K1StandupEnv(SkillEnv):
         hand = [links_by_name.get(n) for n in _HAND_LINK_NAMES]
         self._foot_links = foot if all(l is not None for l in foot) else None
         self._hand_links = hand if all(l is not None for l in hand) else None
+        # Trunk + knee/shank links for the anti-slam force penalty and the
+        # knee-support credit. Stored as idx_local into the entity's
+        # net-contact-force tensor (N, n_links, 3).
+        trunk = links_by_name.get(_TRUNK_LINK_NAME)
+        self._trunk_link_idx = (trunk.idx_local if trunk is not None else None)
+        knees = [links_by_name.get(n) for n in _KNEE_LINK_NAMES]
+        self._knee_link_idx = ([k.idx_local for k in knees]
+                               if all(k is not None for k in knees) else None)
         if self._foot_links is None:
             print(f"[standup] foot links {_FOOT_LINK_NAMES} not found — "
                   "contact obs will be zeroed.")
         if self._hand_links is None:
             print(f"[standup] hand links {_HAND_LINK_NAMES} not found — "
                   "contact obs will be zeroed.")
+        if self._trunk_link_idx is None:
+            print(f"[standup] trunk link '{_TRUNK_LINK_NAME}' not found — "
+                  "trunk contact-force penalty will be zeroed.")
+        if self._knee_link_idx is None:
+            print(f"[standup] knee links {_KNEE_LINK_NAMES} not found — "
+                  "knee-support reward will be zeroed.")
+
+    def _read_contact_forces(self):
+        """Returns (trunk_force_mag (N,), knee_force_mag (N, 2)) — the net
+        ground-contact force magnitudes on the Trunk and the two shanks. Used
+        by the anti-slam penalty and the knee-support credit (privileged: a
+        reward signal, never in the policy obs). Degrades to zeros if the
+        Genesis contact-force API or the links are unavailable."""
+        N = self.num_envs
+        trunk = np.zeros(N, dtype=np.float32)
+        knees = np.zeros((N, 2), dtype=np.float32)
+        if self._trunk_link_idx is None and self._knee_link_idx is None:
+            self._ensure_contact_links()
+        try:
+            f = _to_np(self.robot.get_links_net_contact_force())  # (N, L, 3)
+            if f.ndim == 2:                      # (L, 3) single-env safety
+                f = f[None, :, :]
+            if self._trunk_link_idx is not None:
+                trunk = np.linalg.norm(f[:, self._trunk_link_idx, :], axis=1)
+            if self._knee_link_idx is not None:
+                for i, li in enumerate(self._knee_link_idx):
+                    knees[:, i] = np.linalg.norm(f[:, li, :], axis=1)
+        except Exception as e:
+            print(f"[standup] contact-force read failed: {e}")
+        return trunk.astype(np.float32), knees.astype(np.float32)
 
     def _read_contact_state(self) -> np.ndarray:
         """Returns (N, 8) addon obs:
@@ -1183,8 +1231,17 @@ class K1StandupEnv(SkillEnv):
                 # re-gets the assist bootstrap + loosened hold/upright/height
                 # criteria + a fresh mix-bias toward itself.
                 self._level_start_env_steps = self._total_env_steps_seen
+                # Re-bootstrap the HoST assist for the new pose: the assist is
+                # EMA-coupled, so without dropping the EMA here it would only
+                # come back at ~8% (the EMA is still ≈ the advance threshold).
+                # Resetting it to 0 makes the assist jump to full for the new,
+                # harder pose and re-disarms the success-ramped stand_pose term
+                # until the new pose is mastered.
+                ema_before = self._success_rate_ema
+                if self.cfg.reset_success_ema_on_level_up:
+                    self._success_rate_ema = 0.0
                 print(f"[standup] pose curriculum: L{old} → L{self._pose_level} "
-                      f"(EMA={self._success_rate_ema:.3f}); easing curricula reset")
+                      f"(EMA={ema_before:.3f}); easing curricula + assist reset")
         else:
             # EMA fell below threshold — reset sustain counter (no regression).
             self._pose_level_sustain_steps = 0
@@ -1234,6 +1291,9 @@ class K1StandupEnv(SkillEnv):
         # the robot stays upright. Cleared by _reset_skill_state.
         achieved_sustained = self._achieved_sustained | sustained_now
 
+        # Privileged contact-force reads for the anti-slam penalty + knee credit.
+        trunk_force, knee_force = self._read_contact_forces()
+
         reward, _frame_success, components, group_rewards = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
@@ -1264,6 +1324,15 @@ class K1StandupEnv(SkillEnv):
             post_success_still_jv_scale=self.cfg.post_success_still_jv_scale,
             post_success_still_v_scale=self.cfg.post_success_still_v_scale,
             feet_under_base_plateau_d=self.cfg.feet_under_base_plateau_d,
+            max_upright=self._max_upright,
+            progress_ratchet=self.cfg.progress_ratchet,
+            trunk_contact_force=trunk_force,
+            trunk_contact_force_thresh=self.cfg.trunk_contact_force_thresh,
+            trunk_contact_force_scale=self.cfg.trunk_contact_force_scale,
+            knee_contact_force=knee_force,
+            knee_contact_force_thresh=self.cfg.knee_contact_force_thresh,
+            knee_support_min_z=self.cfg.knee_support_min_z,
+            knee_support_max_z=self.cfg.knee_support_max_z,
             target_height=target_h,
             upright_threshold=upright_thresh,
             hold_steps=hold_steps,
@@ -1320,6 +1389,9 @@ class K1StandupEnv(SkillEnv):
         self._frame_success = frame_now
         self._prev_prev_action = self._last_action.copy()
         self._prev_upright = upright_signal(root_quat).astype(np.float32)
+        # Advance the episode high-water mark for the ratcheted progress reward.
+        self._max_upright = np.maximum(self._max_upright,
+                                       self._prev_upright).astype(np.float32)
 
         # Per-env group rewards (N, G) in STANDUP_CRITIC_GROUPS order —
         # consumed by the multi-critic trainer via info["group_rewards"].
@@ -1359,6 +1431,9 @@ class K1StandupEnv(SkillEnv):
             quat = _to_np(self.robot.get_quat())
             self._prev_upright[envs_idx] = upright_signal(
                 quat[envs_idx]).astype(np.float32)
+            # High-water mark starts at the reset orientation so the ratchet
+            # only pays uprightness BEYOND where the episode began.
+            self._max_upright[envs_idx] = self._prev_upright[envs_idx]
             # Anchor the on-spot penalty to the post-reset base xy.
             pos = _to_np(self.robot.get_pos())
             self._start_xy[envs_idx] = pos[envs_idx, :2].astype(np.float32)
@@ -1376,4 +1451,5 @@ class K1StandupEnv(SkillEnv):
             self._start_supine[envs_idx] = (g[:, 0] > 0.5) & bool(armed)
         except Exception:
             self._prev_upright[envs_idx] = -1.0
+            self._max_upright[envs_idx] = -1.0
             self._start_supine[envs_idx] = False

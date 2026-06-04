@@ -154,6 +154,23 @@ class StandupRewardWeights:
     # progress reward still makes the detour worthwhile.
     supine_anti_flip: float = 3.0
 
+    # ── Anti cobra/dolphin-slam terms ────────────────────────────────────
+    # Trunk contact-force penalty — suppresses the "slam the torso into the
+    # ground for momentum" exploit that would damage a real robot. Penalises
+    # the NET ground-contact force on the Trunk link ABOVE a threshold (so
+    # merely resting on the floor at the start is free, only violent impacts
+    # are taxed): (clip((‖F_trunk‖ − thresh)/scale, 0, ∞))². NOT discovery-
+    # zeroed (it must shape the get-up itself). 0 = off.
+    trunk_contact_force: float = 1.0
+
+    # Knee/shin support credit — makes a KNEE-based get-up a viable path
+    # instead of a dead end (today only FEET-grounded postures earn standing
+    # credit, so the policy never explores kneeling). Small positive bump for
+    # the shanks being in ground contact while the trunk is at kneeling height
+    # and upright-ish; fades to 0 at full standing so it never competes with
+    # standing on the feet (no kneel attractor). 0 = off.
+    knee_support: float = 2.0
+
 
 # Regularizer weights zeroed in the "discovery" reward stage. These are
 # motion-quality / deployability shaping terms — useful for a SMOOTH final
@@ -599,6 +616,42 @@ class StandupConfig:
     # free; beyond it the penalty grows quadratically. Generous enough for an
     # in-place get-up incl. a short roll, tight enough to forbid wandering.
     on_spot_tol: float = 0.6
+
+    # ── Anti-slam: trunk contact-force penalty ───────────────────────────
+    # Net Trunk contact force (N) below this is free (covers resting on the
+    # floor at spawn ≈ partial body weight); above it the penalty ramps. The
+    # robot weighs ~20 kg (≈196 N), so 280 N ≈ 1.4× weight catches genuine
+    # impacts/slams while leaving a normal rest/roll untaxed.
+    trunk_contact_force_thresh: float = 280.0
+    # Normaliser (N) for the excess force before squaring — one body weight,
+    # so an impact one body-weight over threshold contributes a penalty of 1.0.
+    trunk_contact_force_scale: float = 196.0
+
+    # ── Knee/shin support credit (StandupRewardWeights.knee_support) ─────
+    # A shank counts as "in ground contact" when its net contact force exceeds
+    # this (N). Small so light knee contact registers.
+    knee_contact_force_thresh: float = 20.0
+    # Trunk-height band (m) over which the knee bump is active: ramps in above
+    # min (off when fully fallen) and fades to 0 above max (so at standing
+    # height the feet, not the knees, carry the reward — no kneel attractor).
+    knee_support_min_z: float = 0.20
+    knee_support_max_z: float = 0.45
+
+    # ── Anti-pump: progress ratchet ──────────────────────────────────────
+    # The progress reward pays max(0, up − reference). With the ratchet ON the
+    # reference is the EPISODE high-water mark of uprightness, so re-gaining
+    # ground already covered (the down→up "pump" of the dolphin slam) earns
+    # nothing — only genuinely NEW progress is paid. OFF = the old per-step
+    # reference (rewards oscillatory pumping).
+    progress_ratchet: bool = True
+
+    # ── Assist re-bootstrap on curriculum level-up ───────────────────────
+    # On a pose-level advance, reset the success-rate EMA to 0 so the HoST
+    # assist force (which is coupled to the EMA) jumps back to full for the
+    # new, harder pose — and the stand_pose end-pose term re-disarms until the
+    # new pose is mastered. Without this the EMA stays high across the advance
+    # and the assist comes back at only ~8%.
+    reset_success_ema_on_level_up: bool = True
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000

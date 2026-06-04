@@ -364,6 +364,15 @@ def compute_standup_reward(
     post_success_still_jv_scale: float = 3.0,
     post_success_still_v_scale: float = 0.2,
     feet_under_base_plateau_d: float = 0.0,
+    max_upright: np.ndarray = None,   # (N,) episode high-water mark of upright
+    progress_ratchet: bool = True,
+    trunk_contact_force: np.ndarray = None,   # (N,) net Trunk contact-force mag
+    trunk_contact_force_thresh: float = 280.0,
+    trunk_contact_force_scale: float = 196.0,
+    knee_contact_force: np.ndarray = None,    # (N, 2) shank contact-force mags
+    knee_contact_force_thresh: float = 20.0,
+    knee_support_min_z: float = 0.20,
+    knee_support_max_z: float = 0.45,
     target_height: float = 0.55,
     upright_threshold: float = 0.92,
     hold_steps: int = 30,
@@ -415,10 +424,18 @@ def compute_standup_reward(
     # Progress shaping — pay the policy for *active* uprightening, not
     # just for being-in-state. Without this, side-plank (up≈0.7) is a
     # stable basin worth +1.9/step; the marginal gradient toward standing
-    # is too weak for PPO to commit to the risky transition. The positive-
-    # only clip avoids paying for backsliding being undone — credit is
-    # only awarded for genuine forward progress.
-    progress = np.maximum(0.0, up - prev_upright).astype(np.float32)
+    # is too weak for PPO to commit to the risky transition.
+    #
+    # RATCHET (anti-pump): the reference is the EPISODE high-water mark of
+    # uprightness (`max_upright`) rather than just last step. So re-gaining
+    # ground already covered — the down→up "pump" of the dolphin slam — earns
+    # NOTHING; only genuinely NEW progress beyond the best so far is paid. A
+    # necessary dip is still never penalised (max(0, …)), it just isn't paid
+    # twice. With the ratchet off, falls back to the per-step reference (the
+    # old behaviour that rewarded oscillatory pumping).
+    _prog_ref = (max_upright if (progress_ratchet and max_upright is not None)
+                 else prev_upright)
+    progress = np.maximum(0.0, up - _prog_ref).astype(np.float32)
 
     # Explosive-rise shaping — direct per-step reward for a fast upward trunk
     # velocity while still low. Drives the snappy hip/knee extension of the
@@ -477,6 +494,38 @@ def compute_standup_reward(
     else:
         disp = np.zeros(root_pos.shape[0], dtype=np.float32)
         on_spot_pen = np.zeros(root_pos.shape[0], dtype=np.float32)
+
+    # Trunk contact-force penalty (anti-slam) — penalise the NET ground-contact
+    # force on the Trunk ABOVE a threshold (resting on the floor is free, only
+    # impacts/slams are taxed): (clip((F − thresh)/scale, 0, ∞))². Directly
+    # discourages the "slam the torso for momentum" exploit that would damage a
+    # real robot, and is active during the get-up itself.
+    if trunk_contact_force is not None:
+        tf_excess = np.clip(
+            (trunk_contact_force - trunk_contact_force_thresh)
+            / max(trunk_contact_force_scale, 1e-6), 0.0, None)
+        trunk_force_pen = (tf_excess ** 2).astype(np.float32)
+    else:
+        trunk_force_pen = np.zeros(root_pos.shape[0], dtype=np.float32)
+
+    # Knee/shin support credit — a small POSITIVE bump for the shanks being in
+    # ground contact while the trunk is at kneeling height and upright-ish, so
+    # a knee-based get-up is a viable path rather than a dead end (today only
+    # FEET-grounded postures earn standing credit). Fades to 0 at full standing
+    # height (the feet then carry the reward) → no kneel attractor.
+    if knee_contact_force is not None:
+        knee_contact = (knee_contact_force > knee_contact_force_thresh
+                        ).astype(np.float32)
+        knee_grounded = knee_contact.mean(axis=1)        # 0, 0.5 or 1
+        z = root_pos[:, 2]
+        z_ramp = np.clip((z - knee_support_min_z)
+                         / max(0.10, 1e-6), 0.0, 1.0)     # in above min
+        z_fade = 1.0 - np.clip((z - knee_support_max_z)
+                               / max(0.10, 1e-6), 0.0, 1.0)  # out above max
+        knee_support = (knee_grounded * z_ramp * z_fade
+                        * _upright_factor(up)).astype(np.float32)
+    else:
+        knee_support = np.zeros(root_pos.shape[0], dtype=np.float32)
 
     # Per-frame "looks standing" — env will count consecutive frames.
     # Gated by feet_ok (feet grounded + under base) so the post-success
@@ -590,7 +639,9 @@ def compute_standup_reward(
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
         + w.stand_pose * stand_pose
+        + w.knee_support * knee_support
         - w.on_spot * on_spot_pen
+        - w.trunk_contact_force * trunk_force_pen
         - w.supine_anti_flip * supine_flip_pen
     ).astype(np.float32)
     r_reg = (
@@ -639,6 +690,10 @@ def compute_standup_reward(
         "post_success_still": float(np.mean(post_success_still)),
         "on_spot_pen": float(np.mean(on_spot_pen)),
         "mean_base_disp": float(np.mean(disp)),
+        "knee_support": float(np.mean(knee_support)),
+        "trunk_force_pen": float(np.mean(trunk_force_pen)),
+        "mean_trunk_force": float(np.mean(trunk_contact_force))
+        if trunk_contact_force is not None else 0.0,
         "stand_pose_scale": float(pose_scale),
         "supine_anti_flip": float(np.mean(supine_flip_pen)),
         "feet_under_base": float(np.mean(under_base)),
