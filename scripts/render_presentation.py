@@ -39,11 +39,35 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-# Pick a GL backend before importing mujoco if the caller didn't.
+# GL backend: prefer EGL (GPU, fast); the script auto-falls-back to OSMesa
+# (software) in _ensure_gl_backend() if EGL can't initialise — so it just works
+# whether or not the machine has a usable EGL/GPU context. Override with
+# MUJOCO_GL=osmesa|egl|glfw to force one.
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
 import mujoco  # noqa: E402
+
+
+def _ensure_gl_backend():
+    """Render a 1-frame probe; if the chosen backend (default EGL) can't make a
+    context, re-exec the process with MUJOCO_GL=osmesa. Called once from main()."""
+    try:
+        m = mujoco.MjModel.from_xml_string(
+            "<mujoco><worldbody><light pos='0 0 2'/>"
+            "<geom type='box' size='.1 .1 .1'/></worldbody></mujoco>")
+        r = mujoco.Renderer(m, 48, 48)
+        r.update_scene(mujoco.MjData(m))
+        r.render()
+        r.close()
+    except Exception as e:
+        if os.environ.get("MUJOCO_GL") != "osmesa" and not os.environ.get("_RP_GL_FB"):
+            print(f"[gl] {os.environ.get('MUJOCO_GL')} unavailable "
+                  f"({type(e).__name__}) — falling back to MUJOCO_GL=osmesa")
+            os.environ["MUJOCO_GL"] = "osmesa"
+            os.environ["_RP_GL_FB"] = "1"
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        raise
 from configs.config import K1RobotConfig  # noqa: E402
 from envs import standup as poses  # noqa: E402
 from models.field_builder import add_field_to_spec  # noqa: E402
@@ -737,19 +761,27 @@ def main():
         choices=list(_VIDEOS) + ["checkpoint_comparison"],
         help="render only these videos (default: all)",
     )
+    ap.add_argument("--height", type=int, default=1080,
+                    help="output height in px (width = 16:9). Use e.g. 540 for "
+                         "fast software-rendered previews on a laptop.")
     args = ap.parse_args()
+    _ensure_gl_backend()                # EGL → OSMesa auto-fallback
     os.makedirs(args.out, exist_ok=True)
+    H = max(180, args.height)
+    W = (int(round(H * 16 / 9)) // 2) * 2          # even width for the codec
+    panel = (min(H, 720) // 2) * 2                  # square checkpoint panels
     selected = args.only or (list(_VIDEOS) + ["checkpoint_comparison"])
-    print(f"Rendering to {args.out}  (MUJOCO_GL={os.environ.get('MUJOCO_GL')})")
+    print(f"Rendering to {args.out}  ({W}x{H}, MUJOCO_GL="
+          f"{os.environ.get('MUJOCO_GL')})")
     for name in selected:
         print(f"[{name}]")
         try:
             if name == "checkpoint_comparison":
                 render_checkpoint_comparison(
-                    find_checkpoints(args.checkpoint_dir), args.out
-                )
+                    find_checkpoints(args.checkpoint_dir), args.out,
+                    H=panel, W=panel)
             else:
-                _VIDEOS[name](args.out)
+                _VIDEOS[name](args.out, H=H, W=W)
         except Exception as e:
             import traceback
 
