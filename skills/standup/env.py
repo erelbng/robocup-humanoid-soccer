@@ -990,20 +990,14 @@ class K1StandupEnv(SkillEnv):
         n = envs_idx.shape[0]
         pos, quat, jpos, is_side = self._sample_reset(n)
 
-        # Small Gaussian joint jitter adds continuous variation on top of
-        # the discrete pool — effectively infinite unique starting states.
-        # Side poses are EXCLUDED from jitter: side-lying is a metastable
-        # equilibrium held by the elbow+foot floor brace. Even ±0.10 rad
-        # jitter can shift the brace off the floor and tip the robot to
-        # prone/supine before the first training step — defeating the
-        # purpose of the side pool. Prone/supine are stable equilibria
-        # (gravity holds them flat) and tolerate jitter fine.
-        if self.cfg.joint_jitter_rad > 0 and not is_side.all():
-            noise = (self.rng.standard_normal(jpos.shape)
-                     .astype(np.float32)
-                     * self.cfg.joint_jitter_rad)
-            noise[is_side] = 0.0   # zero out jitter for side-pose envs
-            jpos = jpos + noise
+        # NO reset-time joint jitter. The pool states are already filtered to
+        # be penetration-free (lowest collision vertex ≳ 0), but adding ±jitter
+        # on the joint angles at reset re-introduces ground penetration — most
+        # visibly the ankle/foot driven into the floor — because there is no
+        # settling step after the jitter to resolve it. Pool diversity comes
+        # from the settle physics (quat + joint noise + per-env DR) during pool
+        # build, which IS resolved by the subsequent settle steps; that is the
+        # right place for variation. (The build-time noise is unaffected.)
 
         try:
             self.robot.set_pos(pos, envs_idx=envs_idx)
