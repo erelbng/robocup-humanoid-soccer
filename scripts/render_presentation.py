@@ -44,14 +44,13 @@ if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
 import mujoco  # noqa: E402
-
 from configs.config import K1RobotConfig  # noqa: E402
-from models.field_generator import FieldDimensions  # noqa: E402
-from models.field_builder import add_field_to_spec  # noqa: E402
 from envs import standup as poses  # noqa: E402
-from skills.standup.config import StandupConfig  # noqa: E402
-from skills.standup import rewards as R  # noqa: E402
+from models.field_builder import add_field_to_spec  # noqa: E402
+from models.field_generator import FieldDimensions  # noqa: E402
 from skills.common_obs import compute_common_obs  # noqa: E402
+from skills.standup import rewards as R  # noqa: E402
+from skills.standup.config import StandupConfig  # noqa: E402
 
 _ROBOT_XML = os.path.join(_ROOT, "models", "robot", "K1", "K1_22dof.xml")
 _FIELD_JSON = os.path.join(_ROOT, "configs", "field_hsl_2026.json")
@@ -60,7 +59,7 @@ _HAND_BODIES = ("left_hand_link", "right_hand_link")
 _CONTACT_Z = 0.05
 _SIM_DT = 0.002
 _CONTROL_DT = 0.02
-_ACTION_REPEAT = int(round(_CONTROL_DT / _SIM_DT))   # 10
+_ACTION_REPEAT = int(round(_CONTROL_DT / _SIM_DT))  # 10
 _ACTION_DELTA_MAX = 0.5
 _BODY_WEIGHT_N = 196.0
 
@@ -74,11 +73,11 @@ def build_scene(with_field: bool = True):
     name→address maps the rest of the script needs."""
     spec = mujoco.MjSpec.from_file(_ROBOT_XML)
     # Brighter, presentation-friendly lighting + offscreen size.
-    spec.visual.headlight.ambient = [0.4, 0.4, 0.4]
-    spec.visual.headlight.diffuse = [0.7, 0.7, 0.7]
+    spec.visual.headlight.ambient = [0.2, 0.2, 0.2]
+    spec.visual.headlight.diffuse = [0.4, 0.4, 0.4]
     try:
-        spec.visual.global_.offwidth = 1280
-        spec.visual.global_.offheight = 720
+        spec.visual.global_.offwidth = 1920
+        spec.visual.global_.offheight = 1080
     except Exception:
         pass
     if with_field:
@@ -88,11 +87,12 @@ def build_scene(with_field: bool = True):
                 spec.delete(g)
         except Exception:
             pass
-        add_field_to_spec(spec, mujoco, FieldDimensions.from_json(_FIELD_JSON),
-                          add_ball=False)
-    light = spec.worldbody.add_light(name="key", pos=[2, -2, 4],
-                                     dir=[-0.4, 0.4, -0.8],
-                                     diffuse=[0.6, 0.6, 0.6])
+        add_field_to_spec(
+            spec, mujoco, FieldDimensions.from_json(_FIELD_JSON), add_ball=False
+        )
+    light = spec.worldbody.add_light(
+        name="key", pos=[2, -2, 4], dir=[-0.4, 0.4, -0.8], diffuse=[0.3, 0.3, 0.3]
+    )
     light.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
     model = spec.compile()
     data = mujoco.MjData(model)
@@ -119,10 +119,14 @@ def _build_index(model):
         return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
 
     return dict(
-        rc=rc, names=names,
-        qpos=np.array(qpos_adr), dof=np.array(dof_adr),
-        act=np.array(act_id), flim=np.array(force_lim),
-        kp=kp, kd=kd,
+        rc=rc,
+        names=names,
+        qpos=np.array(qpos_adr),
+        dof=np.array(dof_adr),
+        act=np.array(act_id),
+        flim=np.array(force_lim),
+        kp=kp,
+        kd=kd,
         default=np.array(rc.default_joint_pos, dtype=np.float64),
         foot_bid=[_bid(n) for n in _FOOT_BODIES],
         hand_bid=[_bid(n) for n in _HAND_BODIES],
@@ -131,7 +135,8 @@ def _build_index(model):
 
 
 def _pd_gains(rc, names):
-    kp = np.zeros(len(names)); kd = np.zeros(len(names))
+    kp = np.zeros(len(names))
+    kd = np.zeros(len(names))
     for i, n in enumerate(names):
         if "Head" in n:
             kp[i], kd[i] = rc.kp_head, rc.kd_head
@@ -141,7 +146,7 @@ def _pd_gains(rc, names):
             kp[i], kd[i] = rc.kp_knee, rc.kd_knee
         elif "Ankle" in n:
             kp[i], kd[i] = rc.kp_ankle, rc.kd_ankle
-        else:                       # shoulders / elbows / arms
+        else:  # shoulders / elbows / arms
             kp[i], kd[i] = rc.kp_arm, rc.kd_arm
     return kp, kd
 
@@ -151,9 +156,12 @@ def _pd_gains(rc, names):
 
 def set_pose(data, idx, pose, extra_clearance: float = 0.0):
     """Place the robot in a named StandupPose (free base + joint targets)."""
-    data.qpos[0:3] = [0.0, 0.0, pose.trunk_height + pose.spawn_clearance
-                      + extra_clearance]
-    data.qpos[3:7] = pose.trunk_quat            # MuJoCo + our convention: wxyz
+    data.qpos[0:3] = [
+        0.0,
+        0.0,
+        pose.trunk_height + pose.spawn_clearance + extra_clearance,
+    ]
+    data.qpos[3:7] = pose.trunk_quat  # MuJoCo + our convention: wxyz
     for n, adr in zip(idx["names"], idx["qpos"]):
         data.qpos[adr] = pose.joint_targets.get(n, 0.0)
     data.qvel[:] = 0.0
@@ -237,19 +245,31 @@ def add_arrow(renderer, p_from, p_to, rgba=(1.0, 0.2, 0.1, 1.0), width=0.02):
     if scn.ngeom >= scn.maxgeom:
         return
     g = scn.geoms[scn.ngeom]
-    mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_ARROW,
-                        np.zeros(3), np.zeros(3), np.zeros(9),
-                        np.asarray(rgba, dtype=np.float32))
-    mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_ARROW, width,
-                         np.asarray(p_from, dtype=np.float64),
-                         np.asarray(p_to, dtype=np.float64))
+    mujoco.mjv_initGeom(
+        g,
+        mujoco.mjtGeom.mjGEOM_ARROW,
+        np.zeros(3),
+        np.zeros(3),
+        np.zeros(9),
+        np.asarray(rgba, dtype=np.float32),
+    )
+    mujoco.mjv_connector(
+        g,
+        mujoco.mjtGeom.mjGEOM_ARROW,
+        width,
+        np.asarray(p_from, dtype=np.float64),
+        np.asarray(p_to, dtype=np.float64),
+    )
     scn.ngeom += 1
 
 
 def _font(size=22):
     from PIL import ImageFont
-    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+
+    for p in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
         try:
             return ImageFont.truetype(p, size)
         except Exception:
@@ -260,6 +280,7 @@ def _font(size=22):
 def overlay_text(frame, title=None, lines=None, bars=None):
     """Draw a title, text lines, and optional labelled bars on an RGB frame."""
     from PIL import Image, ImageDraw
+
     img = Image.fromarray(frame)
     d = ImageDraw.Draw(img, "RGBA")
     W = img.width
@@ -279,12 +300,12 @@ def overlay_text(frame, title=None, lines=None, bars=None):
         bx, bw = 170, 240
         for label, val in bars:
             d.text((16, y - 2), label, fill=(255, 255, 255), font=f)
-            d.rectangle([bx, y, bx + bw, y + 14], outline=(255, 255, 255),
-                        fill=(0, 0, 0, 120))
+            d.rectangle(
+                [bx, y, bx + bw, y + 14], outline=(255, 255, 255), fill=(0, 0, 0, 120)
+            )
             fillw = int(bw * max(0.0, min(1.0, val)))
             d.rectangle([bx, y, bx + fillw, y + 14], fill=(90, 200, 90))
-            d.text((bx + bw + 8, y - 2), f"{val:+.2f}", fill=(255, 255, 255),
-                   font=f)
+            d.text((bx + bw + 8, y - 2), f"{val:+.2f}", fill=(255, 255, 255), font=f)
             y += 18
     return np.asarray(img)
 
@@ -295,6 +316,7 @@ def write_video(frames, path, fps=30):
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     import imageio
+
     imageio.mimwrite(path, frames, fps=fps, quality=8)
     print(f"  wrote {path}  ({len(frames)} frames)")
 
@@ -308,10 +330,12 @@ def render_curriculum(out_dir, H=720, W=1280):
     model, data, idx = build_scene()
     renderer = mujoco.Renderer(model, H, W)
     cam = make_camera()
-    factories = [("Supine (on back)", poses.supine),
-                 ("Prone (face down)", poses.prone),
-                 ("Side-left", poses.side_left),
-                 ("Side-right", poses.side_right)]
+    factories = [
+        ("Supine (on back)", poses.supine),
+        ("Prone (face down)", poses.prone),
+        ("Side-left", poses.side_left),
+        ("Side-right", poses.side_right),
+    ]
     frames = []
     for label, fac in factories:
         pose = fac()
@@ -323,14 +347,18 @@ def render_curriculum(out_dir, H=720, W=1280):
         for k in range(90):
             apply_pd(model, data, idx, hold)
             renderer.update_scene(data, camera=cam)
-            frames.append(overlay_text(
-                renderer.render(), title=f"Init-pose curriculum — {label}",
-                lines=["spawn in the air → settle to a physical fallen pose"]))
+            frames.append(
+                overlay_text(
+                    renderer.render(),
+                    title=f"Init-pose curriculum — {label}",
+                    lines=["spawn in the air → settle to a physical fallen pose"],
+                )
+            )
     write_video(frames, os.path.join(out_dir, "curriculum.mp4"))
     del renderer
 
 
-def render_assist_force(out_dir, H=720, W=1280):
+def render_assist_force(out_dir, H=1080, W=1920):
     """Decaying HoST upward trunk support, drawn as an arrow whose length tracks
     the force. Scripted lift (assist holds the trunk) so the concept is clear
     without a policy."""
@@ -357,17 +385,27 @@ def render_assist_force(out_dir, H=720, W=1280):
         renderer.update_scene(data, camera=cam)
         arrow_len = 0.15 + 0.6 * (fz / max(cfg.assist_force_max, 1e-6))
         if fz > 1.0:
-            add_arrow(renderer, trunk, trunk + np.array([0, 0, arrow_len]),
-                      rgba=(0.1, 0.5, 1.0, 1.0))
-        frames.append(overlay_text(
-            renderer.render(), title="Assist-force curriculum (HoST)",
-            lines=[f"upward trunk support: {fz:6.1f} N   (decaying → 0)",
-                   "blue arrow ∝ applied force"]))
+            add_arrow(
+                renderer,
+                trunk,
+                trunk + np.array([0, 0, arrow_len]),
+                rgba=(0.1, 0.5, 1.0, 1.0),
+            )
+        frames.append(
+            overlay_text(
+                renderer.render(),
+                title="Assist-force curriculum (HoST)",
+                lines=[
+                    f"upward trunk support: {fz:6.1f} N   (decaying → 0)",
+                    "blue arrow ∝ applied force",
+                ],
+            )
+        )
     write_video(frames, os.path.join(out_dir, "assist_force.mp4"))
     del renderer
 
 
-def render_domain_randomization(out_dir, H=720, W=1280):
+def render_domain_randomization(out_dir, H=1080, W=1920):
     """Random base pushes (red force arrows) on a standing robot — the visible
     face of the domain randomisation that hardens the policy."""
     model, data, idx = build_scene()
@@ -382,29 +420,34 @@ def render_domain_randomization(out_dir, H=720, W=1280):
     mujoco.mj_forward(model, data)
     frames, push = [], np.zeros(3)
     for t in range(260):
-        if t % 40 == 0:                       # new push every ~0.8 s
+        if t % 40 == 0:  # new push every ~0.8 s
             ang = rng.uniform(0, 2 * np.pi)
             mag = rng.uniform(40, 110)
             push = np.array([mag * np.cos(ang), mag * np.sin(ang), 0.0])
-        active = (t % 40) < 6                  # held ~5 control steps
-        apply_force(model, data, idx, idx["trunk_bid"],
-                    push if active else np.zeros(3))
+        active = (t % 40) < 6  # held ~5 control steps
+        apply_force(model, data, idx, idx["trunk_bid"], push if active else np.zeros(3))
         apply_pd(model, data, idx, idx["default"])
         trunk = data.xpos[idx["trunk_bid"]].copy()
         renderer.update_scene(data, camera=cam)
         if active:
             tip = trunk + push / 120.0
             add_arrow(renderer, trunk, tip, rgba=(1.0, 0.2, 0.1, 1.0))
-        frames.append(overlay_text(
-            renderer.render(), title="Domain randomisation — random base pushes",
-            lines=["also randomised (not visible): friction, motor gains,",
-                   "joint friction, link masses, COM offset, sensor noise",
-                   f"push: {np.linalg.norm(push) if active else 0:5.0f} N"]))
+        frames.append(
+            overlay_text(
+                renderer.render(),
+                title="Domain randomisation — random base pushes",
+                lines=[
+                    "also randomised (not visible): friction, motor gains,",
+                    "joint friction, link masses, COM offset, sensor noise",
+                    f"push: {np.linalg.norm(push) if active else 0:5.0f} N",
+                ],
+            )
+        )
     write_video(frames, os.path.join(out_dir, "domain_randomization.mp4"))
     del renderer
 
 
-def render_reward_breakdown(out_dir, H=720, W=1280):
+def render_reward_breakdown(out_dir, H=1080, W=1920):
     """Scripted fallen→stand sweep (kinematic) with the live reward signals
     overlaid — illustrates what each shaping term measures."""
     model, data, idx = build_scene()
@@ -427,7 +470,7 @@ def render_reward_breakdown(out_dir, H=720, W=1280):
     N = 160
     for t in range(N):
         a = t / (N - 1)
-        s = 0.5 - 0.5 * math.cos(math.pi * a)        # smootherstep
+        s = 0.5 - 0.5 * math.cos(math.pi * a)  # smootherstep
         data.qpos[2] = (1 - s) * z0 + s * z1
         data.qpos[0:2] = 0.0
         data.qpos[3:7] = _slerp(quat0, quat1, s)
@@ -437,33 +480,64 @@ def render_reward_breakdown(out_dir, H=720, W=1280):
         quat = data.qpos[3:7][None, :].astype(np.float32)
         z = data.qpos[2:3][None].astype(np.float32)
         jp = data.qpos[idx["qpos"]][None, :].astype(np.float32)
-        foot_z = np.array([[data.xpos[b, 2] for b in idx["foot_bid"]]],
-                          dtype=np.float32)
+        foot_z = np.array(
+            [[data.xpos[b, 2] for b in idx["foot_bid"]]], dtype=np.float32
+        )
         up = R.upright_signal(quat)
         bars = [
             ("upright", float(R.upright_signal(quat)[0] * 0.5 + 0.5)),
             ("height", float(R.height_signal(z[:, 0], cfg.target_height)[0])),
-            ("foot_grounded_up", float(R.foot_grounded_up_signal(
-                foot_z, z[:, 0], up, foot_max_z=cfg.foot_grounded_max_z,
-                trunk_min_z=cfg.trunk_up_min_z)[0])),
-            ("standing_tall", float(R.standing_tall_signal(
-                foot_z, z[:, 0], up, foot_max_z=cfg.foot_grounded_max_z,
-                trunk_min_z=cfg.standing_tall_min_z,
-                trunk_max_z=cfg.standing_tall_max_z)[0])),
-            ("stand_pose", float(R.stand_pose_signal(
-                jp, pose_idx, q1.astype(np.float32), up,
-                dev_scale=cfg.stand_pose_dev_scale)[0])),
+            (
+                "foot_grounded_up",
+                float(
+                    R.foot_grounded_up_signal(
+                        foot_z,
+                        z[:, 0],
+                        up,
+                        foot_max_z=cfg.foot_grounded_max_z,
+                        trunk_min_z=cfg.trunk_up_min_z,
+                    )[0]
+                ),
+            ),
+            (
+                "standing_tall",
+                float(
+                    R.standing_tall_signal(
+                        foot_z,
+                        z[:, 0],
+                        up,
+                        foot_max_z=cfg.foot_grounded_max_z,
+                        trunk_min_z=cfg.standing_tall_min_z,
+                        trunk_max_z=cfg.standing_tall_max_z,
+                    )[0]
+                ),
+            ),
+            (
+                "stand_pose",
+                float(
+                    R.stand_pose_signal(
+                        jp,
+                        pose_idx,
+                        q1.astype(np.float32),
+                        up,
+                        dev_scale=cfg.stand_pose_dev_scale,
+                    )[0]
+                ),
+            ),
         ]
         renderer.update_scene(data, camera=cam)
-        frames.append(overlay_text(
-            renderer.render(), title="Reward shaping — live signal breakdown",
-            bars=bars))
+        frames.append(
+            overlay_text(
+                renderer.render(),
+                title="Reward shaping — live signal breakdown",
+                bars=bars,
+            )
+        )
     write_video(frames, os.path.join(out_dir, "reward_breakdown.mp4"))
     del renderer
 
 
-def render_checkpoint_comparison(checkpoints, out_dir, H=540, W=540,
-                                 steps=250):
+def render_checkpoint_comparison(checkpoints, out_dir, H=540, W=540, steps=250):
     """Roll out each checkpoint's policy in MuJoCo (sim2sim) from a prone start
     and tile the clips side by side, labelled by training step."""
     try:
@@ -477,8 +551,7 @@ def render_checkpoint_comparison(checkpoints, out_dir, H=540, W=540,
         return
     panels = []
     for ckpt in checkpoints:
-        frames = _rollout_checkpoint(ckpt, create_policy, load_checkpoint,
-                                     H, W, steps)
+        frames = _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps)
         if frames:
             panels.append((_step_of(ckpt), frames))
     if not panels:
@@ -486,8 +559,7 @@ def render_checkpoint_comparison(checkpoints, out_dir, H=540, W=540,
     n = min(len(f) for _, f in panels)
     tiled = []
     for t in range(n):
-        row = [overlay_text(f[t], title=f"step {step:,}")
-               for step, f in panels]
+        row = [overlay_text(f[t], title=f"step {step:,}") for step, f in panels]
         tiled.append(np.concatenate(row, axis=1))
     write_video(tiled, os.path.join(out_dir, "checkpoint_comparison.mp4"))
 
@@ -495,8 +567,7 @@ def render_checkpoint_comparison(checkpoints, out_dir, H=540, W=540,
 # Nominal (no-DR) privileged tail appended for teacher checkpoints (obs 94):
 # [ground_friction, kp_scale, kd_scale, joint_friction, base_mass_scale,
 #  com_offset_xyz] at their un-randomised values.
-_PRIV_NOMINAL = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-                         dtype=np.float32)
+_PRIV_NOMINAL = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 _BASE_OBS_DIM = 86
 
 
@@ -504,6 +575,7 @@ def _ckpt_obs_dim(ckpt):
     """Detect a checkpoint's expected obs_dim (proprio 86 vs privileged 94) +
     return its obs_norm state dict, without assuming a layout."""
     import torch
+
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     obs_norm_sd = sd.get("obs_norm") if isinstance(sd, dict) else None
     dim = None
@@ -513,12 +585,14 @@ def _ckpt_obs_dim(ckpt):
         psd = sd.get("policy_state_dict") or sd.get("actor_state_dict") or sd
         for k, v in psd.items():
             if "actor" in k and k.endswith("weight") and getattr(v, "ndim", 0) == 2:
-                dim = int(v.shape[1]); break
+                dim = int(v.shape[1])
+                break
     return dim, obs_norm_sd
 
 
 def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
     import torch
+
     act_dim = 22
     obs_dim, obs_norm_sd = _ckpt_obs_dim(ckpt)
     if obs_dim not in (_BASE_OBS_DIM, _BASE_OBS_DIM + 8):
@@ -537,6 +611,7 @@ def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
     obs_norm = None
     if obs_norm_sd is not None:
         from training.normalizers import RunningMeanStd
+
         obs_norm = RunningMeanStd(shape=(obs_dim,))
         obs_norm.load_state_dict(obs_norm_sd)
     renderer = mujoco.Renderer(model, H, W)
@@ -548,17 +623,20 @@ def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
     frames = []
     for t in range(steps):
         obs = standup_obs(data, idx, last_action, t)
-        if obs_dim == _BASE_OBS_DIM + 8:          # privileged/teacher policy
+        if obs_dim == _BASE_OBS_DIM + 8:  # privileged/teacher policy
             obs = np.concatenate([obs, _PRIV_NOMINAL])
         nobs = obs_norm.normalize(obs[None])[0] if obs_norm is not None else obs
         with torch.no_grad():
-            out = policy.act(torch.as_tensor(nobs[None], dtype=torch.float32),
-                             deterministic=True)
+            out = policy.act(
+                torch.as_tensor(nobs[None], dtype=torch.float32), deterministic=True
+            )
         action = np.asarray(_action_from(out)).reshape(-1)[:act_dim]
         last_action = action.astype(np.float32)
-        target = np.clip(idx["default"]
-                         + np.clip(action, -_ACTION_DELTA_MAX, _ACTION_DELTA_MAX),
-                         -math.pi, math.pi)
+        target = np.clip(
+            idx["default"] + np.clip(action, -_ACTION_DELTA_MAX, _ACTION_DELTA_MAX),
+            -math.pi,
+            math.pi,
+        )
         apply_pd(model, data, idx, target)
         renderer.update_scene(data, camera=cam)
         frames.append(renderer.render())
@@ -606,7 +684,8 @@ def find_checkpoints(ckpt_dir, k=4):
     seen, out = set(), []
     for p in pick:
         if p not in seen:
-            seen.add(p); out.append(p)
+            seen.add(p)
+            out.append(p)
     return out
 
 
@@ -619,14 +698,19 @@ _VIDEOS = {
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--out", default=os.path.join(_ROOT, "videos", "presentation"))
-    ap.add_argument("--checkpoint-dir",
-                    default=os.path.join(_ROOT, "checkpoints", "skill_standup"))
-    ap.add_argument("--only", nargs="*",
-                    choices=list(_VIDEOS) + ["checkpoint_comparison"],
-                    help="render only these videos (default: all)")
+    ap.add_argument(
+        "--checkpoint-dir", default=os.path.join(_ROOT, "checkpoints", "skill_standup")
+    )
+    ap.add_argument(
+        "--only",
+        nargs="*",
+        choices=list(_VIDEOS) + ["checkpoint_comparison"],
+        help="render only these videos (default: all)",
+    )
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     selected = args.only or (list(_VIDEOS) + ["checkpoint_comparison"])
@@ -636,11 +720,13 @@ def main():
         try:
             if name == "checkpoint_comparison":
                 render_checkpoint_comparison(
-                    find_checkpoints(args.checkpoint_dir), args.out)
+                    find_checkpoints(args.checkpoint_dir), args.out
+                )
             else:
                 _VIDEOS[name](args.out)
         except Exception as e:
             import traceback
+
             print(f"  [error] {name}: {e}")
             traceback.print_exc()
 
