@@ -152,6 +152,24 @@ def _build_index(model):
         force_lim.append(model.actuator_forcerange[aid].copy())
     kp, kd = _pd_gains(rc, names)
 
+    # Configure MuJoCo NATIVE position-servo PD on each actuator (affine bias:
+    # ctrl = target angle, MuJoCo computes kp·(target−q) − kd·q̇ each substep),
+    # UNCLAMPED. This is the exact control contract of evaluation/
+    # eval_standup_mujoco.py — the one that matches Genesis (control_dofs_position,
+    # no torque clamp) and reports the true ~95% sim2sim success. The stock MJCF
+    # <motor> actuators driven by an explicit, force-CLAMPED torque loop made the
+    # rollout report false "crouch-stall" failures; the servo fixes that.
+    for k, aid in enumerate(act_id):
+        model.actuator_gaintype[aid] = mujoco.mjtGain.mjGAIN_FIXED
+        model.actuator_biastype[aid] = mujoco.mjtBias.mjBIAS_AFFINE
+        model.actuator_gainprm[aid] = 0.0
+        model.actuator_gainprm[aid][0] = kp[k]
+        model.actuator_biasprm[aid] = 0.0
+        model.actuator_biasprm[aid][1] = -kp[k]
+        model.actuator_biasprm[aid][2] = -kd[k]
+        model.actuator_ctrllimited[aid] = 0
+        model.actuator_forcelimited[aid] = 0
+
     def _bid(nm):
         return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, nm)
 
@@ -211,13 +229,13 @@ def joint_state(data, idx):
 
 
 def apply_pd(model, data, idx, target_q):
-    """One control step: PD torque toward target_q, then action_repeat sub-steps
-    of physics. `target_q` is in canonical joint order."""
+    """One control step: set the native position-servo target (an ANGLE) and
+    run action_repeat physics sub-steps. MuJoCo's affine actuators (configured
+    in _build_index) realise kp·(target−q) − kd·q̇ internally each substep,
+    UNCLAMPED — matching Genesis / eval_standup_mujoco (the prior explicit,
+    force-clamped torque loop made the rollout report false crouch failures)."""
+    data.ctrl[idx["act"]] = target_q
     for _ in range(_ACTION_REPEAT):
-        q, qd = joint_state(data, idx)
-        tau = idx["kp"] * (target_q - q) - idx["kd"] * qd
-        tau = np.clip(tau, idx["flim"][:, 0], idx["flim"][:, 1])
-        data.ctrl[idx["act"]] = tau
         mujoco.mj_step(model, data)
 
 
