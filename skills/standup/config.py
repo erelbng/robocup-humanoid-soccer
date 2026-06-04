@@ -312,6 +312,21 @@ class StandupConfig:
     # exploits fewer Genesis-specific contact quirks → transfers better.
     reg_success_ramp: bool = True
 
+    # ── Single-run TWO-STAGE gate (curriculum-completion, not global success) ──
+    # The fix for the L0 stall: instead of ramping the style/quality terms by the
+    # global success EMA (which crossed 0.5 DURING L0 and capped per-frame success
+    # just under the 0.55 advance gate, freezing the curriculum at prone-only),
+    # hold them at 0 until Karl's pose curriculum is COMPLETE (final level), then
+    # ramp by the (reset-to-0-on-advance) L3 success EMA. Stage 1 = proven
+    # discovery + full L0→L3 curriculum; stage 2 = style / "stand still" on an
+    # already-generalising policy. Karl's curriculum is untouched — this only
+    # changes WHEN style activates. Set False for the legacy global-EMA ramp.
+    style_stage_gate: bool = True
+    # Stage-2 ramp reference: style_scale = clip(L3_success_ema / this, 0, 1)
+    # once the curriculum is complete. 0.5 ≈ "stands ~half the L3 mix" → start
+    # sculpting; raise for a later/gentler style onset.
+    style_success_ref: float = 0.5
+
     # ── Multi-critic PPO (HoST, arXiv:2502.08378) ────────────────────
     # One value head per reward group (STANDUP_CRITIC_GROUPS: task / reg /
     # success) instead of a single critic over the full heterogeneous
@@ -679,7 +694,9 @@ class StandupConfig:
     reset_success_ema_on_level_up: bool = True
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
-    total_timesteps: int = 50_000_000
+    total_timesteps: int = 500_000_000   # two-stage run: ~L0-L3 curriculum
+                                          # (stage 1) + a long stage-2 style /
+                                          # stand-still refinement at L3.
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95

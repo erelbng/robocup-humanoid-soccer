@@ -367,6 +367,7 @@ def compute_standup_reward(
     max_upright: np.ndarray = None,   # (N,) episode high-water mark of upright
     progress_ratchet: bool = True,
     reg_success_ramp: bool = False,
+    style_scale: float = None,
     trunk_contact_force: np.ndarray = None,   # (N,) net Trunk contact-force mag
     trunk_contact_force_thresh: float = 280.0,
     trunk_contact_force_scale: float = 196.0,
@@ -471,8 +472,18 @@ def compute_standup_reward(
     pose = stand_pose_signal(joint_pos, pose_joint_indices,
                              _stand_target, up,
                              dev_scale=stand_pose_dev_scale)
-    pose_scale = float(np.clip(success_ema / max(stand_pose_success_ref, 1e-6),
-                               0.0, 1.0))
+    # `pose_scale` ramps ALL the stage-2 style/quality terms (stand_pose,
+    # trunk-force, on_spot, and the reg group via reg_success_ramp). By default
+    # it tracks the global success EMA. When the env passes an explicit
+    # `style_scale` (the single-run TWO-STAGE gate), that value is used instead:
+    # it stays 0 until Karl's pose curriculum is COMPLETE (L3 reached) and only
+    # then ramps in — so the style terms can never stall the curriculum at an
+    # earlier level (the failure mode of the success-EMA gate, which fired
+    # during L0). See K1StandupEnv._style_scale.
+    pose_scale = (float(style_scale) if style_scale is not None
+                  else float(np.clip(success_ema
+                                     / max(stand_pose_success_ref, 1e-6),
+                                     0.0, 1.0)))
     stand_pose = (pose * pose_scale).astype(np.float32)
 
     # Post-success STILLNESS — highly reward being motionless once a sustained

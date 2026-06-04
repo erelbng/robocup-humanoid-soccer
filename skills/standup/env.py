@@ -1105,6 +1105,29 @@ class K1StandupEnv(SkillEnv):
         return float(c.target_height_start
                      + (c.target_height - c.target_height_start) * p)
 
+    def _style_scale(self) -> float:
+        """Stage gate (0..1) for the motion-quality / style reward terms — the
+        single-run TWO-STAGE mechanism.
+
+        Stage 1 (style_scale = 0): while Karl's pose curriculum is still climbing
+        (pose_level below the final level), ALL style/quality terms are OFF, so
+        the reward is the proven discovery set and the curriculum advances
+        unhindered. Stage 2 (style_scale ramps 0→1): once the curriculum is
+        COMPLETE (final level reached), ramp the style terms in by the success
+        EMA — which the env reset to 0 on the final advance — so they sculpt a
+        smooth, motionless, shoulder-wide hold on an ALREADY-generalising policy.
+
+        This replaces the old global-success gate (clip(success_ema/0.5)), which
+        crossed its threshold during L0 and stalled the curriculum there. With
+        `style_stage_gate=False` it degrades to that legacy EMA ramp.
+        """
+        ref = max(self.cfg.style_success_ref, 1e-6)
+        final_level = len(self.cfg.pose_level_thresholds)
+        if (self.cfg.style_stage_gate and self.cfg.pose_curriculum_enabled
+                and self._pose_level < final_level):
+            return 0.0
+        return float(np.clip(self._success_rate_ema / ref, 0.0, 1.0))
+
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.
 
@@ -1294,6 +1317,17 @@ class K1StandupEnv(SkillEnv):
         # Privileged contact-force reads for the anti-slam penalty + knee credit.
         trunk_force, knee_force = self._read_contact_forces()
 
+        # ── Single-run TWO-STAGE gate ────────────────────────────────────────
+        # Stage 1 (discovery + Karl's L0-L3 curriculum): style_scale = 0, so all
+        # the motion-quality terms (reg group, on_spot, stand_pose, trunk-force)
+        # are OFF — the reward is the proven discovery set and the curriculum
+        # runs unhindered. Stage 2 ("stand still" / style): once the curriculum
+        # is COMPLETE (pose_level reached the final level), ramp style in by the
+        # (now L3) success EMA so it sculpts a smooth, motionless, shoulder-wide
+        # hold on an already-generalising policy. This replaces the old global-
+        # success gate that fired during L0 and stalled the curriculum there.
+        style_scale = self._style_scale()
+
         reward, _frame_success, components, group_rewards = compute_standup_reward(
             root_pos=root_pos, root_quat=root_quat,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
@@ -1327,6 +1361,7 @@ class K1StandupEnv(SkillEnv):
             max_upright=self._max_upright,
             progress_ratchet=self.cfg.progress_ratchet,
             reg_success_ramp=self.cfg.reg_success_ramp,
+            style_scale=style_scale,
             trunk_contact_force=trunk_force,
             trunk_contact_force_thresh=self.cfg.trunk_contact_force_thresh,
             trunk_contact_force_scale=self.cfg.trunk_contact_force_scale,
@@ -1352,6 +1387,10 @@ class K1StandupEnv(SkillEnv):
         components["target_height_current"] = float(target_h)
         components["assist_fraction"] = float(self._current_assist_fraction())
         components["assist_force_mean"] = float(self._last_assist_force_mean)
+        # Two-stage telemetry: stage 1 (curriculum/discovery) until style_scale
+        # lifts off 0 at curriculum completion, then stage 2 (style/stand-still).
+        components["style_scale"] = float(style_scale)
+        components["training_stage"] = 2.0 if style_scale > 0.0 else 1.0
 
         # Update EMA of frame success rate — used to gate curriculum.
         current_success_rate = float(np.mean(frame_now))
