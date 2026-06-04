@@ -125,6 +125,13 @@ class StandupRewardWeights:
     # so it cannot tax the rise into a crouch-freeze.
     stand_pose: float = 6.0
 
+    # NOTE (regression fix): the anti-slam terms below over-constrained FRESH
+    # discovery (v3 froze in a passive z≈0.28 crouch, never standing, vs v2
+    # which stood by ~42M). Trunk_contact_force is now SUCCESS-RAMPED (off
+    # until the robot reliably stands — see compute_standup_reward), the
+    # progress ratchet is OFF by default, and knee_support is disabled (it was
+    # rewarding the knees-down crouch and reinforcing the very failure mode).
+
     # Post-success STILLNESS — once a sustained stand is achieved AND still
     # holding, highly reward being motionless: exp(-(Σq̇²/jv + ‖v‖²/vs)),
     # paid per post-success frame on TOP of post_success_standing. Gated by
@@ -159,17 +166,19 @@ class StandupRewardWeights:
     # ground for momentum" exploit that would damage a real robot. Penalises
     # the NET ground-contact force on the Trunk link ABOVE a threshold (so
     # merely resting on the floor at the start is free, only violent impacts
-    # are taxed): (clip((‖F_trunk‖ − thresh)/scale, 0, ∞))². NOT discovery-
-    # zeroed (it must shape the get-up itself). 0 = off.
-    trunk_contact_force: float = 1.0
+    # are taxed): (clip((‖F_trunk‖ − thresh)/scale, 0, ∞))². SUCCESS-RAMPED
+    # (× the success EMA, like stand_pose) so it is ~0 during fresh discovery
+    # and only bites once the robot reliably stands — a penalty active from
+    # step 0 froze v3 in a passive crouch. 0 = off.
+    trunk_contact_force: float = 1.5
 
-    # Knee/shin support credit — makes a KNEE-based get-up a viable path
-    # instead of a dead end (today only FEET-grounded postures earn standing
-    # credit, so the policy never explores kneeling). Small positive bump for
-    # the shanks being in ground contact while the trunk is at kneeling height
-    # and upright-ish; fades to 0 at full standing so it never competes with
-    # standing on the feet (no kneel attractor). 0 = off.
-    knee_support: float = 2.0
+    # Knee/shin support credit — DISABLED (0.0). It was meant to make a knee-
+    # based get-up viable, but as a per-step bump for knees-down + upright at
+    # kneeling height it instead REWARDED the z≈0.28 crouch and reinforced the
+    # exact failure mode v3 got stuck in. Kept in the reward (gated, fades at
+    # standing) for a future redesign (e.g. gated on upward trunk velocity so
+    # it only rewards a kneel-and-PUSH, never static kneeling). 0 = off.
+    knee_support: float = 0.0
 
 
 # Regularizer weights zeroed in the "discovery" reward stage. These are
@@ -643,7 +652,13 @@ class StandupConfig:
     # ground already covered (the down→up "pump" of the dolphin slam) earns
     # nothing — only genuinely NEW progress is paid. OFF = the old per-step
     # reference (rewards oscillatory pumping).
-    progress_ratchet: bool = True
+    #
+    # DEFAULT OFF (regression fix): with the ratchet ON, the rise reward
+    # collapsed (a climb-with-wobble only pays for the new highs, far less than
+    # the per-step signal) and v3 never left the crouch. The trunk contact-
+    # force penalty already targets the actual slam (impact), so the ratchet's
+    # anti-pump role isn't worth the lost rise drive. Flip True to experiment.
+    progress_ratchet: bool = False
 
     # ── Assist re-bootstrap on curriculum level-up ───────────────────────
     # On a pose-level advance, reset the success-rate EMA to 0 so the HoST

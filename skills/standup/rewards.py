@@ -499,12 +499,14 @@ def compute_standup_reward(
     # force on the Trunk ABOVE a threshold (resting on the floor is free, only
     # impacts/slams are taxed): (clip((F − thresh)/scale, 0, ∞))². Directly
     # discourages the "slam the torso for momentum" exploit that would damage a
-    # real robot, and is active during the get-up itself.
+    # real robot. SUCCESS-RAMPED (× pose_scale, the same success-EMA ramp as
+    # stand_pose) so it is ~0 during fresh discovery and only bites once the
+    # robot reliably stands — a penalty active from step 0 froze the get-up.
     if trunk_contact_force is not None:
         tf_excess = np.clip(
             (trunk_contact_force - trunk_contact_force_thresh)
             / max(trunk_contact_force_scale, 1e-6), 0.0, None)
-        trunk_force_pen = (tf_excess ** 2).astype(np.float32)
+        trunk_force_pen = (tf_excess ** 2 * pose_scale).astype(np.float32)
     else:
         trunk_force_pen = np.zeros(root_pos.shape[0], dtype=np.float32)
 
