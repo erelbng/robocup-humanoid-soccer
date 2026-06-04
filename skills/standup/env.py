@@ -162,7 +162,7 @@ class K1StandupEnv(SkillEnv):
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
 
-        # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
+        # ── Pose difficulty curriculum (L0–L2) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
         # Env-step count at which the CURRENT level started. All easing
@@ -181,7 +181,7 @@ class K1StandupEnv(SkillEnv):
         # ── Reverse-height get-up curriculum (R0..R_final) ────────────────
         # Outer curriculum: start near standing (upright crouch) and move the
         # start progressively more fallen. Stages 0..K-1 sample from crouch
-        # pools; the final stage K hands off to the fallen-pose L0-L3 curriculum.
+        # pools; the final stage K hands off to the fallen-pose L0-L2 curriculum.
         self._recovery_final_stage: int = len(self.cfg.recovery_crouch_heights)
         self._recovery_stage: int = (
             self.cfg.recovery_start_stage
@@ -198,6 +198,9 @@ class K1StandupEnv(SkillEnv):
         # Joint random-sampling bounds cache (prone arm_random/leg_random pool
         # build). Keyed by tuple(joint_indices) → (lo, hi) float32 arrays.
         self._joint_rand_bounds: dict = {}
+        # Per-dof inset URDF-limit cache (constrained-pass clamping). Keyed by
+        # dof column → (lo, hi) float tuple, or None if no finite limit.
+        self._dof_limit_cache: dict = {}
 
         # Reward weights for the active stage. "discovery" zeroes the motion
         # regularizers so the policy can find ANY standup; "deploy" uses the
@@ -352,6 +355,62 @@ class K1StandupEnv(SkillEnv):
                           for k, ji in enumerate(idx)))
         return self._joint_rand_bounds[key]
 
+    def _inset_dof_limit(self, col: int):
+        """Return the (lo, hi) URDF limit for dof column `col`, inset by
+        `pose_pool_arm_random_limit_margin`, or None if the joint has no
+        finite limit. Cached per column.
+
+        Used to CLAMP the explicit (lo, hi) ranges of the constrained
+        randomization passes (bottom leg / down arm of a side pose) so a wide
+        requested range never drives a joint past its mechanical stop — the
+        full-range pass already insets via `_joint_random_bounds`, but the
+        constrained pass writes raw ranges, which on this robot overrun the
+        tight ankle / hip-roll / elbow-yaw limits.
+        """
+        cached = self._dof_limit_cache.get(col)
+        if cached is not None or col in self._dof_limit_cache:
+            return cached
+        margin = float(self.cfg.pose_pool_arm_random_limit_margin)
+        name = self.robot_cfg.joint_names[col]
+        joint_by_name = {j.name: j for j in getattr(self.robot, "joints", [])}
+        res = None
+        j = joint_by_name.get(name)
+        if j is not None:
+            try:
+                lim = _to_np(j.dofs_limit)
+                if lim.ndim == 2 and lim.shape[0] >= 1:
+                    jlo, jhi = float(lim[0, 0]), float(lim[0, 1])
+                    if (np.isfinite(jlo) and np.isfinite(jhi)
+                            and jhi - jlo > 2.0 * margin):
+                        res = (jlo + margin, jhi - margin)
+            except Exception:
+                pass
+        self._dof_limit_cache[col] = res
+        return res
+
+    def _apply_constrained_targets(self, jpos_target, constrained,
+                                   name_to_idx) -> None:
+        """Overwrite jpos_target columns with uniform samples from explicit
+        (lo, hi) ranges, each CLAMPED to the joint's inset URDF limit so a wide
+        requested range can never spawn a joint past its mechanical stop.
+        Shared by the bottom-leg and down-arm constrained passes.
+        """
+        N = jpos_target.shape[0]
+        for jname, (clo, chi) in constrained.items():
+            col = name_to_idx.get(jname)
+            if col is None:
+                continue
+            clo, chi = float(clo), float(chi)
+            lim = self._inset_dof_limit(col)
+            if lim is not None:
+                lo_l, hi_l = lim
+                clo = min(max(clo, lo_l), hi_l)
+                chi = min(max(chi, lo_l), hi_l)
+                if clo > chi:                  # fully outside the limit → pin
+                    clo = chi
+            jpos_target[:, col] = self.rng.uniform(
+                clo, chi, size=N).astype(np.float32)
+
     def _build_pose_pool(self, pose, keep_upright: bool = False,
                          quat_noise_rad: float = None,
                          joint_jitter_rad: float = None,
@@ -453,9 +512,10 @@ class K1StandupEnv(SkillEnv):
             # penetration/orientation filters cull any invalid (limb-in-floor /
             # non-prone) result.
             if arm_random:
-                # A pose may restrict randomization to a subset of arm joints
-                # (side poses: UP arm only — the DOWN arm stays braced so the
-                # trunk holds its side height and the leg reference stays valid).
+                # A pose may restrict FULL-range randomization to a subset of arm
+                # joints (side poses: UP arm only). The DOWN (brace) arm is then
+                # randomized within bracing-safe bounds by the constrained pass
+                # below (shoulder-roll kept floor-ward), not left fully fixed.
                 names = getattr(pose, "arm_random_joint_names", None)
                 if names:
                     arm_cols = [name_to_idx[n] for n in names
@@ -468,13 +528,11 @@ class K1StandupEnv(SkillEnv):
                 # Constrained pass: explicit per-joint (lo, hi) — the DOWN (brace)
                 # arm of a side pose, shoulder-roll kept floor-ward so the elbow
                 # stays a contact (mirror of the bottom-leg constrained pass).
+                # Clamped to inset URDF limits (e.g. elbow-yaw is one-sided).
                 arm_constrained = getattr(pose, "arm_random_constrained", None)
                 if arm_constrained:
-                    for jname, (clo, chi) in arm_constrained.items():
-                        col = name_to_idx.get(jname)
-                        if col is not None:
-                            jpos_target[:, col] = self.rng.uniform(
-                                clo, chi, size=N).astype(np.float32)
+                    self._apply_constrained_targets(
+                        jpos_target, arm_constrained, name_to_idx)
             if leg_random:
                 # Full-range pass: all 12 leg joints (prone/supine) or a subset
                 # (side poses: the TOP leg only — the bottom leg is the tripod
@@ -491,13 +549,12 @@ class K1StandupEnv(SkillEnv):
                         lo, hi, size=(N, len(leg_cols))).astype(np.float32)
                 # Constrained pass: explicit per-joint (lo, hi) — the BOTTOM leg
                 # of a side pose, kept floor-ward so the foot stays a contact.
+                # Clamped to inset URDF limits (the K1 ankles barely travel, and
+                # hip-roll floor-ward is limited on the bottom side).
                 constrained = getattr(pose, "leg_random_constrained", None)
                 if constrained:
-                    for jname, (clo, chi) in constrained.items():
-                        col = name_to_idx.get(jname)
-                        if col is not None:
-                            jpos_target[:, col] = self.rng.uniform(
-                                clo, chi, size=N).astype(np.float32)
+                    self._apply_constrained_targets(
+                        jpos_target, constrained, name_to_idx)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)
@@ -747,7 +804,7 @@ class K1StandupEnv(SkillEnv):
         """Top-level reset sampler honoring the reverse-height curriculum.
 
         While in a crouch stage (R < R_final), sample from that stage's upright
-        crouch pool; at the final stage, hand off to the fallen-pose L0-L3
+        crouch pool; at the final stage, hand off to the fallen-pose L0-L2
         curriculum. Falls back to the fallen sampler if a crouch pool is empty.
 
         Returns (pos, quat, jpos, is_side) — see _gather_by_choice for is_side.
@@ -773,8 +830,9 @@ class K1StandupEnv(SkillEnv):
 
         L0 → prone only               — easiest single entry pose (belly)
         L1 → prone + supine           — add the back recovery
-        L2 → all 4 named poses        — + side_left + side_right (side-biased)
-        L3 → all 4 named poses        — equal mix, fully relaxed (robustness)
+        L2 → all 4 named poses        — + side_left + side_right (terminal:
+                                        full robustness, side-biased on entry,
+                                        relaxing to an equal 25% mix)
 
         Prone and supine are *different motor strategies* (prone: arm push-up
         → tuck → stand; supine: roll/sit up, tuck knees), so they are added
@@ -782,7 +840,8 @@ class K1StandupEnv(SkillEnv):
 
         The four named pose pools are each already heavily randomized (arm/leg
         joints twisted within the side-stability filters), so there is no
-        separate "random" settle pool: L3 just draws equally from all four.
+        separate "random" settle pool — L2 (terminal) just draws equally from
+        all four.
 
         On every level-up the sampler BIASES toward the just-introduced
         pose(s) and relaxes back to the level's base mix over
@@ -802,12 +861,9 @@ class K1StandupEnv(SkillEnv):
         elif level == 1:
             base = np.array([0.5, 0.5, 0., 0.], dtype=np.float64)
             new = (0,)                               # supine
-        elif level == 2:
+        else:  # level >= 2 (terminal): equal mix, side-biased on entry
             base = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
             new = (2, 3)                             # side_left, side_right
-        else:  # level >= 3: equal mix of all four (no new pose to bias toward)
-            base = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
-            new = ()
 
         # Decaying bias toward the freshly-introduced pose(s).
         if new and self.cfg.pose_mix_bias_start > 0.0:
@@ -1267,7 +1323,7 @@ class K1StandupEnv(SkillEnv):
         components["success_rate_ema"] = self._success_rate_ema
 
         # Curriculum advancement. The reverse-height (recovery) curriculum is
-        # the OUTER stage; the fallen-pose L0-L3 curriculum only starts
+        # the OUTER stage; the fallen-pose L0-L2 curriculum only starts
         # advancing once we've reached the final (fallen) recovery stage.
         self._maybe_advance_recovery_stage()
         if self._recovery_stage >= self._recovery_final_stage:
@@ -1278,7 +1334,7 @@ class K1StandupEnv(SkillEnv):
         # log_std-pump + LR-reset (b09d769) fires on every curriculum advance —
         # entropy decays over time and jumps back up at each level-up.
         # With the recovery curriculum DISABLED (the current config) this is
-        # exactly Karl's pose level L0..L3. (If the recovery curriculum is
+        # exactly Karl's pose level L0..L2. (If the recovery curriculum is
         # re-enabled, prepend its stages R0..R(K-1) so the pump fires on those
         # advances too — they're 0 while disabled.)
         if self.cfg.recovery_curriculum_enabled:
@@ -1338,7 +1394,7 @@ class K1StandupEnv(SkillEnv):
             # (~0) and prone (-1) are excluded by orientation. Additionally
             # gate by a pose-level WINDOW so the anti-flip only arms where the
             # detour appears (default: L1 only) — NOT in L0 discovery, and
-            # never on a back-lying RANDOM start in L2/L3. Must match the
+            # never on a back-lying start in L2 (terminal). Must match the
             # rewards-side penalty (max(0, -proj_g_x)): both treat supine as
             # g_x>0 and the belly-flip as g_x<0.
             armed = (self.cfg.supine_anti_flip_min_level

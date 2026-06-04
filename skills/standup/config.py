@@ -262,14 +262,15 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
+    # ── Pose difficulty curriculum (discrete, L0–L2) ──────────────────────
     # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
     #   L0: prone only                — easiest single entry pose (belly)
     #   L1: prone + supine (50/50)    — add the back recovery
-    #   L2: all 4 named poses (25% each) — + side_left + side_right
-    #   L3: named 50% + random fallen 50% — full robustness
+    #   L2: all 4 named poses (25% each) — + side_left + side_right (terminal,
+    #       full robustness). Each named pool is already heavily randomized, so
+    #       there is no separate "random" fallen level beyond this.
     #
     # Prone (arm push-up → tuck → stand) and supine (roll/sit up) are
     # different motor strategies. Training both 50/50 from the start averages
@@ -277,18 +278,18 @@ class StandupConfig:
     # success EMA stalls below the gate when one pose lags — so supine is held
     # back to L1 and gets there only after prone is solid. Recovery from
     # fully-fallen poses is bootstrapped by the decaying assist force. Set
-    # pose_curriculum_start_level=3 to train directly on the full mixed
+    # pose_curriculum_start_level=2 to train directly on the full mixed
     # distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
 
     # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length = (num_levels - 1) = 3.
-    #   L0→L1 (prone solid before adding supine), L1→L2, L2→L3.
+    # transition from level i → i+1. Length = (num_levels - 1) = 2.
+    #   L0→L1 (prone solid before adding supine), L1→L2 (add side poses).
     # Set just below assist_success_target (0.60) so advancement requires
     # genuine, largely-unassisted competence — by the time the success EMA
     # hits 0.55 the performance-coupled assist is already low (~0.08).
-    pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
+    pose_level_thresholds: tuple = (0.55, 0.55)
 
     # Pose-level WINDOW [min, max] (inclusive) in which `supine_anti_flip` is
     # armed. Default = only L1:
@@ -298,8 +299,8 @@ class StandupConfig:
     #     freshly-learned prone arm-push gets misapplied to those back starts
     #     (roll-to-belly / cobra detour) → arm the anti-flip here to force
     #     direct back-recovery.
-    #   * L2 (side poses) / L3 (random) want unconstrained generalisation, and
-    #     a back-lying random start must not trigger it → off.
+    #   * L2 (adds side poses, terminal) wants unconstrained generalisation,
+    #     and a back-lying start must not trigger it → off.
     # Non-back starts are additionally exempt via the orientation test.
     supine_anti_flip_min_level: int = 1
     supine_anti_flip_max_level: int = 1
@@ -430,10 +431,10 @@ class StandupConfig:
     # passes a gate. Mastering "stand from a squat" first bootstraps the full
     # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
     # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
-    # existing L0-L3 fallen-pose curriculum unchanged.
+    # existing L0-L2 fallen-pose curriculum unchanged.
     #
     # DISABLED (mergefixes): per project decision we run ONLY Karl's pose-
-    # difficulty curriculum (L0-L3, _sample_reset_from_level / _maybe_advance_
+    # difficulty curriculum (L0-L2, _sample_reset_from_level / _maybe_advance_
     # level) and no other start-state curriculum. With this False the env sets
     # _recovery_stage = _recovery_final_stage at construction, so _sample_reset
     # hands off to Karl's pose curriculum from step 0 and the crouch pools are
