@@ -125,6 +125,22 @@ class StandupRewardWeights:
     # so it cannot tax the rise into a crouch-freeze.
     stand_pose: float = 6.0
 
+    # Post-success STILLNESS — once a sustained stand is achieved AND still
+    # holding, highly reward being motionless: exp(-(Σq̇²/jv + ‖v‖²/vs)),
+    # paid per post-success frame on TOP of post_success_standing. Gated by
+    # (achieved_sustained & frame_success), so it can only ever reward a robot
+    # that has already stood — it never touches the get-up. This is the "stand
+    # still in the pose after a successful standup" reward.
+    post_success_still: float = 8.0
+
+    # Stand "on the spot" — penalise horizontal travel of the base from the
+    # spawn point, (max(0, ‖xy − xy0‖ − tol))². With a generous tolerance a
+    # normal in-place get-up (incl. a short roll) pays ~0, while a policy that
+    # jiggles metres across the field to stand up is taxed hard (quadratic).
+    # A position penalty (not a velocity one), so it never penalises the
+    # vigorous motion a get-up needs — only NET displacement.
+    on_spot: float = 6.0
+
     # Anti-detour penalty for BACK (supine) starts — teaches a direct
     # back-recovery instead of the "roll onto the belly / cobra, then push
     # up" detour. Body-frame gravity-x is −1 when supine, +1 when prone,
@@ -560,6 +576,29 @@ class StandupConfig:
     # is still learning to stand and ramps to full only once it reliably
     # succeeds. 0.5 ≈ "stands about half the time" → start sculpting the pose.
     stand_pose_success_ref: float = 0.5
+
+    # Hip-roll abduction (rad) applied to the stand_pose TARGET so the desired
+    # final stance is SHOULDER-wide, not hip-wide. Left_Hip_Roll += this,
+    # Right_Hip_Roll -= this (URDF axis 1 0 0 → +left/-right spreads the feet).
+    # ~0.15 rad ≈ +13 cm total stance width over the hip-width default → about
+    # shoulder width. The knees keep the default's slight bend.
+    stand_target_hip_abduction: float = 0.15
+    # Free-zone radius (m) for feet_under_base: a foot within this of the base
+    # gets full credit, so a shoulder-wide stance is NOT pulled together. Must
+    # cover the shoulder-wide foot offset (~0.16 m) with margin, while still
+    # well below feet_under_base_soft_d (0.40) so cobra/sprawl scores 0.
+    feet_under_base_plateau_d: float = 0.22
+
+    # ── Post-success stillness (StandupRewardWeights.post_success_still) ──
+    # exp(-(Σq̇²/jv_scale + ‖v‖²/v_scale)): smaller scales = stricter stillness.
+    post_success_still_jv_scale: float = 3.0    # joint kinetic-energy scale
+    post_success_still_v_scale: float = 0.2     # base linear-velocity scale
+
+    # ── Stand-on-the-spot (StandupRewardWeights.on_spot) ─────────────────
+    # Horizontal base travel from the spawn point up to this radius (m) is
+    # free; beyond it the penalty grows quadratically. Generous enough for an
+    # in-place get-up incl. a short roll, tight enough to forbid wandering.
+    on_spot_tol: float = 0.6
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000

@@ -161,6 +161,18 @@ class K1StandupEnv(SkillEnv):
         # poses), set from the reset orientation. Gates the supine_anti_flip
         # penalty so only back-starts are taxed for rolling face-down.
         self._start_supine = np.zeros(self.num_envs, dtype=bool)
+        # Base xy captured at reset — anchor for the "stand on the spot"
+        # (on_spot) horizontal-travel penalty.
+        self._start_xy = np.zeros((self.num_envs, 2), dtype=np.float32)
+        # SHOULDER-wide standing target for the stand_pose reward: the default
+        # pose with the hip-roll joints abducted (Left += a, Right -= a). Arms
+        # and knees keep the default (arms at sides, slight knee bend).
+        self._stand_target_pose = self._default_action.copy()
+        _abd = float(self.cfg.stand_target_hip_abduction)
+        _names = self.robot_cfg.joint_names
+        if "Left_Hip_Roll" in _names and "Right_Hip_Roll" in _names:
+            self._stand_target_pose[_names.index("Left_Hip_Roll")] += _abd
+            self._stand_target_pose[_names.index("Right_Hip_Roll")] -= _abd
         self._prev_prev_action = np.zeros((self.num_envs, self.act_dim),
                                           dtype=np.float32)
         # Cumulative env-steps seen by the policy (sum over all parallel
@@ -1243,9 +1255,15 @@ class K1StandupEnv(SkillEnv):
             pose_joint_indices=(tuple(self.robot_cfg.arm_joint_indices)
                                 + tuple(self.robot_cfg.leg_joint_indices)),
             default_joint_pos=self._default_action,
+            stand_target_pose=self._stand_target_pose,
             stand_pose_dev_scale=self.cfg.stand_pose_dev_scale,
             success_ema=self._success_rate_ema,
             stand_pose_success_ref=self.cfg.stand_pose_success_ref,
+            start_xy=self._start_xy,
+            on_spot_tol=self.cfg.on_spot_tol,
+            post_success_still_jv_scale=self.cfg.post_success_still_jv_scale,
+            post_success_still_v_scale=self.cfg.post_success_still_v_scale,
+            feet_under_base_plateau_d=self.cfg.feet_under_base_plateau_d,
             target_height=target_h,
             upright_threshold=upright_thresh,
             hold_steps=hold_steps,
@@ -1341,6 +1359,9 @@ class K1StandupEnv(SkillEnv):
             quat = _to_np(self.robot.get_quat())
             self._prev_upright[envs_idx] = upright_signal(
                 quat[envs_idx]).astype(np.float32)
+            # Anchor the on-spot penalty to the post-reset base xy.
+            pos = _to_np(self.robot.get_pos())
+            self._start_xy[envs_idx] = pos[envs_idx, :2].astype(np.float32)
             # Body-frame gravity-x > +0.5 ⇔ lying on the back (supine). Side
             # (~0) and prone (-1) are excluded by orientation. Additionally
             # gate by a pose-level WINDOW so the anti-flip only arms where the

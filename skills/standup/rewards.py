@@ -138,23 +138,29 @@ def _feet_grounded_score(foot_z: np.ndarray,
 
 
 def feet_under_base_score(foot_xy: np.ndarray, base_xy: np.ndarray,
-                           d_max: float = 0.40) -> np.ndarray:
+                           d_max: float = 0.40,
+                           plateau_d: float = 0.0) -> np.ndarray:
     """Multiplicative AND in [0, 1] of how close each foot is to being
-    directly UNDER the base in the world horizontal plane.
+    (roughly) UNDER the base in the world horizontal plane.
 
     This is the signal that `_feet_grounded_score` is missing: that score
     rewards feet being LOW (z≈0), which a prone / cobra / push-up / L-sit
     pose satisfies trivially with its legs splayed FLAT on the floor — the
     feet are on the ground, but the robot is lying on them, not standing on
     them. When the robot actually stands, both feet sit roughly beneath the
-    base (horizontal offset ≈ stance half-width, ~0.15 m); when the legs are
-    extended flat they are ~0.4–0.6 m away horizontally. Smooth ramp → 1 at
-    d=0 (foot under base), → 0 at d≥d_max, so PPO gets a gradient that pulls
-    the feet inward rather than a hard wall.
+    base; when the legs are extended flat they are ~0.4–0.6 m away.
+
+    `plateau_d` is a FREE-ZONE radius: any foot within `plateau_d` of the base
+    gets full credit, and the ramp to 0 runs over [plateau_d, d_max]. With the
+    default 0 it peaks only at d=0 (pulling the feet together). Set it to the
+    desired standing stance half-width so a SHOULDER-wide stance is NOT
+    penalised, while a cobra / sprawl (d ≥ d_max) still scores 0.
     """
     # foot_xy: (N, 2, 2) [foot, xy]; base_xy: (N, 2)
     d = np.linalg.norm(foot_xy - base_xy[:, None, :], axis=2)  # (N, 2)
-    score = np.clip(1.0 - d / max(d_max, 1e-6), 0.0, 1.0)
+    excess = np.clip(d - max(plateau_d, 0.0), 0.0, None)
+    span = max(d_max - max(plateau_d, 0.0), 1e-6)
+    score = np.clip(1.0 - excess / span, 0.0, 1.0)
     return (score[:, 0] * score[:, 1]).astype(np.float32)
 
 
@@ -262,22 +268,23 @@ def standing_tall_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
 
 
 def stand_pose_signal(joint_pos: np.ndarray, pose_joint_indices: tuple,
-                      default_joint_pos: np.ndarray, upright: np.ndarray,
+                      target_pose: np.ndarray, upright: np.ndarray,
                       dev_scale: float = 1.0) -> np.ndarray:
-    """Positive [0, 1] reward for holding the nominal standing pose — bent
-    knees, hip-wide feet, arms at the sides (i.e. the K1 `default_joint_pos`),
-    ready to transition to walking.
+    """Positive [0, 1] reward for holding the desired standing pose — a little
+    bent knees, SHOULDER-wide feet (hips abducted), arms at the sides — ready
+    to transition to walking. `target_pose` is the standup-specific target
+    (the K1 default pose with the hip-roll joints abducted; see
+    StandupConfig.stand_target_hip_abduction).
 
-    `exp(-Σ(q - q_rest)² / dev_scale)` over the shaped joints (arms + legs),
-    peaking at 1 when the body sits at the default pose. Multiplied by
-    `near_upright_gate(up)` so it is 0 through the whole recovery (the policy
-    keeps full freedom to stand up) and only shapes the FINAL pose. The caller
-    additionally ramps the whole term with the success-rate EMA, so it stays
-    off until the robot reliably stands and only then sculpts the end pose."""
-    if len(pose_joint_indices) == 0 or default_joint_pos is None:
+    `exp(-Σ(q - q_target)² / dev_scale)` over the shaped joints (arms + legs),
+    peaking at 1 at the target pose. Multiplied by `near_upright_gate(up)` so
+    it is 0 through the whole recovery (the policy keeps full freedom to stand
+    up) and only shapes the FINAL pose. The caller additionally ramps the whole
+    term with the success-rate EMA, so it stays off until the robot reliably
+    stands and only then sculpts the end pose."""
+    if len(pose_joint_indices) == 0 or target_pose is None:
         return np.zeros(joint_pos.shape[0], dtype=np.float32)
-    dev = joint_pose_deviation(joint_pos, pose_joint_indices,
-                               default_joint_pos)
+    dev = joint_pose_deviation(joint_pos, pose_joint_indices, target_pose)
     pose = np.exp(-dev / max(dev_scale, 1e-6))
     return (pose * near_upright_gate(upright)).astype(np.float32)
 
@@ -348,9 +355,15 @@ def compute_standup_reward(
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
     pose_joint_indices: tuple = (),  # joints shaped to the target stand pose
     default_joint_pos: np.ndarray = None,
+    stand_target_pose: np.ndarray = None,  # default w/ hips abducted (shoulder-wide)
     stand_pose_dev_scale: float = 1.0,
     success_ema: float = 0.0,         # running frame-success rate (0..1)
     stand_pose_success_ref: float = 0.5,
+    start_xy: np.ndarray = None,      # (N, 2) base xy captured at reset
+    on_spot_tol: float = 0.6,
+    post_success_still_jv_scale: float = 3.0,
+    post_success_still_v_scale: float = 0.2,
+    feet_under_base_plateau_d: float = 0.0,
     target_height: float = 0.55,
     upright_threshold: float = 0.92,
     hold_steps: int = 30,
@@ -435,12 +448,35 @@ def compute_standup_reward(
     # rate EMA (`pose_scale`): ~0 while the policy is still learning to stand,
     # rising to full strength only once it reliably succeeds — so it never
     # disturbs the proven get-up, it only sculpts the end pose afterwards.
+    _stand_target = (stand_target_pose if stand_target_pose is not None
+                     else default_joint_pos)
     pose = stand_pose_signal(joint_pos, pose_joint_indices,
-                             default_joint_pos, up,
+                             _stand_target, up,
                              dev_scale=stand_pose_dev_scale)
     pose_scale = float(np.clip(success_ema / max(stand_pose_success_ref, 1e-6),
                                0.0, 1.0))
     stand_pose = (pose * pose_scale).astype(np.float32)
+
+    # Post-success STILLNESS — highly reward being motionless once a sustained
+    # stand is achieved AND still held. Raw (ungated) joint + base kinetic
+    # energy → exp() so it peaks at 1 when perfectly still. Gated to
+    # (achieved_sustained & frame_success) so it ONLY ever rewards an
+    # already-standing robot; it cannot touch the get-up.
+    still_score = np.exp(
+        -(joint_vel_quiet(joint_vel) / max(post_success_still_jv_scale, 1e-6)
+          + base_lin_vel_drift(root_lin_vel)
+          / max(post_success_still_v_scale, 1e-6))).astype(np.float32)
+
+    # Stand "on the spot" — quadratic penalty on horizontal base travel from
+    # the spawn xy beyond a tolerance (an in-place get-up incl. a short roll
+    # pays ~0; jiggling across the field is taxed hard).
+    if start_xy is not None:
+        disp = np.linalg.norm(root_pos[:, :2] - start_xy, axis=1)
+        on_spot_excess = np.clip(disp - on_spot_tol, 0.0, None)
+        on_spot_pen = (on_spot_excess ** 2).astype(np.float32)
+    else:
+        disp = np.zeros(root_pos.shape[0], dtype=np.float32)
+        on_spot_pen = np.zeros(root_pos.shape[0], dtype=np.float32)
 
     # Per-frame "looks standing" — env will count consecutive frames.
     # Gated by feet_ok (feet grounded + under base) so the post-success
@@ -480,6 +516,10 @@ def compute_standup_reward(
     # forfeits all of it — exactly the "fast AND stable" pressure we want.
     post_success = (achieved_sustained & frame_success).astype(np.float32)
 
+    # Post-success stillness — `still_score` gated to the same post-success
+    # frames, so staying motionless in the held stand is highly rewarded.
+    post_success_still = (post_success * still_score).astype(np.float32)
+
     # Anti-gaming "stand on feet" reward — only pays for the joint
     # condition (both feet grounded AND trunk lifted). Closes the bridge
     # / shoulder-stand / sprawled-on-back local optima where the policy
@@ -495,7 +535,8 @@ def compute_standup_reward(
     # to 1.0 (no-op) when foot_xy is unavailable.
     if foot_xy is not None:
         under_base = feet_under_base_score(
-            foot_xy, root_pos[:, :2], d_max=feet_under_base_soft_d)
+            foot_xy, root_pos[:, :2], d_max=feet_under_base_soft_d,
+            plateau_d=feet_under_base_plateau_d)
     else:
         under_base = np.ones(root_pos.shape[0], dtype=np.float32)
 
@@ -549,6 +590,7 @@ def compute_standup_reward(
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
         + w.stand_pose * stand_pose
+        - w.on_spot * on_spot_pen
         - w.supine_anti_flip * supine_flip_pen
     ).astype(np.float32)
     r_reg = (
@@ -564,6 +606,7 @@ def compute_standup_reward(
         - w.time_penalty * time_pen
         + w.success_bonus * sustained_bonus
         + w.post_success_standing * post_success
+        + w.post_success_still * post_success_still
     ).astype(np.float32)
 
     r = (r_task + r_reg + r_success).astype(np.float32)
@@ -593,6 +636,9 @@ def compute_standup_reward(
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
         "stand_pose": float(np.mean(stand_pose)),
+        "post_success_still": float(np.mean(post_success_still)),
+        "on_spot_pen": float(np.mean(on_spot_pen)),
+        "mean_base_disp": float(np.mean(disp)),
         "stand_pose_scale": float(pose_scale),
         "supine_anti_flip": float(np.mean(supine_flip_pen)),
         "feet_under_base": float(np.mean(under_base)),
