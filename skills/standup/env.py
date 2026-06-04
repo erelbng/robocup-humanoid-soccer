@@ -576,6 +576,16 @@ class K1StandupEnv(SkillEnv):
                 lo, hi = self._joint_random_bounds(tuple(arm_cols))
                 jpos_target[:, arm_cols] = self.rng.uniform(
                     lo, hi, size=(N, len(arm_cols))).astype(np.float32)
+                # Constrained pass: explicit per-joint (lo, hi) — the DOWN (brace)
+                # arm of a side pose, shoulder-roll kept floor-ward so the elbow
+                # stays a contact (mirror of the bottom-leg constrained pass).
+                arm_constrained = getattr(pose, "arm_random_constrained", None)
+                if arm_constrained:
+                    for jname, (clo, chi) in arm_constrained.items():
+                        col = name_to_idx.get(jname)
+                        if col is not None:
+                            jpos_target[:, col] = self.rng.uniform(
+                                clo, chi, size=N).astype(np.float32)
             if leg_random:
                 # Full-range pass: all 12 leg joints (prone/supine) or a subset
                 # (side poses: the TOP leg only — the bottom leg is the tripod

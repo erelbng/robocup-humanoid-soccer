@@ -344,10 +344,11 @@ class StandupConfig:
     # Side rounds: random arms + legs (side_left) + the unpinned rollover-verify
     # and at-rest filters reject more states than the old fixed-brace pose, so
     # build more rounds to keep the side pool populated. Was 6 (fixed brace),
-    # then 12 (arm random), then 18 (added leg randomization); 30 compensates for
-    # the WIDE bottom-leg ranges (twisted/turned configs roll out more often, so
-    # the rollover-verify culls a larger fraction → need more rounds for yield).
-    pose_pool_side_rounds: int = 30         # compensates for higher filter rejection rate
+    # then 12 (arm random), then 18 (added leg randomization), then 30 (WIDE
+    # bottom-leg ranges); 40 also covers DOWN-arm randomization — twisting the
+    # load-bearing brace rolls more configs out, so the verify culls a larger
+    # fraction → need more rounds for yield.
+    pose_pool_side_rounds: int = 40         # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
     # Prone + supine use wide uniform-random arm+leg joint targets
     # (StandupPose.arm_random + leg_random) to get diverse limb configs.

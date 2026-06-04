@@ -103,15 +103,20 @@ class StandupPose:
     # invalid result. The arm entries in `joint_targets` then act only as a
     # harmless fallback. Used by prone (see prone()).
     arm_random: bool = False
-    # Restrict arm randomization to these joint NAMES (subset of the 8 arm
-    # joints). None = randomize ALL arm joints (the supine/prone default). Side
-    # poses set this to the UP-arm joints only: the DOWN arm must stay at its
-    # braced reference, because the down-arm elbow brace is what holds the trunk
-    # at z≈0.13 m. Randomizing it removes the brace → the trunk settles lower →
-    # the brace-tuned bottom-leg reference gets driven into the floor (the
-    # legs-in-ground regression). The up arm alone still gives the requested
-    # variety (crossed over the torso / raised / bent / twisted).
+    # Restrict FULL-range arm randomization to these joint NAMES (subset of the 8
+    # arm joints). None = randomize ALL arm joints (the supine/prone default).
+    # Side poses set this to the UP-arm joints only. The DOWN arm is the floor
+    # brace whose elbow contact holds the trunk at z≈0.13 m, so it is NOT given
+    # the full URDF range (that removes the brace → trunk sinks/rolls); instead
+    # it is varied within bracing-safe bounds via arm_random_constrained below.
     arm_random_joint_names: Optional[Tuple[str, ...]] = None
+    # Arm joints to randomize within EXPLICIT (lo, hi) bounds instead of the
+    # full URDF range. Mirror of leg_random_constrained for the DOWN (brace) arm
+    # of a side pose: keep shoulder-ROLL floor-ward so the elbow stays a tripod
+    # contact, while varying shoulder-pitch (turn) / elbow-pitch (forearm bend) /
+    # elbow-yaw (twist). Applied AFTER the full-range arm pass, so it wins for its
+    # joints. Requires arm_random=True.
+    arm_random_constrained: Optional[Dict[str, Tuple[float, float]]] = None
     # Same as arm_random but for the 12 leg joints (hip pitch/roll/yaw, knee,
     # ankle pitch/roll for both legs) — produces varied leg configs (crossed,
     # one up one down, bent, twisted). The orientation/height filters reject
@@ -205,12 +210,13 @@ def prone() -> StandupPose:
 #   Large Elbow_Pitch (1.1 rad) bends forearm back so ELBOW JOINT = contact point.
 
 # side_left: RIGHT arm is DOWN arm, RIGHT leg is BOTTOM leg.
-# NOTE: side_left() randomizes only the UP arm (left) via arm_random_joint_names.
-# The DOWN arm (right) below stays at its braced reference: its elbow brace is
-# what holds the trunk on its side at z≈0.13 m, which the bottom-leg reference
-# is tuned for. The UP-arm angles below are just a fallback (overwritten by the
-# random sampler). An unpinned rollover-verify settle (see _build_pose_pool)
-# additionally rejects any up-arm config that rolls the trunk out of class.
+# NOTE: side_left() randomizes EVERY extremity. The UP arm (left) is full-range
+# random (arm_random_joint_names). The DOWN arm (right) is the floor brace, so it
+# is randomized within bracing-safe bounds (arm_random_constrained): shoulder-roll
+# kept floor-ward so the elbow stays a contact, while shoulder-pitch/elbow-pitch/
+# elbow-yaw vary for twist/turn. The arm angles below are just a fallback
+# (overwritten by the random sampler). The unpinned rollover-verify settle (see
+# _build_pose_pool) rejects any config that rolls the trunk out of class.
 #
 # LEGS: side_left() also randomizes the legs (leg_random=True). The TOP leg
 # (left) is randomized over its FULL range (twist/turn/bend/foot angle — it's
@@ -282,13 +288,23 @@ def side_left() -> StandupPose:
     # the trunk centre, so a small clearance buries it at spawn and the PD
     # holds it embedded through the settle. 0.45 m ensures the whole body
     # (including the down shoulder/elbow) spawns well above the floor.
-    # Randomize ONLY the UP arm (left) — the DOWN arm (right) keeps its braced
-    # reference so the elbow brace still holds the trunk at z≈0.13 m and the
-    # bottom-leg reference stays valid (avoids the legs-in-ground regression).
-    # The up arm alone yields the requested variety (crossed / raised / bent /
-    # twisted); the unpinned rollover-verify settle rejects any that destabilise.
+    # UP arm (left) — full-range random (not load-bearing): crossed / raised /
+    # bent / twisted. The unpinned rollover-verify settle rejects any that
+    # destabilise.
     up_arm_left = ("ALeft_Shoulder_Pitch", "Left_Shoulder_Roll",
                    "Left_Elbow_Pitch", "Left_Elbow_Yaw")
+    # DOWN arm (right) — WIDE twisted ranges, brace preserved. Shoulder-ROLL kept
+    # floor-ward (≥~0.45) so the elbow stays a tripod contact (mirror of the
+    # bottom leg's hip-roll prior); shoulder-pitch / elbow-pitch / elbow-yaw open
+    # up for twist/turn. The rollover-verify + orientation/trunk_z/at-rest/
+    # penetration filters cull any config that loses the brace (trunk rolls or the
+    # arm buries). Reference: pitch 0.6, roll 0.65, elbow_pitch 1.1, elbow_yaw 0.0.
+    down_arm_right = {
+        "Right_Shoulder_Roll": (0.45, 1.0),   # floor-ward — the brace prior
+        "ARight_Shoulder_Pitch": (0.0, 1.2),  # turn upper arm fwd/back
+        "Right_Elbow_Pitch": (0.3, 1.6),      # forearm bend (elbow-vs-hand contact)
+        "Right_Elbow_Yaw": (-1.0, 1.0),       # twist
+    }
     # TOP leg (left) — full-range random (not load-bearing): twist/turn/bend/foot.
     top_leg_left = ("Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
                     "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll")
@@ -313,6 +329,7 @@ def side_left() -> StandupPose:
     return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13,
                        spawn_clearance=0.45, arm_random=True,
                        arm_random_joint_names=up_arm_left,
+                       arm_random_constrained=down_arm_right,
                        leg_random=True,
                        leg_random_joint_names=top_leg_left,
                        leg_random_constrained=bottom_leg_right)
