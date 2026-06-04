@@ -91,7 +91,8 @@ def rollout(policy, obs_norm, model, data, idx, pose, cfg, *,
 
     obs_dim = rp._BASE_OBS_DIM
     last_action = np.zeros(idx["default"].shape[0], dtype=np.float32)
-    zs, ups, feet_ok = [], [], []
+    zs, ups, feet_ok, sat = [], [], [], []
+    flim_mag = np.abs(idx["flim"]).min(axis=1)  # per-joint torque limit (N·m)
     for t in range(steps):
         obs = rp.standup_obs(data, idx, last_action, t)
         nobs = obs_norm.normalize(obs[None])[0] if obs_norm is not None else obs
@@ -104,6 +105,14 @@ def rollout(policy, obs_norm, model, data, idx, pose, cfg, *,
             idx["default"] + np.clip(action, -rp._ACTION_DELTA_MAX,
                                      rp._ACTION_DELTA_MAX),
             -np.pi, np.pi)
+        # Torque-saturation probe: the demanded PD torque at the current state,
+        # BEFORE MuJoCo clips it to the motor forcerange. A high saturation
+        # fraction means the policy wants more torque than the limits allow —
+        # evidence it learned (in Genesis) to command torque the real/MuJoCo
+        # actuators can't deliver (e.g. Genesis not enforcing the effort limit).
+        q, qd = rp.joint_state(data, idx)
+        tau_dem = idx["kp"] * (target - q) - idx["kd"] * qd
+        sat.append(float(np.mean(np.abs(tau_dem) >= flim_mag - 1e-6)))
         rp.apply_pd(model, data, idx, target)
 
         quat = data.qpos[3:7][None, :].astype(np.float32)
@@ -143,6 +152,7 @@ def rollout(policy, obs_norm, model, data, idx, pose, cfg, *,
         end_z=float(zs[-tail:].mean()),
         end_up=float(ups[-tail:].mean()),
         frac_ok=float(frame_ok.mean()),
+        sat=float(np.mean(sat)),
     )
 
 
@@ -197,6 +207,7 @@ def eval_checkpoint(ckpt, poses_list, cfg, *, steps, trials, settle, jitter,
             end_z=float(np.mean([r["end_z"] for r in runs])),
             end_up=float(np.mean([r["end_up"] for r in runs])),
             frac_ok=float(np.mean([r["frac_ok"] for r in runs])),
+            sat=float(np.mean([r["sat"] for r in runs])),
         )
     return results
 
@@ -255,13 +266,13 @@ def main():
             continue
         out[ckpt] = res
         print(f"  {'pose':<11} {'stood':>7} {'max_z':>7} {'end_z':>7} "
-              f"{'end_up':>7} {'%ok':>6}")
+              f"{'end_up':>7} {'%ok':>6} {'%tau_sat':>9}")
         stood_rates = []
         for name, m in res.items():
             stood_rates.append(m["stood_rate"])
             print(f"  {name:<11} {m['stood_rate']*100:6.0f}% {m['max_z']:7.3f} "
                   f"{m['end_z']:7.3f} {m['end_up']:7.3f} "
-                  f"{m['frac_ok']*100:5.0f}%")
+                  f"{m['frac_ok']*100:5.0f}% {m['sat']*100:8.0f}%")
         overall = float(np.mean(stood_rates)) if stood_rates else 0.0
         verdict = ("TRANSFERS" if overall > 0.5
                    else "CROUCH-STALL / NO TRANSFER" if overall < 0.1
