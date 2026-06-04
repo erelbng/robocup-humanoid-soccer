@@ -366,6 +366,7 @@ def compute_standup_reward(
     feet_under_base_plateau_d: float = 0.0,
     max_upright: np.ndarray = None,   # (N,) episode high-water mark of upright
     progress_ratchet: bool = True,
+    reg_success_ramp: bool = False,
     trunk_contact_force: np.ndarray = None,   # (N,) net Trunk contact-force mag
     trunk_contact_force_thresh: float = 280.0,
     trunk_contact_force_scale: float = 196.0,
@@ -486,11 +487,18 @@ def compute_standup_reward(
 
     # Stand "on the spot" — quadratic penalty on horizontal base travel from
     # the spawn xy beyond a tolerance (an in-place get-up incl. a short roll
-    # pays ~0; jiggling across the field is taxed hard).
+    # pays ~0; jiggling across the field is taxed hard). SUCCESS-RAMPED
+    # (× pose_scale, the same success-EMA ramp as stand_pose / trunk_contact_
+    # force) so it is ~0 during fresh discovery — the policy needs full freedom
+    # to translate the base through a vigorous get-up, and an active travel
+    # penalty from step 0 collapses exploration into a wiggle-in-place cobra.
+    # It only arms once the robot reliably stands, then pulls the working
+    # get-up in-place. So it shapes the END behaviour without trapping
+    # discovery — never a "don't move" pressure during the rise.
     if start_xy is not None:
         disp = np.linalg.norm(root_pos[:, :2] - start_xy, axis=1)
         on_spot_excess = np.clip(disp - on_spot_tol, 0.0, None)
-        on_spot_pen = (on_spot_excess ** 2).astype(np.float32)
+        on_spot_pen = (on_spot_excess ** 2 * pose_scale).astype(np.float32)
     else:
         disp = np.zeros(root_pos.shape[0], dtype=np.float32)
         on_spot_pen = np.zeros(root_pos.shape[0], dtype=np.float32)
@@ -654,6 +662,14 @@ def compute_standup_reward(
         - w.action_smoothness * smooth
         - w.action_jerk * jerk
     ).astype(np.float32)
+    # HoST recipe: success-ramp the motion-quality group by the success EMA
+    # (× pose_scale, the same ramp as stand_pose / on_spot). Keeps the style
+    # terms ~0 through the get-up (discovery free) and folds them in only once
+    # the policy reliably stands — smoother, motion-speed-bounded, arms-to-sides
+    # — without a separate deploy stage. Also the main sim2sim lever: a gentler,
+    # lower-impact motion exploits fewer Genesis-specific contact quirks.
+    if reg_success_ramp:
+        r_reg = (r_reg * pose_scale).astype(np.float32)
     r_success = (
         w.success_persistence * persistence
         - w.time_penalty * time_pen

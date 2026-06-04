@@ -1326,6 +1326,7 @@ class K1StandupEnv(SkillEnv):
             feet_under_base_plateau_d=self.cfg.feet_under_base_plateau_d,
             max_upright=self._max_upright,
             progress_ratchet=self.cfg.progress_ratchet,
+            reg_success_ramp=self.cfg.reg_success_ramp,
             trunk_contact_force=trunk_force,
             trunk_contact_force_thresh=self.cfg.trunk_contact_force_thresh,
             trunk_contact_force_scale=self.cfg.trunk_contact_force_scale,

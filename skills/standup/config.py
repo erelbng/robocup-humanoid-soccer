@@ -300,7 +300,17 @@ class StandupConfig:
     # the policy can find ANY standup; "deploy" (Stage 2) uses the full
     # weight set for a smooth, sim2real-ready motion. Train discovery →
     # warm-start a deploy run from its checkpoint via --init-from.
-    reward_stage: str = "discovery"           # "discovery" | "deploy"
+    reward_stage: str = "deploy"           # "discovery" | "deploy"
+    # HoST recipe (standup-host-recipe branch): success-ramp the motion-quality
+    # group (r_reg: smoothness, jerk, joint-velocity, sway, drift, arm-posture)
+    # by the success EMA — the "fold light style into one run" path. With
+    # reward_stage="deploy" the reg weights are live, but × pose_scale keeps
+    # them ~0 during the get-up (discovery stays free) and ramps them in only
+    # once the policy reliably stands, so they SCULPT the motion (smoother,
+    # implicit motion-speed bound, arms-to-sides) without trapping discovery.
+    # This is also the main sim2sim lever: a gentler, lower-impact motion
+    # exploits fewer Genesis-specific contact quirks → transfers better.
+    reg_success_ramp: bool = True
 
     # ── Multi-critic PPO (HoST, arXiv:2502.08378) ────────────────────
     # One value head per reward group (STANDUP_CRITIC_GROUPS: task / reg /
@@ -310,13 +320,13 @@ class StandupConfig:
     # shaping and small penalties. Each critic fits one homogeneous-scale
     # group; advantages are normalized per group then weighted-summed.
     # Standup-only (the other skills keep single-critic PPO).
-    use_multi_critic: bool = False  # Restored to Karl's e52b48b config (single
-                                    # critic). Eric's multi-critic was a run-#3
-                                    # fix for his recovery-curriculum setup; we
-                                    # now run Karl's curriculum + rewards, which
-                                    # used a single critic. (n_critics=1 keeps the
-                                    # original param names → existing single-critic
-                                    # checkpoints load unchanged.)
+    use_multi_critic: bool = True   # standup-host-recipe: ON. HoST's multi-
+                                    # critic — one value head per reward group
+                                    # (task/reg/success), each fitting a
+                                    # homogeneous-scale return. n_critics=3, so
+                                    # an `--init-from` of a single-critic ckpt
+                                    # partial-loads the ACTOR (warm get-up) and
+                                    # starts the 3 critics fresh.
     # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
     # success). Bias toward `task` early to drive the get-up; `reg` is ~0
     # in the discovery stage anyway (its weights are zeroed).
