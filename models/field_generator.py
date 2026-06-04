@@ -600,7 +600,7 @@ def build_soccer_field(scene, physics_only: bool = False):
                 )
 
         # Center circle (segments)
-        n_seg = 48
+        n_seg = 36
         for i in range(n_seg):
             a0 = 2 * math.pi * i / n_seg
             a1 = 2 * math.pi * (i + 1) / n_seg
@@ -633,7 +633,7 @@ def build_soccer_field(scene, physics_only: bool = False):
 
         # Corner arcs (quarter circles at the 4 corners)
         car = {self.f.corner_arc_radius}
-        n_carc = 10
+        n_carc = 8
         for sx in [1, -1]:
             for sy in [1, -1]:
                 a_start = math.atan2(-sy, 0)
