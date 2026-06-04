@@ -265,13 +265,16 @@ class K1MatchEnv:
             ),
         )
 
-        # Field — physics-only (skip the ~80 visual-only line/circle
-        # entities) to keep per-env body count manageable. With 2K
-        # robots × 256 envs we're already at ~2K bodies; a fancy
-        # field would inflate that 10×.
+        # Field — visual markings ON by default so match replay videos show a
+        # real pitch. Set RC_FIELD_PHYSICS_ONLY=1 to skip the visual-only
+        # line/circle entities and keep per-env body count minimal for max-
+        # throughput self-play training (with 4v4 × many envs the extra fixed
+        # visual entities can matter — flip the env var if scene build is slow
+        # or GPU memory is tight).
+        physics_only = os.environ.get("RC_FIELD_PHYSICS_ONLY", "0") == "1"
         try:
             from models.field.field_genesis_builder import build_soccer_field
-            build_soccer_field(self.scene, physics_only=True)
+            build_soccer_field(self.scene, physics_only=physics_only)
         except Exception as e:
             print(f"[match_env] field builder failed ({e}); using plane.")
             self.scene.add_entity(

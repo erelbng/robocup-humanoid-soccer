@@ -67,105 +67,22 @@ def _add_ball_texture(spec, mj):
 
 
 def _add_field(spec, field: dict, mj, ball_material: str | None = None):
-    """Mutate `spec.worldbody` to add carpet, lines, goals, and a free ball.
+    """Mutate `spec.worldbody` to add the shared HSL field + a free ball.
 
-    Field elements are non-colliding (contype=conaffinity=0) so they don't
-    pollute robot contact resolution. The carpet sits at z=-0.011 to keep
-    the existing K1 ground plane at z=0 doing the actual physics.
+    The carpet + markings + goals come from
+    `models.field_builder.add_field_to_spec` — the single source of truth
+    shared with the eval path and the static scene generator — so the debug
+    render shows the same proper pitch (grass, center circle, penalty boxes +
+    marks, corner arcs, goals + nets). The collidable carpet replaces the K1's
+    own ground plane (which the caller removes before invoking us).
     """
+    from models.field_builder import add_field_to_spec
+    from models.field_generator import FieldDimensions
+    field_dims = FieldDimensions.from_json(
+        str(PROJECT_ROOT / "configs" / "field_hsl_2026.json"))
+    add_field_to_spec(spec, mj, field_dims, add_ball=False)
+
     wb = spec.worldbody
-    hl = field["half_length"]
-    hw = field["half_width"]
-    tl = field["total_length"]
-    tw = field["total_width"]
-    gw = field["goal_width"] / 2
-    gh = field["goal_height"]
-    gd = field["goal_depth"]
-    pal = field["penalty_area_length"]
-    paw = field["penalty_area_width"] / 2
-    ccr = field["center_circle_radius"]
-
-    def box(name, size, pos, rgba=(1, 1, 1, 1), collide=False, yaw=0.0):
-        g = wb.add_geom()
-        g.name = name
-        g.type = mj.mjtGeom.mjGEOM_BOX
-        g.size = list(size)
-        g.pos = list(pos)
-        g.rgba = list(rgba)
-        if not collide:
-            g.contype = 0
-            g.conaffinity = 0
-        if yaw:
-            half = yaw / 2.0
-            g.quat = [math.cos(half), 0.0, 0.0, math.sin(half)]
-        return g
-
-    def cyl(name, radius, half_height, pos, rgba=(0.95, 0.95, 0.95, 1),
-            collide=True):
-        g = wb.add_geom()
-        g.name = name
-        g.type = mj.mjtGeom.mjGEOM_CYLINDER
-        g.size = [radius, half_height, 0.0]
-        g.pos = list(pos)
-        g.rgba = list(rgba)
-        if not collide:
-            g.contype = 0
-            g.conaffinity = 0
-        return g
-
-    # Carpet — collidable replacement for the K1's own ground plane (which
-    # the caller removes before invoking us).
-    g = wb.add_geom()
-    g.name = "field_carpet"
-    g.type = mj.mjtGeom.mjGEOM_BOX
-    g.size = [tl / 2, tw / 2, 0.005]
-    g.pos = [0, 0, -0.005]
-    g.rgba = [0.10, 0.55, 0.10, 1.0]
-    g.friction = [1.0, 0.005, 0.0001]
-
-    # Field outline
-    lz = 0.002
-    for sign in (1, -1):
-        box(f"touchline_{'p' if sign>0 else 'n'}", (hl, 0.025, 0.001),
-            (0, sign * hw, lz))
-        box(f"goalline_{'p' if sign>0 else 'n'}", (0.025, hw, 0.001),
-            (sign * hl, 0, lz))
-    box("centerline", (0.025, hw, 0.001), (0, 0, lz))
-
-    # Penalty areas
-    for sign in (1, -1):
-        side = "p" if sign > 0 else "n"
-        box(f"pa_front_{side}", (0.025, paw, 0.001),
-            (sign * (hl - pal), 0, lz))
-        for ysign in (1, -1):
-            ys = "t" if ysign > 0 else "b"
-            box(f"pa_side_{side}_{ys}", (pal / 2, 0.025, 0.001),
-                (sign * (hl - pal / 2), ysign * paw, lz))
-
-    # Center circle segments
-    n_seg = 36
-    for i in range(n_seg):
-        a0 = 2 * math.pi * i / n_seg
-        a1 = 2 * math.pi * (i + 1) / n_seg
-        cx = (ccr * math.cos(a0) + ccr * math.cos(a1)) / 2
-        cy = (ccr * math.sin(a0) + ccr * math.sin(a1)) / 2
-        seg_len = 2 * ccr * math.sin(math.pi / n_seg)
-        ang = (a0 + a1) / 2
-        box(f"cc_{i}", (seg_len / 2, 0.025, 0.001),
-            (cx, cy, lz), yaw=ang)
-
-    # Goal posts and crossbars (collidable)
-    for sign in (1, -1):
-        side = "p" if sign > 0 else "n"
-        gx = sign * hl
-        for ysign in (1, -1):
-            ys = "L" if ysign > 0 else "R"
-            cyl(f"post_{side}_{ys}", 0.05, gh / 2,
-                (gx + sign * gd / 2, ysign * gw, gh / 2))
-        box(f"crossbar_{side}", (0.05, gw + 0.05, 0.05),
-            (gx + sign * gd / 2, 0, gh),
-            rgba=(0.95, 0.95, 0.95, 1.0), collide=True)
-
     ball = wb.add_body()
     ball.name = "ball"
     ball.pos = [1.0, 0.0, 0.07]
