@@ -263,15 +263,26 @@ def _contact_addons(model, data, idx):
     return out
 
 
-def standup_obs(data, idx, last_action, step):
+def standup_obs(model, data, idx, last_action, step):
     """Build the 86-dim standup obs (78 common + 8 contact) from MuJoCo state,
     matching skills/common_obs + the standup addons."""
     q, qd = joint_state(data, idx)
+    # Trunk velocities via mj_objectVelocity — world-frame linear + body-frame
+    # angular AT THE BODY, exactly like evaluation/eval_standup_mujoco and
+    # Genesis. The raw free-joint qvel is the joint-anchor velocity and differs
+    # from the body velocity by ω×r_com during a dynamic get-up, which is enough
+    # to push the policy off-distribution (renders as a kneel/seated failure).
+    vw = np.zeros(6)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY,
+                             idx["trunk_bid"], vw, 0)            # world frame
+    vb = np.zeros(6)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY,
+                             idx["trunk_bid"], vb, 1)            # body frame
     base = compute_common_obs(
         root_pos=data.qpos[0:3][None, :].astype(np.float32),
         root_quat=data.qpos[3:7][None, :].astype(np.float32),
-        root_lin_vel=data.qvel[0:3][None, :].astype(np.float32),
-        root_ang_vel=data.qvel[3:6][None, :].astype(np.float32),  # body frame
+        root_lin_vel=vw[3:6][None, :].astype(np.float32),       # world linear
+        root_ang_vel=vb[0:3][None, :].astype(np.float32),       # body angular
         joint_pos=q[None, :].astype(np.float32),
         joint_vel=qd[None, :].astype(np.float32),
         last_action=last_action[None, :].astype(np.float32),
@@ -741,13 +752,35 @@ def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
         obs_norm.load_state_dict(obs_norm_sd)
     renderer = mujoco.Renderer(model, H, W)
     cam = make_camera()
+    # Reset EXACTLY like evaluation/eval_standup_mujoco._reset_fallen (the
+    # validated ~100% sim2sim path): drop from height with a RANDOM orientation,
+    # default joints + noise, hold the DEFAULT pose via the position servo while
+    # settling ~0.6 s, then zero velocity so the policy starts from rest on an
+    # in-distribution fallen heap. The policy trains on physics-settled pool
+    # states; a fixed prone reference pose (raw, unsettled) is out-of-distribution
+    # and made a good policy render as a seated crouch. Fixed seed → every
+    # checkpoint panel starts from the identical fallen state (comparable).
+    rng = np.random.default_rng(0)
     mujoco.mj_resetData(model, data)
-    set_pose(data, idx, poses.prone())
+    base = np.asarray(idx["default"], dtype=np.float64)
+    u = rng.uniform(0.0, 1.0, 3)
+    s1, s0 = np.sqrt(1.0 - u[0]), np.sqrt(u[0])
+    quat = np.array([s1*np.sin(2*np.pi*u[1]), s1*np.cos(2*np.pi*u[1]),
+                     s0*np.sin(2*np.pi*u[2]), s0*np.cos(2*np.pi*u[2])])
+    data.qpos[0:2] = 0.0
+    data.qpos[2] = rng.uniform(0.8, 1.2)
+    data.qpos[3:7] = quat
+    data.qpos[idx["qpos"]] = base + rng.normal(0.0, 0.2, len(idx["qpos"]))
+    data.ctrl[idx["act"]] = base
+    mujoco.mj_forward(model, data)
+    for _ in range(300):
+        mujoco.mj_step(model, data)
+    data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
     last_action = np.zeros(act_dim, dtype=np.float32)
     frames = []
     for t in range(steps):
-        obs = standup_obs(data, idx, last_action, t)
+        obs = standup_obs(model, data, idx, last_action, t)
         if obs_dim == _BASE_OBS_DIM + 8:  # privileged/teacher policy
             obs = np.concatenate([obs, _PRIV_NOMINAL])
         nobs = obs_norm.normalize(obs[None])[0] if obs_norm is not None else obs
@@ -756,12 +789,15 @@ def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
                 torch.as_tensor(nobs[None], dtype=torch.float32), deterministic=True
             )
         action = np.asarray(_action_from(out)).reshape(-1)[:act_dim]
-        last_action = action.astype(np.float32)
-        target = np.clip(
-            idx["default"] + np.clip(action, -_ACTION_DELTA_MAX, _ACTION_DELTA_MAX),
-            -math.pi,
-            math.pi,
-        )
+        # Residual delta = CLIPPED policy output, and that clipped delta is what
+        # feeds back into the obs as last_action — exactly as training
+        # (SkillEnv.step: self._last_action = clipped action) and
+        # eval_standup_mujoco do. Feeding the RAW unclipped action as
+        # last_action corrupts 22 of the 86 obs dims whenever |a|>0.5 (common in
+        # a vigorous get-up) and makes a good policy stall in a kneel.
+        delta = np.clip(action, -_ACTION_DELTA_MAX, _ACTION_DELTA_MAX)
+        last_action = delta.astype(np.float32)
+        target = np.clip(idx["default"] + delta, -math.pi, math.pi)
         apply_pd(model, data, idx, target)
         renderer.update_scene(data, camera=cam)
         frames.append(renderer.render())
