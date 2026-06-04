@@ -212,8 +212,9 @@ class K1StandupEnv(SkillEnv):
         self._foot_links = None
         self._hand_links = None
 
-        # Arm random-sampling bounds cache (prone arm_random pool build).
-        self._arm_rand_bounds = None
+        # Joint random-sampling bounds cache (prone arm_random/leg_random pool
+        # build). Keyed by tuple(joint_indices) → (lo, hi) float32 arrays.
+        self._joint_rand_bounds: dict = {}
 
         # Reward weights for the active stage. "discovery" zeroes the motion
         # regularizers so the policy can find ANY standup; "deploy" uses the
@@ -387,29 +388,31 @@ class K1StandupEnv(SkillEnv):
               f"(from {c.settle_pool_rounds} rounds × {N} envs, "
               f"{c.settle_steps} sim substeps each)")
 
-    def _arm_random_bounds(self) -> tuple:
-        """Return (lo, hi) float32 arrays for the arm joints' random sampling.
+    def _joint_random_bounds(self, indices) -> tuple:
+        """Return (lo, hi) float32 arrays for random sampling of `indices`.
 
         Bounds come from the URDF joint limits (`joint.dofs_limit`, shape
         (n_dofs, 2): [lower, upper]) inset by `pose_pool_arm_random_limit_margin`
         so targets don't sit exactly at the mechanical stop. Any joint whose
         limit is missing / non-finite (e.g. a continuous joint) falls back to a
-        hand-picked wide range per joint type. Cached after the first call.
+        hand-picked wide range per joint type. Cached per index-tuple.
 
-        Order matches `robot_cfg.arm_joint_indices` (shoulder pitch/roll,
-        elbow pitch/yaw for both arms).
+        Works for any joint-index tuple — used for both the arm joints
+        (`robot_cfg.arm_joint_indices`) and the leg joints
+        (`robot_cfg.leg_joint_indices`) in the prone pool build.
         """
-        if getattr(self, "_arm_rand_bounds", None) is not None:
-            return self._arm_rand_bounds
+        key = tuple(int(i) for i in indices)
+        cached = self._joint_rand_bounds.get(key)
+        if cached is not None:
+            return cached
 
         c = self.cfg
         margin = float(c.pose_pool_arm_random_limit_margin)
         joint_names = self.robot_cfg.joint_names
-        arm_idx = list(self.robot_cfg.arm_joint_indices)
         joint_by_name = {j.name: j for j in getattr(self.robot, "joints", [])}
 
         # Hand-picked wide fallbacks (rad) by joint type, used when the URDF
-        # limit is unavailable or non-finite.
+        # limit is unavailable or non-finite. Covers arm and leg joints.
         def _fallback(name: str) -> tuple:
             lo = name.lower()
             if "shoulder_pitch" in lo:
@@ -420,11 +423,24 @@ class K1StandupEnv(SkillEnv):
                 return (-1.8, 1.8)
             if "elbow_yaw" in lo:
                 return (-1.5, 1.5)
+            if "hip_pitch" in lo:
+                return (-2.0, 2.0)
+            if "hip_roll" in lo:
+                return (-0.6, 0.6)
+            if "hip_yaw" in lo:
+                return (-1.0, 1.0)
+            if "knee" in lo:
+                return (-2.2, 0.1)
+            if "ankle_pitch" in lo:
+                return (-1.0, 1.0)
+            if "ankle_roll" in lo:
+                return (-0.5, 0.5)
             return (-1.5, 1.5)
 
-        lo_arr = np.empty(len(arm_idx), dtype=np.float32)
-        hi_arr = np.empty(len(arm_idx), dtype=np.float32)
-        for k, ji in enumerate(arm_idx):
+        idx = list(key)
+        lo_arr = np.empty(len(idx), dtype=np.float32)
+        hi_arr = np.empty(len(idx), dtype=np.float32)
+        for k, ji in enumerate(idx):
             name = joint_names[ji]
             lo, hi = _fallback(name)
             j = joint_by_name.get(name)
@@ -441,11 +457,11 @@ class K1StandupEnv(SkillEnv):
             lo_arr[k] = lo
             hi_arr[k] = hi
 
-        self._arm_rand_bounds = (lo_arr, hi_arr)
-        print(f"[standup] arm-random bounds (rad): "
+        self._joint_rand_bounds[key] = (lo_arr, hi_arr)
+        print(f"[standup] random bounds (rad): "
               + ", ".join(f"{joint_names[ji]}[{lo_arr[k]:+.2f},{hi_arr[k]:+.2f}]"
-                          for k, ji in enumerate(arm_idx)))
-        return self._arm_rand_bounds
+                          for k, ji in enumerate(idx)))
+        return self._joint_rand_bounds[key]
 
     def _build_pose_pool(self, pose, keep_upright: bool = False,
                          quat_noise_rad: float = None,
@@ -510,12 +526,13 @@ class K1StandupEnv(SkillEnv):
         # target side class. Higher rejection rate → more rounds to compensate.
         is_side = pose.name.startswith("side_")
         arm_random = getattr(pose, "arm_random", False)
+        leg_random = getattr(pose, "leg_random", False)
         if is_side:
             n_rounds = c.pose_pool_side_rounds
-        elif arm_random:
-            # Wide random arm targets raise the filter rejection rate → more
-            # rounds to keep the prone pool large.
-            n_rounds = c.pose_pool_prone_rounds
+        elif arm_random or leg_random:
+            # Wide random arm/leg targets raise the filter rejection rate →
+            # more rounds to keep the prone/supine pool large.
+            n_rounds = c.pose_pool_limb_random_rounds
         else:
             n_rounds = c.pose_pool_rounds
         # Settle length: an explicit caller override (crouch pools, which need
@@ -540,17 +557,24 @@ class K1StandupEnv(SkillEnv):
                               .astype(np.float32)
                               * jj)
 
-            # Wide random arm configs (prone): override the 8 arm-joint targets
-            # with uniform samples within their limits → crossed / one-up-one-
-            # down / bent / twisted. Legs/head keep the small jitter above so
-            # the prone class and feet-on-floor geometry are preserved; the
-            # settle physics + penetration/orientation filters cull any invalid
-            # (arm-in-floor / non-prone) result.
+            # Wide random limb configs (prone): override the arm and/or leg
+            # joint targets with uniform samples within their limits → crossed /
+            # one-up-one-down / bent / twisted. Head keeps the small jitter above
+            # so the lying class is preserved; the settle physics +
+            # penetration/orientation filters cull any invalid (limb-in-floor /
+            # non-prone) result.
             if arm_random:
-                lo, hi = self._arm_random_bounds()
+                lo, hi = self._joint_random_bounds(
+                    self.robot_cfg.arm_joint_indices)
                 arm_cols = list(self.robot_cfg.arm_joint_indices)
                 jpos_target[:, arm_cols] = self.rng.uniform(
                     lo, hi, size=(N, len(arm_cols))).astype(np.float32)
+            if leg_random:
+                lo, hi = self._joint_random_bounds(
+                    self.robot_cfg.leg_joint_indices)
+                leg_cols = list(self.robot_cfg.leg_joint_indices)
+                jpos_target[:, leg_cols] = self.rng.uniform(
+                    lo, hi, size=(N, len(leg_cols))).astype(np.float32)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)

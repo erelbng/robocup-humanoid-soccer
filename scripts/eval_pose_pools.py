@@ -176,11 +176,12 @@ def run(args):
                      else cfg.pose_pool_settle_steps)
             if is_side:
                 rounds = cfg.pose_pool_side_rounds
-            elif pool_name == "prone":
-                rounds = cfg.pose_pool_prone_rounds
+            elif pool_name in ("prone", "supine"):
+                rounds = cfg.pose_pool_limb_random_rounds
             else:
                 rounds = cfg.pose_pool_rounds
-            arm_note = " arm-random" if pool_name == "prone" else ""
+            arm_note = (" arm+leg-random"
+                        if pool_name in ("prone", "supine") else "")
             settle_info = f"settle={steps} steps × {rounds} rounds{arm_note}"
         print(f"[eval] pool '{pool_name}': {size} states "
               f"({settle_info}) → rendering {args.per_pool} samples")

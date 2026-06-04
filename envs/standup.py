@@ -103,6 +103,11 @@ class StandupPose:
     # invalid result. The arm entries in `joint_targets` then act only as a
     # harmless fallback. Used by prone (see prone()).
     arm_random: bool = False
+    # Same as arm_random but for the 12 leg joints (hip pitch/roll/yaw, knee,
+    # ankle pitch/roll for both legs) — produces varied leg configs (crossed,
+    # one up one down, bent, twisted). The orientation/height filters reject
+    # any leg config that lifts the trunk out of the lying class. Used by prone.
+    leg_random: bool = False
 
 
 def supine() -> StandupPose:
@@ -111,7 +116,11 @@ def supine() -> StandupPose:
     # orientation test (`g[:,0] < -0.5`) classifies as on-the-back. Paired
     # with the arms-by-side joint preset (natural supine rest pose).
     q = _quat_from_axis_angle((0, 1, 0), -math.pi / 2)
-    return StandupPose("supine", _POSE_SUPINE, q, trunk_height=0.13)
+    # arm_random + leg_random: pool build samples 8 arm + 12 leg joints
+    # uniformly within limits → diverse limb configs (crossed, one up one down,
+    # bent, twisted); filters keep genuinely supine, penetration-free states.
+    return StandupPose("supine", _POSE_SUPINE, q, trunk_height=0.13,
+                       arm_random=True, leg_random=True)
 
 
 def prone() -> StandupPose:
@@ -119,11 +128,12 @@ def prone() -> StandupPose:
     # body-frame g_x = +1 (front faces the floor). Paired with the
     # arms-forward joint preset — the push-up-ready prone start.
     q = _quat_from_axis_angle((0, 1, 0), math.pi / 2)
-    # arm_random: the pool build samples the 8 arm joints uniformly within
-    # their limits so prone starts show many arm configurations (crossed,
-    # one up one down, bent, twisted) rather than the single _POSE_PRONE arms.
+    # arm_random + leg_random: the pool build samples the 8 arm joints AND the
+    # 12 leg joints uniformly within their limits so prone starts show many
+    # limb configurations (crossed, one up one down, bent, twisted) rather than
+    # the single _POSE_PRONE reference.
     return StandupPose("prone", _POSE_PRONE, q, trunk_height=0.13,
-                       arm_random=True)
+                       arm_random=True, leg_random=True)
 
 
 # ── Side-pose joint targets ──────────────────────────────────────────────
@@ -175,6 +185,12 @@ def prone() -> StandupPose:
 #   Large Elbow_Pitch (1.1 rad) bends forearm back so ELBOW JOINT = contact point.
 
 # side_left: RIGHT arm is DOWN arm, RIGHT leg is BOTTOM leg.
+# NOTE: side_left() sets arm_random=True, so BOTH arms below are OVERWRITTEN
+# with wide uniform random targets during pool build (crossed / one-up-one-down
+# / bent / twisted). The brace angles here are kept only as the leg/head
+# reference and document the original stabiliser geometry. The down-arm elbow
+# brace is therefore NO LONGER the stabiliser — an unpinned rollover-verify
+# settle (see _build_pose_pool) filters out any random arm config that rolls.
 _POSE_SIDE_LEFT = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.0,
     # DOWN arm (right) — FLOOR BRACE.
@@ -230,8 +246,11 @@ def side_left() -> StandupPose:
     # the trunk centre, so a small clearance buries it at spawn and the PD
     # holds it embedded through the settle. 0.45 m ensures the whole body
     # (including the down shoulder/elbow) spawns well above the floor.
+    # arm_random=True: both arms are sampled uniformly within their limits at
+    # pool build for varied configs. Stability is then guaranteed by the
+    # unpinned rollover-verify settle in _build_pose_pool, not by the brace.
     return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13,
-                       spawn_clearance=0.45)
+                       spawn_clearance=0.45, arm_random=True)
 
 
 def side_right() -> StandupPose:

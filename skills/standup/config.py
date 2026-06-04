@@ -330,10 +330,11 @@ class StandupConfig:
     pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
     pose_pool_side_rounds: int = 6          # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
-    # Prone uses wide uniform-random arm-joint targets (StandupPose.arm_random)
-    # to get diverse arm configs. That raises the filter rejection rate, so it
-    # needs more rounds than the default pose_pool_rounds to keep the pool large.
-    pose_pool_prone_rounds: int = 6
+    # Prone + supine use wide uniform-random arm+leg joint targets
+    # (StandupPose.arm_random + leg_random) to get diverse limb configs.
+    # That raises the filter rejection rate (more states leave the lying class
+    # or get culled), so it needs more rounds than pose_pool_rounds.
+    pose_pool_limb_random_rounds: int = 10
     # Inset (rad) from each arm joint's hard URDF limit when sampling random
     # arm targets, so targets don't sit exactly at the mechanical stop.
     pose_pool_arm_random_limit_margin: float = 0.10
