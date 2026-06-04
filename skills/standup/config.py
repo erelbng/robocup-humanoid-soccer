@@ -162,23 +162,15 @@ class StandupConfig:
     sim_dt: float = 0.002
     gait_freq_hz: float = 1.5          # unused but keeps obs layout uniform
 
-    # Initial-pose generation: spawn robot in the air with random
-    # orientations + random joint perturbations, let physics settle it
-    # in parallel across all envs, snapshot the resulting states into a
-    # pool. Each subsequent reset samples uniformly from the pool — no
-    # mid-rollout physics step needed (which would desynchronize the
-    # other envs).
-    spawn_height_min: float = 0.8        # m
-    spawn_height_max: float = 1.5        # m
-    settle_steps: int = 1500            # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
-                                       # to resolve self-collisions from randomised DOFs;
-                                       # 3 s is a practical GPU compromise. Was 300 (0.6 s) —
-                                       # too short to actually let the pose settle.
-    settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
-    # Filter the pool: keep only states with a clearly fallen robot.
-    # Avoids "robot landed upright" trivial-success starts.
+    # Initial-pose generation: every reset pose is drawn from the four
+    # already-randomized named-pose pools (supine/prone/side_left/side_right),
+    # each built by the forced-settle + filter pipeline in _build_pose_pool.
+    # Reset samples uniformly from the relevant pool — no mid-rollout physics
+    # step needed (which would desynchronize the other envs).
+    # Named-pose pool filter: keep only states with a clearly fallen robot
+    # (avoids "robot landed upright" trivial-success starts). Used by the
+    # orientation/height gates in _build_pose_pool.
     pool_max_upright: float = 0.7        # upright signal upper bound
-    pool_max_height: float = 0.4         # trunk-z upper bound (m)
     # Joint noise added on every pool-sample → effectively unlimited
     # per-reset variation on top of the discrete pool. 0.10 rad ≈ ±6°.
     # Raised from 0.03 (±1.7°, too small to give real start diversity);
@@ -416,11 +408,8 @@ class StandupConfig:
     # rejecting the several-cm burials seen in the eval screenshots.
     pose_pool_penetration_eps: float = 0.02
 
-    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
-    pose_mix_random_frac: float = 0.50
-
     # Level-up mix bias. On every advance the sampler over-weights the
-    # newly-introduced pose (supine@L1, sides@L2, random@L3) by this fraction
+    # newly-introduced pose (supine@L1, sides@L2) by this fraction
     # and relaxes back to the level's base mix over `pose_mix_bias_env_steps`
     # on the PER-LEVEL clock. Concentrates fresh capacity on the hard new
     # pose and makes success_rate_ema track it, so the advance gate measures
