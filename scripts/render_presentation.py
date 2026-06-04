@@ -55,19 +55,24 @@ def _ensure_gl_backend():
     try:
         m = mujoco.MjModel.from_xml_string(
             "<mujoco><worldbody><light pos='0 0 2'/>"
-            "<geom type='box' size='.1 .1 .1'/></worldbody></mujoco>")
+            "<geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+        )
         r = mujoco.Renderer(m, 48, 48)
         r.update_scene(mujoco.MjData(m))
         r.render()
         r.close()
     except Exception as e:
         if os.environ.get("MUJOCO_GL") != "osmesa" and not os.environ.get("_RP_GL_FB"):
-            print(f"[gl] {os.environ.get('MUJOCO_GL')} unavailable "
-                  f"({type(e).__name__}) — falling back to MUJOCO_GL=osmesa")
+            print(
+                f"[gl] {os.environ.get('MUJOCO_GL')} unavailable "
+                f"({type(e).__name__}) — falling back to MUJOCO_GL=osmesa"
+            )
             os.environ["MUJOCO_GL"] = "osmesa"
             os.environ["_RP_GL_FB"] = "1"
             os.execv(sys.executable, [sys.executable] + sys.argv)
         raise
+
+
 from configs.config import K1RobotConfig  # noqa: E402
 from envs import standup as poses  # noqa: E402
 from models.field_builder import add_field_to_spec  # noqa: E402
@@ -124,8 +129,8 @@ def build_scene(with_field: bool = True):
     sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
     sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_GRADIENT
     sky.width = sky.height = 512
-    sky.rgb1 = [0.46, 0.62, 0.86]   # upper sky
-    sky.rgb2 = [0.78, 0.84, 0.92]   # horizon haze
+    sky.rgb1 = [0.46, 0.62, 0.86]  # upper sky
+    sky.rgb2 = [0.78, 0.84, 0.92]  # horizon haze
     model = spec.compile()
     data = mujoco.MjData(model)
     idx = _build_index(model)
@@ -297,8 +302,8 @@ def add_arrow(renderer, p_from, p_to, rgba=(1.0, 0.2, 0.1, 1.0), width=0.02):
     scn.ngeom += 1
 
 
-_ACCENT = (54, 211, 178)          # teal accent
-_PANEL = (16, 20, 30, 180)        # translucent dark panel
+_ACCENT = (54, 211, 178)  # teal accent
+_PANEL = (16, 20, 30, 180)  # translucent dark panel
 _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 _FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
@@ -322,7 +327,7 @@ def _rounded(draw, box, radius, fill):
 
 
 def _bar_color(v):
-    lo, hi = (242, 178, 72), (74, 210, 150)   # amber (low) → green (high)
+    lo, hi = (242, 178, 72), (74, 210, 150)  # amber (low) → green (high)
     return tuple(int(lo[i] + (hi[i] - lo[i]) * v) for i in range(3)) + (240,)
 
 
@@ -335,8 +340,8 @@ def overlay_text(frame, title=None, lines=None, bars=None):
     img = Image.fromarray(frame).convert("RGB")
     d = ImageDraw.Draw(img, "RGBA")
     H = img.height
-    s = H / 720.0                                   # scale factor
-    px = lambda v: int(round(v * s))                # noqa: E731
+    s = H / 720.0  # scale factor
+    px = lambda v: int(round(v * s))  # noqa: E731
     pad = px(18)
 
     y = pad
@@ -353,8 +358,12 @@ def overlay_text(frame, title=None, lines=None, bars=None):
         lf = _font(px(20))
         wmax = max(d.textlength(ln, font=lf) for ln in lines)
         rh = px(28)
-        _rounded(d, [pad, y, pad + int(wmax) + px(28), y + rh * len(lines) + px(10)],
-                 px(10), (16, 20, 30, 150))
+        _rounded(
+            d,
+            [pad, y, pad + int(wmax) + px(28), y + rh * len(lines) + px(10)],
+            px(10),
+            (16, 20, 30, 150),
+        )
         yy = y + px(8)
         for ln in lines:
             d.text((pad + px(14), yy), ln, font=lf, fill=(206, 224, 236))
@@ -372,14 +381,23 @@ def overlay_text(frame, title=None, lines=None, bars=None):
         tx = pad + px(14) + lblw
         for label, val in bars:
             d.text((pad + px(14), yy + px(2)), label, font=bf, fill=(232, 240, 248))
-            _rounded(d, [tx, yy + px(4), tx + trk, yy + px(21)], px(8),
-                     (255, 255, 255, 45))
+            _rounded(
+                d, [tx, yy + px(4), tx + trk, yy + px(21)], px(8), (255, 255, 255, 45)
+            )
             v = max(0.0, min(1.0, float(val)))
             if v > 0.01:
-                _rounded(d, [tx, yy + px(4), tx + int(trk * v), yy + px(21)], px(8),
-                         _bar_color(v))
-            d.text((tx + trk + px(10), yy + px(2)), f"{val:.2f}", font=vf,
-                   fill=(232, 240, 248))
+                _rounded(
+                    d,
+                    [tx, yy + px(4), tx + int(trk * v), yy + px(21)],
+                    px(8),
+                    _bar_color(v),
+                )
+            d.text(
+                (tx + trk + px(10), yy + px(2)),
+                f"{val:.2f}",
+                font=vf,
+                fill=(232, 240, 248),
+            )
             yy += row
     return np.asarray(img)
 
@@ -468,7 +486,7 @@ def render_assist_force(out_dir, H=1080, W=1920):
         frames.append(
             overlay_text(
                 renderer.render(),
-                title="Assist-force curriculum (HoST)",
+                title="Assist-force curriculum",
                 lines=[
                     f"upward trunk support: {fz:6.1f} N   (decaying → 0)",
                     "blue arrow ∝ applied force",
@@ -555,34 +573,73 @@ def render_reward_breakdown(out_dir, H=1080, W=1920):
         z = data.qpos[2:3][None].astype(np.float32)
         zc = z[:, 0]
         jp = data.qpos[idx["qpos"]][None, :].astype(np.float32)
-        foot_z = np.array([[data.xpos[b, 2] for b in idx["foot_bid"]]],
-                          dtype=np.float32)
-        foot_xy = np.array([[data.xpos[b, :2] for b in idx["foot_bid"]]],
-                           dtype=np.float32)
+        foot_z = np.array(
+            [[data.xpos[b, 2] for b in idx["foot_bid"]]], dtype=np.float32
+        )
+        foot_xy = np.array(
+            [[data.xpos[b, :2] for b in idx["foot_bid"]]], dtype=np.float32
+        )
         up = R.upright_signal(quat)
         bars = [
             ("upright", float(up[0] * 0.5 + 0.5)),
             ("height", float(R.height_signal(zc, cfg.target_height)[0])),
-            ("feet under base", float(R.feet_under_base_score(
-                foot_xy, data.qpos[:2][None].astype(np.float32),
-                d_max=cfg.feet_under_base_soft_d,
-                plateau_d=cfg.feet_under_base_plateau_d)[0])),
-            ("foot grounded + up", float(R.foot_grounded_up_signal(
-                foot_z, zc, up, foot_max_z=cfg.foot_grounded_max_z,
-                trunk_min_z=cfg.trunk_up_min_z)[0])),
-            ("standing tall", float(R.standing_tall_signal(
-                foot_z, zc, up, foot_max_z=cfg.foot_grounded_max_z,
-                trunk_min_z=cfg.standing_tall_min_z,
-                trunk_max_z=cfg.standing_tall_max_z)[0])),
-            ("stand pose (final)", float(R.stand_pose_signal(
-                jp, pose_idx, q1.astype(np.float32), up,
-                dev_scale=cfg.stand_pose_dev_scale)[0])),
+            (
+                "feet under base",
+                float(
+                    R.feet_under_base_score(
+                        foot_xy,
+                        data.qpos[:2][None].astype(np.float32),
+                        d_max=cfg.feet_under_base_soft_d,
+                        plateau_d=cfg.feet_under_base_plateau_d,
+                    )[0]
+                ),
+            ),
+            (
+                "foot grounded + up",
+                float(
+                    R.foot_grounded_up_signal(
+                        foot_z,
+                        zc,
+                        up,
+                        foot_max_z=cfg.foot_grounded_max_z,
+                        trunk_min_z=cfg.trunk_up_min_z,
+                    )[0]
+                ),
+            ),
+            (
+                "standing tall",
+                float(
+                    R.standing_tall_signal(
+                        foot_z,
+                        zc,
+                        up,
+                        foot_max_z=cfg.foot_grounded_max_z,
+                        trunk_min_z=cfg.standing_tall_min_z,
+                        trunk_max_z=cfg.standing_tall_max_z,
+                    )[0]
+                ),
+            ),
+            (
+                "stand pose (final)",
+                float(
+                    R.stand_pose_signal(
+                        jp,
+                        pose_idx,
+                        q1.astype(np.float32),
+                        up,
+                        dev_scale=cfg.stand_pose_dev_scale,
+                    )[0]
+                ),
+            ),
         ]
         renderer.update_scene(data, camera=cam)
-        frames.append(overlay_text(
-            renderer.render(),
-            title="Reward shaping — live signal breakdown",
-            bars=bars))
+        frames.append(
+            overlay_text(
+                renderer.render(),
+                title="Reward shaping — live signal breakdown",
+                bars=bars,
+            )
+        )
     write_video(frames, os.path.join(out_dir, "reward_breakdown.mp4"))
     del renderer
 
@@ -761,25 +818,31 @@ def main():
         choices=list(_VIDEOS) + ["checkpoint_comparison"],
         help="render only these videos (default: all)",
     )
-    ap.add_argument("--height", type=int, default=1080,
-                    help="output height in px (width = 16:9). Use e.g. 540 for "
-                         "fast software-rendered previews on a laptop.")
+    ap.add_argument(
+        "--height",
+        type=int,
+        default=1080,
+        help="output height in px (width = 16:9). Use e.g. 540 for "
+        "fast software-rendered previews on a laptop.",
+    )
     args = ap.parse_args()
-    _ensure_gl_backend()                # EGL → OSMesa auto-fallback
+    _ensure_gl_backend()  # EGL → OSMesa auto-fallback
     os.makedirs(args.out, exist_ok=True)
     H = max(180, args.height)
-    W = (int(round(H * 16 / 9)) // 2) * 2          # even width for the codec
-    panel = (min(H, 720) // 2) * 2                  # square checkpoint panels
+    W = (int(round(H * 16 / 9)) // 2) * 2  # even width for the codec
+    panel = (min(H, 720) // 2) * 2  # square checkpoint panels
     selected = args.only or (list(_VIDEOS) + ["checkpoint_comparison"])
-    print(f"Rendering to {args.out}  ({W}x{H}, MUJOCO_GL="
-          f"{os.environ.get('MUJOCO_GL')})")
+    print(
+        f"Rendering to {args.out}  ({W}x{H}, MUJOCO_GL="
+        f"{os.environ.get('MUJOCO_GL')})"
+    )
     for name in selected:
         print(f"[{name}]")
         try:
             if name == "checkpoint_comparison":
                 render_checkpoint_comparison(
-                    find_checkpoints(args.checkpoint_dir), args.out,
-                    H=panel, W=panel)
+                    find_checkpoints(args.checkpoint_dir), args.out, H=panel, W=panel
+                )
             else:
                 _VIDEOS[name](args.out, H=H, W=W)
         except Exception as e:
