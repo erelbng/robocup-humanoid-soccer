@@ -215,9 +215,13 @@ def prone() -> StandupPose:
 # LEGS: side_left() also randomizes the legs (leg_random=True). The TOP leg
 # (left) is randomized over its FULL range (twist/turn/bend/foot angle — it's
 # not load-bearing). The BOTTOM leg (right) is the third tripod contact, so it
-# is randomized within CONSTRAINED ranges (leg_random_constrained) that keep
-# hip-roll floor-ward (foot stays down) while still varying yaw/pitch/knee/
-# ankles. The reference angles below remain the fallback / leg-jitter base.
+# is randomized within WIDE ranges (leg_random_constrained) whose ONLY retained
+# constraint is hip-roll floor-ward (≥0, foot stays a contact) — yaw/pitch/knee/
+# ankles otherwise open up near their mechanical range for strongly twisted/
+# turned lower-body configs. The unpinned rollover-verify settle + orientation/
+# at-rest/trunk_z filters in _build_pose_pool cull any config that rolls out of
+# the side class, so the surviving pool is guaranteed all genuine side poses.
+# The reference angles below remain the fallback / leg-jitter base.
 _POSE_SIDE_LEFT = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.0,
     # DOWN arm (right) — FLOOR BRACE.
@@ -283,17 +287,23 @@ def side_left() -> StandupPose:
     # TOP leg (left) — full-range random (not load-bearing): twist/turn/bend/foot.
     top_leg_left = ("Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
                     "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll")
-    # BOTTOM leg (right) — constrained: keep hip-ROLL floor-ward (foot stays a
-    # contact point) while still varying yaw (twist) / pitch (turn) / knee
-    # (bend) / ankles (foot angle). Reference values: roll 0.3, pitch 0.2,
-    # yaw 0.0, knee 0.5, ankle_pitch -0.2, ankle_roll -0.2.
+    # BOTTOM leg (right) — WIDE, twisted random configs. The only retained
+    # physical prior is hip-ROLL floor-ward (≥ 0, never sky-ward) so the leg/foot
+    # stays the third tripod contact point; everything else opens up near its
+    # mechanical range (yaw twist / pitch turn / knee bend / ankle foot-angle).
+    # We deliberately do NOT clamp these to "safe" narrow bands: the unpinned
+    # rollover-verify settle + orientation-class / at-rest / trunk_z filters in
+    # _build_pose_pool cull any combination that actually rolls the trunk out of
+    # the side class, so the surviving pool is provably all genuine side poses —
+    # just with far more lower-body variety than the old near-fixed brace.
+    # Reference values: roll 0.3, pitch 0.2, yaw 0.0, knee 0.5, ankles -0.2.
     bottom_leg_right = {
-        "Right_Hip_Roll": (0.1, 0.5),     # floor-ward — the key stability constraint
-        "Right_Hip_Pitch": (-0.2, 0.7),
-        "Right_Hip_Yaw": (-0.4, 0.4),     # twist
-        "Right_Knee_Pitch": (0.1, 1.0),   # keep some bend
-        "Right_Ankle_Pitch": (-0.5, 0.2), # foot angle
-        "Right_Ankle_Roll": (-0.5, 0.1),  # keep sole toward floor
+        "Right_Hip_Roll": (0.0, 0.8),     # floor-ward (≥0) — the key stability prior
+        "Right_Hip_Pitch": (-1.0, 1.2),   # turn thigh fwd/back
+        "Right_Hip_Yaw": (-0.9, 0.9),     # twist
+        "Right_Knee_Pitch": (0.0, 1.8),   # near-straight → deeply bent
+        "Right_Ankle_Pitch": (-0.9, 0.6), # foot point
+        "Right_Ankle_Roll": (-0.8, 0.4),  # foot twist / sole angle
     }
     return StandupPose("side_left", _POSE_SIDE_LEFT, q, trunk_height=0.13,
                        spawn_clearance=0.45, arm_random=True,
