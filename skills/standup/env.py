@@ -51,20 +51,6 @@ _CONTACT_Z = 0.05
 # ─── quaternion helper ────────────────────────────────────────────────
 
 
-def _random_unit_quat(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Uniform samples on SO(3). Shoemake's method:
-    u1, u2, u3 ∈ U[0,1] → unit quaternion (w, x, y, z)."""
-    u = rng.uniform(0.0, 1.0, size=(n, 3)).astype(np.float32)
-    s1 = np.sqrt(1.0 - u[:, 0])
-    s0 = np.sqrt(u[:, 0])
-    return np.stack([
-        s1 * np.sin(2.0 * np.pi * u[:, 1]),
-        s1 * np.cos(2.0 * np.pi * u[:, 1]),
-        s0 * np.sin(2.0 * np.pi * u[:, 2]),
-        s0 * np.cos(2.0 * np.pi * u[:, 2]),
-    ], axis=-1).astype(np.float32)
-
-
 def _small_tilt_quat(n: int, max_angle: float,
                       rng: np.random.Generator) -> np.ndarray:
     """Quat for a small rotation (≤ max_angle radians) around a random
@@ -141,11 +127,8 @@ class K1StandupEnv(SkillEnv):
         super().__init__(**kwargs)
         self.MAX_EPISODE_STEPS = self.cfg.max_episode_steps
 
-        # Settle pool — built lazily on first reset (needs scene + robot).
-        self._pool_pos: Optional[np.ndarray] = None
-        self._pool_quat: Optional[np.ndarray] = None
-        self._pool_jpos: Optional[np.ndarray] = None
-        self._pool_size: int = 0
+        # Pose pools — built lazily on first reset (needs scene + robot).
+        self._pools_built: bool = False
 
         # Per-env reward / termination state.
         self._frame_success = np.zeros(self.num_envs, dtype=bool)
@@ -179,7 +162,7 @@ class K1StandupEnv(SkillEnv):
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
 
-        # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
+        # ── Pose difficulty curriculum (L0–L2) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
         # Env-step count at which the CURRENT level started. All easing
@@ -198,7 +181,7 @@ class K1StandupEnv(SkillEnv):
         # ── Reverse-height get-up curriculum (R0..R_final) ────────────────
         # Outer curriculum: start near standing (upright crouch) and move the
         # start progressively more fallen. Stages 0..K-1 sample from crouch
-        # pools; the final stage K hands off to the fallen-pose L0-L3 curriculum.
+        # pools; the final stage K hands off to the fallen-pose L0-L2 curriculum.
         self._recovery_final_stage: int = len(self.cfg.recovery_crouch_heights)
         self._recovery_stage: int = (
             self.cfg.recovery_start_stage
@@ -211,6 +194,13 @@ class K1StandupEnv(SkillEnv):
         # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
         self._hand_links = None
+
+        # Joint random-sampling bounds cache (prone arm_random/leg_random pool
+        # build). Keyed by tuple(joint_indices) → (lo, hi) float32 arrays.
+        self._joint_rand_bounds: dict = {}
+        # Per-dof inset URDF-limit cache (constrained-pass clamping). Keyed by
+        # dof column → (lo, hi) float tuple, or None if no finite limit.
+        self._dof_limit_cache: dict = {}
 
         # Reward weights for the active stage. "discovery" zeroes the motion
         # regularizers so the policy can find ANY standup; "deploy" uses the
@@ -290,99 +280,136 @@ class K1StandupEnv(SkillEnv):
 
     # ── settle pool ───────────────────────────────────────────────
 
-    def _build_settle_pool(self) -> None:
-        """Spawn all envs in the air with random orientations, settle by
-        gravity, snapshot. Repeat for `settle_pool_rounds` iterations →
-        pool of (rounds × num_envs) physically-realistic fallen states.
+    def _joint_random_bounds(self, indices) -> tuple:
+        """Return (lo, hi) float32 arrays for random sampling of `indices`.
 
-        Filters out states the robot accidentally settled into that look
-        like a successful standup already (uprightness high enough that
-        the policy would get the success bonus for free). The pool is
-        rebuilt from scratch if filtering drops below `num_envs` valid
-        states — we'd rather pay a few extra seconds than feed the
-        trainer a tiny pool.
+        Bounds come from the URDF joint limits (`joint.dofs_limit`, shape
+        (n_dofs, 2): [lower, upper]) inset by `pose_pool_arm_random_limit_margin`
+        so targets don't sit exactly at the mechanical stop. Any joint whose
+        limit is missing / non-finite (e.g. a continuous joint) falls back to a
+        hand-picked wide range per joint type. Cached per index-tuple.
+
+        Works for any joint-index tuple — used for both the arm joints
+        (`robot_cfg.arm_joint_indices`) and the leg joints
+        (`robot_cfg.leg_joint_indices`) in the prone pool build.
         """
+        key = tuple(int(i) for i in indices)
+        cached = self._joint_rand_bounds.get(key)
+        if cached is not None:
+            return cached
+
         c = self.cfg
-        N = self.num_envs
-        all_idx = np.arange(N)
+        margin = float(c.pose_pool_arm_random_limit_margin)
+        joint_names = self.robot_cfg.joint_names
+        joint_by_name = {j.name: j for j in getattr(self.robot, "joints", [])}
 
-        pool_pos, pool_quat, pool_jpos = [], [], []
+        # Hand-picked wide fallbacks (rad) by joint type, used when the URDF
+        # limit is unavailable or non-finite. Covers arm and leg joints.
+        def _fallback(name: str) -> tuple:
+            lo = name.lower()
+            if "shoulder_pitch" in lo:
+                return (-2.5, 2.5)
+            if "shoulder_roll" in lo:
+                return (-2.0, 2.0)
+            if "elbow_pitch" in lo:
+                return (-1.8, 1.8)
+            if "elbow_yaw" in lo:
+                return (-1.5, 1.5)
+            if "hip_pitch" in lo:
+                return (-2.0, 2.0)
+            if "hip_roll" in lo:
+                return (-0.6, 0.6)
+            if "hip_yaw" in lo:
+                return (-1.0, 1.0)
+            if "knee" in lo:
+                return (-2.2, 0.1)
+            if "ankle_pitch" in lo:
+                return (-1.0, 1.0)
+            if "ankle_roll" in lo:
+                return (-0.5, 0.5)
+            return (-1.5, 1.5)
 
-        for round_idx in range(c.settle_pool_rounds):
-            # Spawn high with random orientation + small joint noise.
-            pos = np.zeros((N, 3), dtype=np.float32)
-            pos[:, 2] = self.rng.uniform(c.spawn_height_min,
-                                          c.spawn_height_max,
-                                          size=N).astype(np.float32)
-            quat = _random_unit_quat(N, self.rng)
-            jpos_target = (self._default_action[None, :]
-                           + self.rng.standard_normal((N, self.act_dim))
-                              .astype(np.float32) * 0.2)
+        idx = list(key)
+        lo_arr = np.empty(len(idx), dtype=np.float32)
+        hi_arr = np.empty(len(idx), dtype=np.float32)
+        for k, ji in enumerate(idx):
+            name = joint_names[ji]
+            lo, hi = _fallback(name)
+            j = joint_by_name.get(name)
+            if j is not None:
+                try:
+                    lim = _to_np(j.dofs_limit)
+                    if lim.ndim == 2 and lim.shape[0] >= 1:
+                        jlo, jhi = float(lim[0, 0]), float(lim[0, 1])
+                        if (np.isfinite(jlo) and np.isfinite(jhi)
+                                and jhi - jlo > 2.0 * margin):
+                            lo, hi = jlo + margin, jhi - margin
+                except Exception:
+                    pass
+            lo_arr[k] = lo
+            hi_arr[k] = hi
 
+        self._joint_rand_bounds[key] = (lo_arr, hi_arr)
+        print(f"[standup] random bounds (rad): "
+              + ", ".join(f"{joint_names[ji]}[{lo_arr[k]:+.2f},{hi_arr[k]:+.2f}]"
+                          for k, ji in enumerate(idx)))
+        return self._joint_rand_bounds[key]
+
+    def _inset_dof_limit(self, col: int):
+        """Return the (lo, hi) URDF limit for dof column `col`, inset by
+        `pose_pool_arm_random_limit_margin`, or None if the joint has no
+        finite limit. Cached per column.
+
+        Used to CLAMP the explicit (lo, hi) ranges of the constrained
+        randomization passes (bottom leg / down arm of a side pose) so a wide
+        requested range never drives a joint past its mechanical stop — the
+        full-range pass already insets via `_joint_random_bounds`, but the
+        constrained pass writes raw ranges, which on this robot overrun the
+        tight ankle / hip-roll / elbow-yaw limits.
+        """
+        cached = self._dof_limit_cache.get(col)
+        if cached is not None or col in self._dof_limit_cache:
+            return cached
+        margin = float(self.cfg.pose_pool_arm_random_limit_margin)
+        name = self.robot_cfg.joint_names[col]
+        joint_by_name = {j.name: j for j in getattr(self.robot, "joints", [])}
+        res = None
+        j = joint_by_name.get(name)
+        if j is not None:
             try:
-                self.robot.set_pos(pos, envs_idx=all_idx)
-                self.robot.set_quat(quat, envs_idx=all_idx)
-                self.robot.set_dofs_position(jpos_target, self.dof_indices,
-                                              envs_idx=all_idx,
-                                              zero_velocity=True)
-                # Hold PD at the spawn pose during the fall — limbs land
-                # roughly relaxed instead of flopping (closer to real falls
-                # where the robot doesn't actively try to control mid-air).
-                self.robot.control_dofs_position(jpos_target,
-                                                  self.dof_indices)
-            except Exception as e:
-                print(f"[standup] settle spawn (round {round_idx}) "
-                      f"failed: {e}")
+                lim = _to_np(j.dofs_limit)
+                if lim.ndim == 2 and lim.shape[0] >= 1:
+                    jlo, jhi = float(lim[0, 0]), float(lim[0, 1])
+                    if (np.isfinite(jlo) and np.isfinite(jhi)
+                            and jhi - jlo > 2.0 * margin):
+                        res = (jlo + margin, jhi - margin)
+            except Exception:
+                pass
+        self._dof_limit_cache[col] = res
+        return res
+
+    def _apply_constrained_targets(self, jpos_target, constrained,
+                                   name_to_idx) -> None:
+        """Overwrite jpos_target columns with uniform samples from explicit
+        (lo, hi) ranges, each CLAMPED to the joint's inset URDF limit so a wide
+        requested range can never spawn a joint past its mechanical stop.
+        Shared by the bottom-leg and down-arm constrained passes.
+        """
+        N = jpos_target.shape[0]
+        for jname, (clo, chi) in constrained.items():
+            col = name_to_idx.get(jname)
+            if col is None:
                 continue
-
-            # Step physics until the robot has settled. We don't drive
-            # the action_repeat outer loop here — this is raw physics
-            # time, not control time.
-            for _ in range(c.settle_steps):
-                self.scene.step()
-
-            # Snapshot.
-            try:
-                p = _to_np(self.robot.get_pos()).copy()
-                q = _to_np(self.robot.get_quat()).copy()
-                j = _to_np(self.robot.get_dofs_position(self.dof_indices)
-                           ).copy()
-            except Exception as e:
-                print(f"[standup] settle snapshot failed: {e}")
-                continue
-
-            # Filter for "actually fallen": low trunk height AND not
-            # already upright. Keep envs where BOTH conditions hold.
-            # PLUS the vertex-based penetration gate (same as the named-pose
-            # pools): reject any state where the lowest collision vertex sits
-            # below the floor — a foot/shin/limb wedged into the ground would
-            # otherwise leak into the L3 random distribution (50% of resets).
-            up = upright_signal(q)
-            min_contact_z = self._min_contact_link_z()
-            ok = ((p[:, 2] < c.pool_max_height)
-                  & (up < c.pool_max_upright)
-                  & (min_contact_z > -c.pose_pool_penetration_eps))
-            if ok.any():
-                pool_pos.append(p[ok])
-                pool_quat.append(q[ok])
-                pool_jpos.append(j[ok])
-
-        if not pool_pos:
-            raise RuntimeError(
-                "[standup] settle pool is empty after filtering — "
-                "loosen pool_max_upright / pool_max_height or increase "
-                "settle_pool_rounds.")
-
-        self._pool_pos = np.concatenate(pool_pos, axis=0).astype(np.float32)
-        self._pool_quat = np.concatenate(pool_quat, axis=0).astype(np.float32)
-        self._pool_jpos = np.concatenate(pool_jpos, axis=0).astype(np.float32)
-        # Re-center horizontally — pool snapshots have arbitrary xy drift
-        # from the fall, but the env should always reset at the origin.
-        self._pool_pos[:, 0:2] = 0.0
-        self._pool_size = self._pool_pos.shape[0]
-        print(f"[standup] settle pool built: {self._pool_size} states "
-              f"(from {c.settle_pool_rounds} rounds × {N} envs, "
-              f"{c.settle_steps} sim substeps each)")
+            clo, chi = float(clo), float(chi)
+            lim = self._inset_dof_limit(col)
+            if lim is not None:
+                lo_l, hi_l = lim
+                clo = min(max(clo, lo_l), hi_l)
+                chi = min(max(chi, lo_l), hi_l)
+                if clo > chi:                  # fully outside the limit → pin
+                    clo = chi
+            jpos_target[:, col] = self.rng.uniform(
+                clo, chi, size=N).astype(np.float32)
 
     def _build_pose_pool(self, pose, keep_upright: bool = False,
                          quat_noise_rad: float = None,
@@ -446,7 +473,16 @@ class K1StandupEnv(SkillEnv):
         # phase (~250 steps) while the orientation is still close to the
         # target side class. Higher rejection rate → more rounds to compensate.
         is_side = pose.name.startswith("side_")
-        n_rounds = c.pose_pool_side_rounds if is_side else c.pose_pool_rounds
+        arm_random = getattr(pose, "arm_random", False)
+        leg_random = getattr(pose, "leg_random", False)
+        if is_side:
+            n_rounds = c.pose_pool_side_rounds
+        elif arm_random or leg_random:
+            # Wide random arm/leg targets raise the filter rejection rate →
+            # more rounds to keep the prone/supine pool large.
+            n_rounds = c.pose_pool_limb_random_rounds
+        else:
+            n_rounds = c.pose_pool_rounds
         # Settle length: an explicit caller override (crouch pools, which need
         # a SHORT settle to stay upright) wins; otherwise side poses settle
         # briefly (they roll out of side-lying) and the rest use the default.
@@ -468,6 +504,57 @@ class K1StandupEnv(SkillEnv):
                            + self.rng.standard_normal((N, self.act_dim))
                               .astype(np.float32)
                               * jj)
+
+            # Wide random limb configs (prone): override the arm and/or leg
+            # joint targets with uniform samples within their limits → crossed /
+            # one-up-one-down / bent / twisted. Head keeps the small jitter above
+            # so the lying class is preserved; the settle physics +
+            # penetration/orientation filters cull any invalid (limb-in-floor /
+            # non-prone) result.
+            if arm_random:
+                # A pose may restrict FULL-range randomization to a subset of arm
+                # joints (side poses: UP arm only). The DOWN (brace) arm is then
+                # randomized within bracing-safe bounds by the constrained pass
+                # below (shoulder-roll kept floor-ward), not left fully fixed.
+                names = getattr(pose, "arm_random_joint_names", None)
+                if names:
+                    arm_cols = [name_to_idx[n] for n in names
+                                if n in name_to_idx]
+                else:
+                    arm_cols = list(self.robot_cfg.arm_joint_indices)
+                lo, hi = self._joint_random_bounds(tuple(arm_cols))
+                jpos_target[:, arm_cols] = self.rng.uniform(
+                    lo, hi, size=(N, len(arm_cols))).astype(np.float32)
+                # Constrained pass: explicit per-joint (lo, hi) — the DOWN (brace)
+                # arm of a side pose, shoulder-roll kept floor-ward so the elbow
+                # stays a contact (mirror of the bottom-leg constrained pass).
+                # Clamped to inset URDF limits (e.g. elbow-yaw is one-sided).
+                arm_constrained = getattr(pose, "arm_random_constrained", None)
+                if arm_constrained:
+                    self._apply_constrained_targets(
+                        jpos_target, arm_constrained, name_to_idx)
+            if leg_random:
+                # Full-range pass: all 12 leg joints (prone/supine) or a subset
+                # (side poses: the TOP leg only — the bottom leg is the tripod
+                # contact and uses the constrained pass below).
+                names = getattr(pose, "leg_random_joint_names", None)
+                if names:
+                    leg_cols = [name_to_idx[n] for n in names
+                                if n in name_to_idx]
+                else:
+                    leg_cols = list(self.robot_cfg.leg_joint_indices)
+                if leg_cols:
+                    lo, hi = self._joint_random_bounds(tuple(leg_cols))
+                    jpos_target[:, leg_cols] = self.rng.uniform(
+                        lo, hi, size=(N, len(leg_cols))).astype(np.float32)
+                # Constrained pass: explicit per-joint (lo, hi) — the BOTTOM leg
+                # of a side pose, kept floor-ward so the foot stays a contact.
+                # Clamped to inset URDF limits (the K1 ankles barely travel, and
+                # hip-roll floor-ward is limited on the bottom side).
+                constrained = getattr(pose, "leg_random_constrained", None)
+                if constrained:
+                    self._apply_constrained_targets(
+                        jpos_target, constrained, name_to_idx)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)
@@ -518,6 +605,19 @@ class K1StandupEnv(SkillEnv):
                             zero_ang, base_ang_dofs, envs_idx=all_idx)
                     except Exception:
                         pass
+
+                if arm_random or leg_random:
+                    # ROLLOVER VERIFICATION. The pinned settle above held the
+                    # trunk on its side while the RANDOMIZED arms/legs settled
+                    # against the floor — but pinning means a roll-prone config
+                    # can't reveal itself (the orientation gate below would
+                    # trivially pass). Now RELEASE the pin and let the trunk
+                    # integrate FREELY for a window: an arm/leg config that
+                    # doesn't brace the side will roll onto its back/belly here.
+                    # The orientation-class + at-rest + side trunk_z gates then
+                    # reject it, so only self-stable side poses reach the pool.
+                    for _ in range(c.pose_pool_side_verify_steps):
+                        self.scene.step()
             else:
                 for _ in range(settle_steps):
                     self.scene.step()
@@ -530,6 +630,20 @@ class K1StandupEnv(SkillEnv):
             except Exception as e:
                 print(f"[standup] pose pool '{pose.name}' snapshot failed: {e}")
                 continue
+
+            # At-rest check (side poses that ran the unpinned verify): a pose
+            # caught MID-ROLL can momentarily pass the orientation gate. Require
+            # the base angular velocity to have settled near zero so the
+            # snapshot is a genuine resting equilibrium, not a transient. Only
+            # meaningful when the trunk was free to move (verify ran).
+            verified = is_side and (arm_random or leg_random)
+            if verified:
+                try:
+                    ang_speed = np.linalg.norm(
+                        _to_np(self.robot.get_ang()), axis=1)
+                except Exception:
+                    # Don't reject on read failure — leave these states in.
+                    ang_speed = np.zeros(N, dtype=np.float32)
 
             up = upright_signal(q)
             # Penetration gate (applies to BOTH pool kinds): the lowest
@@ -571,6 +685,10 @@ class K1StandupEnv(SkillEnv):
                 if is_side:
                     ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
                     ok &= (p[:, 2] < c.pose_pool_side_max_trunk_z)
+                    # At-rest gate: reject snapshots still rotating (mid-roll)
+                    # so every pooled side pose is a stationary equilibrium.
+                    if verified:
+                        ok &= (ang_speed < c.pose_pool_side_max_ang_vel)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -590,64 +708,12 @@ class K1StandupEnv(SkillEnv):
         return {"pos": pos_arr, "quat": quat_arr,
                 "jpos": jpos_arr, "size": pos_arr.shape[0]}
 
-    def _extract_side_pools_from_settle(self) -> None:
-        """Override side-pose pools with states extracted from the random
-        settle pool.
-
-        Rationale: humanoid side-lying is NOT a stable equilibrium when the
-        robot is spawned in a forced side orientation and let to settle — PD
-        joint torques roll the trunk to prone/supine within ~60 physics
-        steps of landing. The random settle pool avoids this entirely: robots
-        start from random orientations, fall naturally, and some arrive at
-        STABLE side-lying equilibria (the ground contact prevents further
-        rolling). These naturally-settled states are physically correct and
-        well-distributed — exactly like ``random_065`` which is a naturally
-        settled side pose.
-
-        Filter: dot(g_body, g_expected) > pose_pool_orient_dot_min:
-          side_left  → g_body = (0, +1, 0) → keep where g_body[1] > threshold
-          side_right → g_body = (0, -1, 0) → keep where g_body[1] < -threshold
-
-        This is called AFTER ``_build_settle_pool`` (which populates
-        _pool_quat) and AFTER ``_build_pose_pool`` side calls (so we always
-        have a pool to override into).
-        """
-        c = self.cfg
-        # Use a slightly more lenient threshold for random-pool extraction than
-        # for the forced-settle filter. These are already physically settled
-        # equilibria (no rolling possible post-settle), so accepting states
-        # within 45° of pure side (dot > 0.70) gives more diverse training
-        # starts while still being clearly side-lying (not back/belly).
-        # The forced-settle pool uses the stricter pose_pool_orient_dot_min.
-        threshold = max(c.pose_pool_orient_dot_min - 0.10, 0.65)
-        g = projected_gravity(self._pool_quat)  # (P, 3)
-
-        for name, sign in [("side_left", +1.0), ("side_right", -1.0)]:
-            mask = (sign * g[:, 1]) > threshold
-            n_found = int(mask.sum())
-            if n_found > 0:
-                pool = {
-                    "pos": self._pool_pos[mask].copy(),
-                    "quat": self._pool_quat[mask].copy(),
-                    "jpos": self._pool_jpos[mask].copy(),
-                    "size": n_found,
-                }
-                old_size = self._named_pools.get(name, {}).get("size", 0)
-                self._named_pools[name] = pool
-                print(f"[standup] side pool '{name}': replaced {old_size} "
-                      f"forced-settle states with {n_found} naturally-settled "
-                      f"states from random pool (dot > {threshold:.2f})")
-            else:
-                print(f"[standup] WARNING: no '{name}' states found in random "
-                      f"settle pool (g_body[1]*{sign:+.0f} > {threshold:.2f}) — "
-                      f"keeping forced-settle pool ({self._named_pools.get(name, {}).get('size', 0)} states)")
-
     def _build_all_pools(self) -> None:
-        """Build all named-pose pools and the settle pool.
+        """Build all named-pose pools (supine, prone, side_left, side_right)
+        plus the optional crouch/squat start pools.
 
-        Order: named pools first (provides a fallback even if side extraction
-        fails), then settle pool (leaves envs in fallen state), then side-pool
-        override from the settle pool's naturally-settled side states.
+        Every reset pose is now drawn from these already-randomized named
+        pools — there is no separate "random" settle pool.
         """
         from envs.standup import all_poses, make_crouch_pose
         for pose in all_poses():
@@ -683,40 +749,28 @@ class K1StandupEnv(SkillEnv):
                       f"(spawn_h={heights[s]}, bend={scales[s]}): "
                       f"{pool['size']} states")
 
-        self._build_settle_pool()  # leaves envs in fallen state
-        # NOTE: _extract_side_pools_from_settle() is intentionally NOT called
-        # here. The forced-settle pool (arm-brace config, 500-step settle,
-        # 0.80 orientation + 0.07 m min-z filters) reliably produces 700+
-        # genuine side-lying states. Replacing it with the random-pool
-        # extraction (dot > 0.70, no min-z guard) introduced z≈0.06 m states
-        # (robot 45° tilted toward prone/supine) that visually look like back-
-        # lying poses. Keep the forced-settle pool — it is better quality.
+        self._pools_built = True
 
     # ── pool sampling helpers ─────────────────────────────────────
 
     def _sample_from_pool(self, pool_name: str, n: int) -> tuple:
         """Return (pos, quat, jpos) of n random states from the named pool.
 
-        Falls back to the settle pool with a one-time warning if the requested
-        pool is empty or missing.
+        Falls back to the prone pool (the most robust fallen pose, always
+        built) with a one-time warning if the requested pool is empty/missing.
         """
-        if pool_name == "random":
-            idx = self.rng.integers(0, self._pool_size, size=n)
-            return (self._pool_pos[idx].copy(),
-                    self._pool_quat[idx].copy(),
-                    self._pool_jpos[idx].copy())
-
         pool = self._named_pools.get(pool_name)
         if pool is None or pool["size"] == 0:
             warn_attr = f"_pool_warn_{pool_name}"
             if not getattr(self, warn_attr, False):
                 print(f"[standup] WARNING: pool '{pool_name}' empty, "
-                      f"falling back to settle pool")
+                      f"falling back to prone pool")
                 setattr(self, warn_attr, True)
-            idx = self.rng.integers(0, self._pool_size, size=n)
-            return (self._pool_pos[idx].copy(),
-                    self._pool_quat[idx].copy(),
-                    self._pool_jpos[idx].copy())
+            pool = self._named_pools.get("prone")
+            if pool is None or pool["size"] == 0:
+                raise RuntimeError(
+                    f"[standup] pool '{pool_name}' empty and prone fallback "
+                    f"unavailable — check the pose-pool build.")
 
         idx = self.rng.integers(0, pool["size"], size=n)
         return (pool["pos"][idx].copy(),
@@ -750,7 +804,7 @@ class K1StandupEnv(SkillEnv):
         """Top-level reset sampler honoring the reverse-height curriculum.
 
         While in a crouch stage (R < R_final), sample from that stage's upright
-        crouch pool; at the final stage, hand off to the fallen-pose L0-L3
+        crouch pool; at the final stage, hand off to the fallen-pose L0-L2
         curriculum. Falls back to the fallen sampler if a crouch pool is empty.
 
         Returns (pos, quat, jpos, is_side) — see _gather_by_choice for is_side.
@@ -776,12 +830,18 @@ class K1StandupEnv(SkillEnv):
 
         L0 → prone only               — easiest single entry pose (belly)
         L1 → prone + supine           — add the back recovery
-        L2 → all 4 named poses        — + side_left + side_right
-        L3 → named + random fallen    — full robustness
+        L2 → all 4 named poses        — + side_left + side_right (terminal:
+                                        full robustness, side-biased on entry,
+                                        relaxing to an equal 25% mix)
 
         Prone and supine are *different motor strategies* (prone: arm push-up
         → tuck → stand; supine: roll/sit up, tuck knees), so they are added
         one level at a time rather than mixed 50/50 from step 0.
+
+        The four named pose pools are each already heavily randomized (arm/leg
+        joints twisted within the side-stability filters), so there is no
+        separate "random" settle pool — L2 (terminal) just draws equally from
+        all four.
 
         On every level-up the sampler BIASES toward the just-introduced
         pose(s) and relaxes back to the level's base mix over
@@ -790,44 +850,39 @@ class K1StandupEnv(SkillEnv):
         so the advance gate measures progress on the new pose instead of
         being dominated by the already-mastered ones.
         """
-        # Category order: [supine, prone, side_left, side_right, random].
-        cats = ("supine", "prone", "side_left", "side_right", "random")
+        # Category order: [supine, prone, side_left, side_right].
+        cats = ("supine", "prone", "side_left", "side_right")
         level = self._pose_level
 
         # Base distribution + indices of the pose(s) NEWLY introduced here.
         if level <= 0:
-            base = np.array([0., 1., 0., 0., 0.], dtype=np.float64)
+            base = np.array([0., 1., 0., 0.], dtype=np.float64)
             new = ()
         elif level == 1:
-            base = np.array([0.5, 0.5, 0., 0., 0.], dtype=np.float64)
+            base = np.array([0.5, 0.5, 0., 0.], dtype=np.float64)
             new = (0,)                               # supine
-        elif level == 2:
-            base = np.array([0.25, 0.25, 0.25, 0.25, 0.], dtype=np.float64)
+        else:  # level >= 2 (terminal): equal mix, side-biased on entry
+            base = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
             new = (2, 3)                             # side_left, side_right
-        else:
-            rf = float(self.cfg.pose_mix_random_frac)
-            nf = (1.0 - rf) / 4.0
-            base = np.array([nf, nf, nf, nf, rf], dtype=np.float64)
-            new = (4,)                               # random
 
         # Decaying bias toward the freshly-introduced pose(s).
         if new and self.cfg.pose_mix_bias_start > 0.0:
             b = self.cfg.pose_mix_bias_start * (
                 1.0 - self._curriculum_progress(self.cfg.pose_mix_bias_env_steps))
             if b > 0.0:
-                new_dist = np.zeros(5, dtype=np.float64)
+                new_dist = np.zeros(4, dtype=np.float64)
                 for i in new:
                     new_dist[i] = 1.0
                 new_dist /= new_dist.sum()
                 base = (1.0 - b) * base + b * new_dist
 
         base /= base.sum()  # guard against fp drift before sampling
-        choice = self.rng.choice(5, size=n, p=base)
-        # _gather_by_choice handles the "random" settle pool and skips empty
-        # masks; per-env choice already avoids positional bias (no shuffle).
-        # Returns (pos, quat, jpos, is_side) — is_side marks side_left/right envs.
+        choice = self.rng.choice(4, size=n, p=base)
+        # _gather_by_choice skips empty masks; per-env choice already avoids
+        # positional bias (no shuffle). Returns (pos, quat, jpos, is_side) —
+        # is_side marks side_left/right envs.
         return self._gather_by_choice(
-            [(cats[i], choice == i) for i in range(5)], n)
+            [(cats[i], choice == i) for i in range(4)], n)
 
     # ── contact-link lookup (after scene.build) ───────────────────
 
@@ -983,8 +1038,7 @@ class K1StandupEnv(SkillEnv):
 
     def _reset_robot_pose(self, envs_idx: np.ndarray) -> None:
         # Build all pools on first reset (lazy — needs scene + robot ready).
-        # _pool_pos is None until _build_settle_pool (called last) sets it.
-        if self._pool_pos is None:
+        if not self._pools_built:
             self._build_all_pools()
 
         n = envs_idx.shape[0]
@@ -1269,7 +1323,7 @@ class K1StandupEnv(SkillEnv):
         components["success_rate_ema"] = self._success_rate_ema
 
         # Curriculum advancement. The reverse-height (recovery) curriculum is
-        # the OUTER stage; the fallen-pose L0-L3 curriculum only starts
+        # the OUTER stage; the fallen-pose L0-L2 curriculum only starts
         # advancing once we've reached the final (fallen) recovery stage.
         self._maybe_advance_recovery_stage()
         if self._recovery_stage >= self._recovery_final_stage:
@@ -1280,7 +1334,7 @@ class K1StandupEnv(SkillEnv):
         # log_std-pump + LR-reset (b09d769) fires on every curriculum advance —
         # entropy decays over time and jumps back up at each level-up.
         # With the recovery curriculum DISABLED (the current config) this is
-        # exactly Karl's pose level L0..L3. (If the recovery curriculum is
+        # exactly Karl's pose level L0..L2. (If the recovery curriculum is
         # re-enabled, prepend its stages R0..R(K-1) so the pump fires on those
         # advances too — they're 0 while disabled.)
         if self.cfg.recovery_curriculum_enabled:
@@ -1340,7 +1394,7 @@ class K1StandupEnv(SkillEnv):
             # (~0) and prone (-1) are excluded by orientation. Additionally
             # gate by a pose-level WINDOW so the anti-flip only arms where the
             # detour appears (default: L1 only) — NOT in L0 discovery, and
-            # never on a back-lying RANDOM start in L2/L3. Must match the
+            # never on a back-lying start in L2 (terminal). Must match the
             # rewards-side penalty (max(0, -proj_g_x)): both treat supine as
             # g_x>0 and the belly-flip as g_x<0.
             armed = (self.cfg.supine_anti_flip_min_level

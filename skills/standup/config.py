@@ -162,23 +162,15 @@ class StandupConfig:
     sim_dt: float = 0.002
     gait_freq_hz: float = 1.5          # unused but keeps obs layout uniform
 
-    # Initial-pose generation: spawn robot in the air with random
-    # orientations + random joint perturbations, let physics settle it
-    # in parallel across all envs, snapshot the resulting states into a
-    # pool. Each subsequent reset samples uniformly from the pool — no
-    # mid-rollout physics step needed (which would desynchronize the
-    # other envs).
-    spawn_height_min: float = 0.8        # m
-    spawn_height_max: float = 1.5        # m
-    settle_steps: int = 1500            # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
-                                       # to resolve self-collisions from randomised DOFs;
-                                       # 3 s is a practical GPU compromise. Was 300 (0.6 s) —
-                                       # too short to actually let the pose settle.
-    settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
-    # Filter the pool: keep only states with a clearly fallen robot.
-    # Avoids "robot landed upright" trivial-success starts.
+    # Initial-pose generation: every reset pose is drawn from the four
+    # already-randomized named-pose pools (supine/prone/side_left/side_right),
+    # each built by the forced-settle + filter pipeline in _build_pose_pool.
+    # Reset samples uniformly from the relevant pool — no mid-rollout physics
+    # step needed (which would desynchronize the other envs).
+    # Named-pose pool filter: keep only states with a clearly fallen robot
+    # (avoids "robot landed upright" trivial-success starts). Used by the
+    # orientation/height gates in _build_pose_pool.
     pool_max_upright: float = 0.7        # upright signal upper bound
-    pool_max_height: float = 0.4         # trunk-z upper bound (m)
     # Joint noise added on every pool-sample → effectively unlimited
     # per-reset variation on top of the discrete pool. 0.10 rad ≈ ±6°.
     # Raised from 0.03 (±1.7°, too small to give real start diversity);
@@ -270,14 +262,15 @@ class StandupConfig:
     # in the discovery stage anyway (its weights are zeroed).
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
 
-    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
+    # ── Pose difficulty curriculum (discrete, L0–L2) ──────────────────────
     # Each level presents harder starting poses. Advancement is gated on both
     # sustained EMA success and minimum time at threshold.
     #
     #   L0: prone only                — easiest single entry pose (belly)
     #   L1: prone + supine (50/50)    — add the back recovery
-    #   L2: all 4 named poses (25% each) — + side_left + side_right
-    #   L3: named 50% + random fallen 50% — full robustness
+    #   L2: all 4 named poses (25% each) — + side_left + side_right (terminal,
+    #       full robustness). Each named pool is already heavily randomized, so
+    #       there is no separate "random" fallen level beyond this.
     #
     # Prone (arm push-up → tuck → stand) and supine (roll/sit up) are
     # different motor strategies. Training both 50/50 from the start averages
@@ -285,18 +278,18 @@ class StandupConfig:
     # success EMA stalls below the gate when one pose lags — so supine is held
     # back to L1 and gets there only after prone is solid. Recovery from
     # fully-fallen poses is bootstrapped by the decaying assist force. Set
-    # pose_curriculum_start_level=3 to train directly on the full mixed
+    # pose_curriculum_start_level=2 to train directly on the full mixed
     # distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
 
     # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length = (num_levels - 1) = 3.
-    #   L0→L1 (prone solid before adding supine), L1→L2, L2→L3.
+    # transition from level i → i+1. Length = (num_levels - 1) = 2.
+    #   L0→L1 (prone solid before adding supine), L1→L2 (add side poses).
     # Set just below assist_success_target (0.60) so advancement requires
     # genuine, largely-unassisted competence — by the time the success EMA
     # hits 0.55 the performance-coupled assist is already low (~0.08).
-    pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
+    pose_level_thresholds: tuple = (0.55, 0.55)
 
     # Pose-level WINDOW [min, max] (inclusive) in which `supine_anti_flip` is
     # armed. Default = only L1:
@@ -306,8 +299,8 @@ class StandupConfig:
     #     freshly-learned prone arm-push gets misapplied to those back starts
     #     (roll-to-belly / cobra detour) → arm the anti-flip here to force
     #     direct back-recovery.
-    #   * L2 (side poses) / L3 (random) want unconstrained generalisation, and
-    #     a back-lying random start must not trigger it → off.
+    #   * L2 (adds side poses, terminal) wants unconstrained generalisation,
+    #     and a back-lying start must not trigger it → off.
     # Non-back starts are additionally exempt via the orientation test.
     supine_anti_flip_min_level: int = 1
     supine_anti_flip_max_level: int = 1
@@ -328,8 +321,36 @@ class StandupConfig:
     # now possible — but we keep it conservative at 500 steps (1.0 s) in case
     # the brace doesn't fully hold. Higher rejection rate → more rounds.
     pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
-    pose_pool_side_rounds: int = 6          # compensates for higher filter rejection rate
+    # After the pinned side settle, RELEASE the trunk pin and free-step this
+    # many physics substeps to verify the pose actually stays on its side
+    # (runs for side poses with arm_random or leg_random, i.e. side_left). A
+    # random arm/leg config that doesn't brace will roll out of the side class
+    # here and be culled by the orientation / at-rest / trunk_z gates. 300 =
+    # 0.6 s at 500 Hz: legs have more leverage than arms and can roll the trunk
+    # more slowly, so the window is longer than the arm-only 150 to ensure a
+    # roll-prone config fully leaves the side class before the snapshot.
+    pose_pool_side_verify_steps: int = 300
+    # At-rest gate: after the unpinned verify, reject side snapshots whose base
+    # angular velocity exceeds this (rad/s) — they're still mid-roll, not a
+    # stable resting equilibrium. Guarantees every pooled side pose is settled.
+    pose_pool_side_max_ang_vel: float = 0.5
+    # Side rounds: random arms + legs (side_left) + the unpinned rollover-verify
+    # and at-rest filters reject more states than the old fixed-brace pose, so
+    # build more rounds to keep the side pool populated. Was 6 (fixed brace),
+    # then 12 (arm random), then 18 (added leg randomization), then 30 (WIDE
+    # bottom-leg ranges); 40 also covers DOWN-arm randomization — twisting the
+    # load-bearing brace rolls more configs out, so the verify culls a larger
+    # fraction → need more rounds for yield.
+    pose_pool_side_rounds: int = 40         # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
+    # Prone + supine use wide uniform-random arm+leg joint targets
+    # (StandupPose.arm_random + leg_random) to get diverse limb configs.
+    # That raises the filter rejection rate (more states leave the lying class
+    # or get culled), so it needs more rounds than pose_pool_rounds.
+    pose_pool_limb_random_rounds: int = 10
+    # Inset (rad) from each arm joint's hard URDF limit when sampling random
+    # arm targets, so targets don't sit exactly at the mechanical stop.
+    pose_pool_arm_random_limit_margin: float = 0.10
     # Orientation noise on the trunk quat during pool build. Smaller values →
     # more consistent pose class; larger → more variety but risk of rolling
     # out of class during settle. 0.15 rad (≈±8°) gives enough variation
@@ -388,11 +409,8 @@ class StandupConfig:
     # rejecting the several-cm burials seen in the eval screenshots.
     pose_pool_penetration_eps: float = 0.02
 
-    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
-    pose_mix_random_frac: float = 0.50
-
     # Level-up mix bias. On every advance the sampler over-weights the
-    # newly-introduced pose (supine@L1, sides@L2, random@L3) by this fraction
+    # newly-introduced pose (supine@L1, sides@L2) by this fraction
     # and relaxes back to the level's base mix over `pose_mix_bias_env_steps`
     # on the PER-LEVEL clock. Concentrates fresh capacity on the hard new
     # pose and makes success_rate_ema track it, so the advance gate measures
@@ -413,10 +431,10 @@ class StandupConfig:
     # passes a gate. Mastering "stand from a squat" first bootstraps the full
     # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
     # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
-    # existing L0-L3 fallen-pose curriculum unchanged.
+    # existing L0-L2 fallen-pose curriculum unchanged.
     #
     # DISABLED (mergefixes): per project decision we run ONLY Karl's pose-
-    # difficulty curriculum (L0-L3, _sample_reset_from_level / _maybe_advance_
+    # difficulty curriculum (L0-L2, _sample_reset_from_level / _maybe_advance_
     # level) and no other start-state curriculum. With this False the env sets
     # _recovery_stage = _recovery_final_stage at construction, so _sample_reset
     # hands off to Karl's pose curriculum from step 0 and the crouch pools are

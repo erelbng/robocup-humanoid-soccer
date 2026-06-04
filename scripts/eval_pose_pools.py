@@ -164,19 +164,22 @@ def run(args):
         pool_dir.mkdir(parents=True, exist_ok=True)
 
         # Report the underlying pool size (0 → _sample_from_pool falls back
-        # to the settle pool with a one-time warning).
-        if pool_name == "random":
-            size = int(env._pool_size)
-            settle_info = f"settle={cfg.settle_steps} steps"
+        # to the prone pool with a one-time warning).
+        p = env._named_pools.get(pool_name)
+        size = int(p["size"]) if p else 0
+        is_side = pool_name.startswith("side_")
+        steps = (cfg.pose_pool_side_settle_steps if is_side
+                 else cfg.pose_pool_settle_steps)
+        if is_side:
+            rounds = cfg.pose_pool_side_rounds
+        elif pool_name in ("prone", "supine"):
+            rounds = cfg.pose_pool_limb_random_rounds
         else:
-            p = env._named_pools.get(pool_name)
-            size = int(p["size"]) if p else 0
-            is_side = pool_name.startswith("side_")
-            steps = (cfg.pose_pool_side_settle_steps if is_side
-                     else cfg.pose_pool_settle_steps)
-            rounds = (cfg.pose_pool_side_rounds if is_side
-                      else cfg.pose_pool_rounds)
-            settle_info = f"settle={steps} steps × {rounds} rounds"
+            rounds = cfg.pose_pool_rounds
+        arm_note = (" arm+leg-random"
+                    if pool_name in ("prone", "supine", "side_left",
+                                     "side_right") else "")
+        settle_info = f"settle={steps} steps × {rounds} rounds{arm_note}"
         print(f"[eval] pool '{pool_name}': {size} states "
               f"({settle_info}) → rendering {args.per_pool} samples")
 
@@ -246,8 +249,7 @@ def main():
     p.add_argument("--per-pool", type=int, default=100,
                    help="Random poses (screenshots) per pool (default 100)")
     p.add_argument("--pools", nargs="+",
-                   default=["prone", "supine", "side_left", "side_right",
-                            "random"],
+                   default=["prone", "supine", "side_left", "side_right"],
                    help="Which pools to render")
     p.add_argument("--num-envs", type=int, default=128,
                    help="Envs used to build the pools (pool size scales with "
