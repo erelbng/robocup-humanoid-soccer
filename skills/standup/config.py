@@ -347,11 +347,22 @@ class StandupConfig:
     # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
     # Side-pose MINIMUM trunk height filter. A side-lying robot has trunk
-    # centre at ≈0.08–0.15 m (half trunk width above floor). Supine/prone
-    # robots settle at ≈0.06 m (half trunk depth). Any pool state with
-    # trunk_z < this value has rolled to supine/prone despite the arm-brace
-    # and must be rejected — even if the orientation filter marginally passed.
-    pose_pool_side_min_trunk_z: float = 0.07
+    # centre at ≈0.10–0.18 m (half trunk width above floor). Supine/prone
+    # robots settle at ≈0.06–0.09 m (half trunk depth). Raised from 0.07
+    # to 0.10 because the eval script showed z=0.091 back-lying states
+    # still passing. Any pool state below this has rolled to supine/prone.
+    pose_pool_side_min_trunk_z: float = 0.10
+    # Side-pose MAXIMUM trunk height filter. A settled side-lying robot
+    # should not exceed ≈0.20 m. Unusually high states (e.g. z=0.31) indicate
+    # the robot is propped up in an unstable pose (leg brace, arched back)
+    # that will immediately collapse at episode start.
+    pose_pool_side_max_trunk_z: float = 0.20
+    # DEPRECATED / unused. Side poses are now held on their side by
+    # kinematically pinning the trunk quaternion every physics step during the
+    # pool settle (see _build_pose_pool), not by an external restoring torque —
+    # the torque was damped out by the solver and failed to prevent rolling.
+    # Kept only so older configs/checkpoints referencing it don't break.
+    pose_pool_side_stabilize_torque: float = 80.0
     # Orientation-CLASS filter for named-pose pools. After settling, keep only
     # states whose body-frame gravity still points (roughly) in the pose's
     # nominal direction — i.e. dot(g_settled, g_nominal) > this. A side pose
@@ -364,12 +375,17 @@ class StandupConfig:
     # dot=0.57 > 0.5). 0.80 (within ~37°) enforces genuinely side-lying poses
     # while still allowing the natural tilt variation from settle physics.
     pose_pool_orient_dot_min: float = 0.80
-    # Penetration guard for named-pose pools. After settling, reject any
-    # snapshot where ANY robot link sits below `-this` (m). The check covers
-    # all links (not just feet/hands) so knees and elbows embedded by joint
-    # noise are also caught. A cleanly resting limb sits at ≈+0.02 m.
-    # Was 0.01 — too tight to catch elbows that were only slightly embedded;
-    # raised to 0.02 to give a more robust rejection margin.
+    # Penetration guard for ALL pose pools (named + random settle). After
+    # settling, reject any snapshot whose LOWEST COLLISION-MESH VERTEX sits
+    # below `-this` (m). This is measured via `robot.get_verts()` — the actual
+    # collision geometry in world frame — NOT link origins. A foot link origin
+    # sits at the ankle (well above the floor) even when the SOLE penetrates,
+    # so the old origin-based check silently passed legs-in-the-ground states.
+    # The vertex check is exact: a cleanly settled pose rests ON the floor
+    # (lowest vertex ≈ 0, within the solver's small steady-state contact
+    # penetration); a buried sole/shin/knee/elbow drives it clearly negative.
+    # 0.02 m tolerates the soft-contact steady-state penetration while still
+    # rejecting the several-cm burials seen in the eval screenshots.
     pose_pool_penetration_eps: float = 0.02
 
     # L3: random-pool fraction (rest drawn equally from the 4 named poses).

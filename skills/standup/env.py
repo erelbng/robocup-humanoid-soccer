@@ -82,6 +82,23 @@ def _small_tilt_quat(n: int, max_angle: float,
                      np.zeros_like(cos_h)], axis=-1).astype(np.float32)
 
 
+def _quat_rotate_body_to_world(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate body-frame vectors to world frame using unit quaternion q.
+
+    Args:
+        q: (N, 4) float32 array in (w, x, y, z) order.
+        v: (N, 3) float32 array of body-frame vectors.
+
+    Returns:
+        (N, 3) float32 world-frame vectors. Uses the standard Rodrigues
+        formula: v_world = v + 2w*(q_xyz × v) + 2*(q_xyz × (q_xyz × v)).
+    """
+    w = q[:, 0:1]   # (N, 1)
+    xyz = q[:, 1:]  # (N, 3)
+    t = 2.0 * np.cross(xyz, v)
+    return (v + w * t + np.cross(xyz, t)).astype(np.float32)
+
+
 def _quat_mul(q: np.ndarray, r: np.ndarray) -> np.ndarray:
     """Hamilton product of two (N, 4) wxyz quaternion arrays.
 
@@ -336,8 +353,15 @@ class K1StandupEnv(SkillEnv):
 
             # Filter for "actually fallen": low trunk height AND not
             # already upright. Keep envs where BOTH conditions hold.
+            # PLUS the vertex-based penetration gate (same as the named-pose
+            # pools): reject any state where the lowest collision vertex sits
+            # below the floor — a foot/shin/limb wedged into the ground would
+            # otherwise leak into the L3 random distribution (50% of resets).
             up = upright_signal(q)
-            ok = (p[:, 2] < c.pool_max_height) & (up < c.pool_max_upright)
+            min_contact_z = self._min_contact_link_z()
+            ok = ((p[:, 2] < c.pool_max_height)
+                  & (up < c.pool_max_upright)
+                  & (min_contact_z > -c.pose_pool_penetration_eps))
             if ok.any():
                 pool_pos.append(p[ok])
                 pool_quat.append(q[ok])
@@ -457,8 +481,46 @@ class K1StandupEnv(SkillEnv):
                       f"(round {round_idx}) failed: {e}")
                 continue
 
-            for _ in range(settle_steps):
-                self.scene.step()
+            if is_side:
+                # GUARANTEED side orientation. Humanoid side-lying is an
+                # UNSTABLE equilibrium — PD joint torques + gravity roll the
+                # trunk onto its back/belly within ~60 physics steps of landing.
+                # An external restoring torque (the previous approach) is damped
+                # out by the solver and failed to hold the pose (eval showed all
+                # side states settling supine/prone).
+                #
+                # Instead we KINEMATICALLY PIN the trunk orientation: every
+                # physics step we re-set the base quaternion to the exact side
+                # target, so the torso physically cannot roll. The EXTREMITY
+                # joints still integrate FREELY under their own PD targets +
+                # gravity + floor contact (we never touch their dofs), which
+                # realises the user's spec: "the torso is definitely turned to
+                # the side and only the joints of the extremities are changing".
+                #
+                #   * set_quat(zero_velocity=False) snaps the orientation back
+                #     WITHOUT freezing the joint dofs, so the limbs keep settling.
+                #   * we zero ONLY the base ANGULAR velocity (free-base dofs 3-5)
+                #     so roll momentum can't accumulate and fight the snap; the
+                #     base LINEAR velocity (dofs 0-2) is left intact so the trunk
+                #     still free-falls and rests at its natural side-lying height.
+                side_quat = quat.copy()                 # per-env (noised) side quat
+                base_ang_dofs = [3, 4, 5]
+                zero_ang = np.zeros((N, 3), dtype=np.float32)
+                for _ in range(settle_steps):
+                    self.scene.step()
+                    try:
+                        self.robot.set_quat(side_quat, envs_idx=all_idx,
+                                            zero_velocity=False)
+                    except Exception:
+                        self.robot.set_quat(side_quat, envs_idx=all_idx)
+                    try:
+                        self.robot.set_dofs_velocity(
+                            zero_ang, base_ang_dofs, envs_idx=all_idx)
+                    except Exception:
+                        pass
+            else:
+                for _ in range(settle_steps):
+                    self.scene.step()
 
             try:
                 p = _to_np(self.robot.get_pos()).copy()
@@ -471,11 +533,13 @@ class K1StandupEnv(SkillEnv):
 
             up = upright_signal(q)
             # Penetration gate (applies to BOTH pool kinds): the lowest
-            # foot/hand link must sit above the floor (within -eps). Large
-            # quat/joint noise can rotate a limb under the spawn clearance and
-            # the PD holds it embedded through the settle; replaying such a
-            # snapshot pins the limb in the ground and feeds negative contact-z
-            # into the reward. Reject it.
+            # COLLISION-MESH VERTEX of the robot must sit above the floor
+            # (within -eps). Large quat/joint noise can rotate a limb under the
+            # spawn clearance and the PD holds it embedded through the settle;
+            # replaying such a snapshot pins the limb in the ground and feeds
+            # negative contact-z into the reward. The vertex-based measure
+            # catches a buried sole/shin/knee/elbow that the old link-origin
+            # check missed (origin = ankle/knee joint, well above the floor).
             min_contact_z = self._min_contact_link_z()
             if keep_upright:
                 # Crouch/squat pools (reverse-height recovery curriculum):
@@ -496,12 +560,17 @@ class K1StandupEnv(SkillEnv):
                       & (up < c.pool_max_upright)
                       & (class_dot > c.pose_pool_orient_dot_min)
                       & (min_contact_z > -c.pose_pool_penetration_eps))
-                # Side-pose height guard: a robot that rolled to supine/prone
-                # despite the arm-brace settles at trunk_z ≈ 0.06 m. Any state
-                # below pose_pool_side_min_trunk_z has rolled into the wrong
-                # class — reject even if the orientation filter barely passed.
+                # Side-pose height guards.
+                # MIN: a robot that rolled to supine/prone despite the arm-brace
+                # settles at trunk_z ≈ 0.06–0.09 m — reject anything below
+                # pose_pool_side_min_trunk_z (0.10 m) even if the orientation
+                # filter barely passed (it can pass up to ~37° off-axis).
+                # MAX: unusually high states (arm-propped bridge, arched back)
+                # are physically unstable — they collapse at episode start.
+                # Reject trunk_z > pose_pool_side_max_trunk_z (0.20 m).
                 if is_side:
                     ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
+                    ok &= (p[:, 2] < c.pose_pool_side_max_trunk_z)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
@@ -655,10 +724,17 @@ class K1StandupEnv(SkillEnv):
                 pool["jpos"][idx].copy())
 
     def _gather_by_choice(self, name_mask_pairs: list, n: int) -> tuple:
-        """Assemble (pos, quat, jpos) from multiple pools based on per-env masks."""
+        """Assemble (pos, quat, jpos, is_side) from multiple pools based on per-env masks.
+
+        Returns a 4-tuple; `is_side` is a bool array marking envs that were
+        assigned a side_left or side_right pool state — used by _reset_robot_pose
+        to suppress joint jitter for those envs (side-lying is metastable; jitter
+        can tip the elbow/foot brace off the floor and cause an immediate fall).
+        """
         pos = np.empty((n, 3), dtype=np.float32)
         quat = np.empty((n, 4), dtype=np.float32)
         jpos = np.empty((n, self.act_dim), dtype=np.float32)
+        is_side = np.zeros(n, dtype=bool)
         for pool_name, mask in name_mask_pairs:
             count = int(mask.sum())
             if count > 0:
@@ -666,7 +742,9 @@ class K1StandupEnv(SkillEnv):
                 pos[mask] = p
                 quat[mask] = q
                 jpos[mask] = j
-        return pos, quat, jpos
+                if pool_name.startswith("side_"):
+                    is_side[mask] = True
+        return pos, quat, jpos, is_side
 
     def _sample_reset(self, n: int) -> tuple:
         """Top-level reset sampler honoring the reverse-height curriculum.
@@ -674,6 +752,8 @@ class K1StandupEnv(SkillEnv):
         While in a crouch stage (R < R_final), sample from that stage's upright
         crouch pool; at the final stage, hand off to the fallen-pose L0-L3
         curriculum. Falls back to the fallen sampler if a crouch pool is empty.
+
+        Returns (pos, quat, jpos, is_side) — see _gather_by_choice for is_side.
         """
         if (self.cfg.recovery_curriculum_enabled
                 and self._recovery_stage < self._recovery_final_stage):
@@ -682,7 +762,8 @@ class K1StandupEnv(SkillEnv):
                 idx = self.rng.integers(0, pool["size"], size=n)
                 return (pool["pos"][idx].copy(),
                         pool["quat"][idx].copy(),
-                        pool["jpos"][idx].copy())
+                        pool["jpos"][idx].copy(),
+                        np.zeros(n, dtype=bool))
             warn_attr = f"_crouch_warn_{self._recovery_stage}"
             if not getattr(self, warn_attr, False):
                 print(f"[standup] WARNING: crouch pool R{self._recovery_stage} "
@@ -744,6 +825,7 @@ class K1StandupEnv(SkillEnv):
         choice = self.rng.choice(5, size=n, p=base)
         # _gather_by_choice handles the "random" settle pool and skips empty
         # masks; per-env choice already avoids positional bias (no shuffle).
+        # Returns (pos, quat, jpos, is_side) — is_side marks side_left/right envs.
         return self._gather_by_choice(
             [(cats[i], choice == i) for i in range(5)], n)
 
@@ -821,19 +903,63 @@ class K1StandupEnv(SkillEnv):
         return out
 
     def _min_contact_link_z(self) -> np.ndarray:
-        """Return (N,) world-z of the LOWEST robot link per env.
+        """Return (N,) world-z of the LOWEST COLLISION VERTEX of the robot per env.
 
         Used by the pose-pool penetration filter to reject snapshots where any
-        link settled below the floor. Checks ALL robot links (not just feet
-        and hands) so that embedded knees, elbows, and shoulders are also
-        caught — especially relevant for side poses where the down-arm elbow
-        can be driven into the floor by joint jitter.
+        part of the robot settled below the floor (z < 0).
 
-        Returns +inf for any env whose links couldn't be read (missing links /
-        read failure) so the caller's `> -eps` test leaves those states
-        untouched rather than dropping them.
+        CRITICAL: this measures the actual collision-MESH geometry via Genesis
+        `robot.get_verts()` (all collision vertices in world frame), NOT the
+        link FRAME origins. `link.get_pos()` returns the link origin — e.g. the
+        ankle joint for a foot, or the knee joint for a shin — which can sit
+        several centimetres ABOVE the floor while the foot SOLE / shin SURFACE
+        penetrates it. The origin-based check therefore silently passed poses
+        with a leg buried in the ground. The vertex-based bound is exact: it is
+        the true lowest surface point of the whole robot, so an embedded sole,
+        shin, knee, elbow, or shoulder is always caught.
+
+        A correctly settled fallen pose rests ON the floor → lowest vertex
+        z ≈ 0 (within the solver's small steady-state contact penetration).
+        A buried limb drives it clearly negative. The caller compares against
+        `-pose_pool_penetration_eps`.
+
+        Returns +inf on read failure so the caller's `> -eps` test leaves those
+        states untouched rather than dropping them.
         """
         N = self.num_envs
+        # Primary path: vertex-based lowest point of the entire collision mesh.
+        try:
+            verts = _to_np(self.robot.get_verts())   # (N, V, 3) batched
+            if verts.ndim == 3:
+                return verts[:, :, 2].min(axis=1).astype(np.float32)
+            if verts.ndim == 2:                       # single-env fallback
+                return np.full(N, float(verts[:, 2].min()), dtype=np.float32)
+        except Exception as e:
+            if not getattr(self, "_warned_getverts", False):
+                print(f"[standup] robot.get_verts() unavailable "
+                      f"({type(e).__name__}: {e}); falling back to per-link "
+                      "AABB / origin penetration check.")
+                self._warned_getverts = True
+
+        # Fallback 1: per-link collision AABB lower bound (still geometry-aware).
+        min_z = np.full(N, np.inf, dtype=np.float32)
+        got_aabb = False
+        try:
+            for link in self.robot.links:
+                try:
+                    if getattr(link, "n_geoms", 0) == 0:
+                        continue
+                    aabb = _to_np(link.get_AABB())     # (N, 2, 3): [min, max]
+                    min_z = np.minimum(min_z, aabb[:, 0, 2])
+                    got_aabb = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if got_aabb:
+            return min_z
+
+        # Fallback 2: link-origin minimum (coarse — misses geometry extent).
         min_z = np.full(N, np.inf, dtype=np.float32)
         try:
             for link in self.robot.links:
@@ -842,7 +968,6 @@ class K1StandupEnv(SkillEnv):
                 except Exception:
                     pass
         except Exception:
-            # Fallback: at least check the named foot/hand links we know about.
             self._ensure_contact_links()
             for links in (self._foot_links, self._hand_links):
                 if links is None:
@@ -863,14 +988,16 @@ class K1StandupEnv(SkillEnv):
             self._build_all_pools()
 
         n = envs_idx.shape[0]
-        pos, quat, jpos = self._sample_reset(n)
+        pos, quat, jpos, is_side = self._sample_reset(n)
 
-        # Small Gaussian joint jitter adds continuous variation on top of
-        # the discrete pool — effectively infinite unique starting states.
-        if self.cfg.joint_jitter_rad > 0:
-            jpos = jpos + (self.rng.standard_normal(jpos.shape)
-                           .astype(np.float32)
-                           * self.cfg.joint_jitter_rad)
+        # NO reset-time joint jitter. The pool states are already filtered to
+        # be penetration-free (lowest collision vertex ≳ 0), but adding ±jitter
+        # on the joint angles at reset re-introduces ground penetration — most
+        # visibly the ankle/foot driven into the floor — because there is no
+        # settling step after the jitter to resolve it. Pool diversity comes
+        # from the settle physics (quat + joint noise + per-env DR) during pool
+        # build, which IS resolved by the subsequent settle steps; that is the
+        # right place for variation. (The build-time noise is unaffected.)
 
         try:
             self.robot.set_pos(pos, envs_idx=envs_idx)
