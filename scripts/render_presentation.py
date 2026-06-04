@@ -132,6 +132,11 @@ def build_scene(with_field: bool = True):
     sky.rgb1 = [0.46, 0.62, 0.86]  # upper sky
     sky.rgb2 = [0.78, 0.84, 0.92]  # horizon haze
     model = spec.compile()
+    # CRITICAL: the K1 MJCF declares <option timestep="0.001">. Training and the
+    # validated eval run physics at _SIM_DT=0.002 (10 substeps/control = 50 Hz
+    # control). Without this override the rollout ran at 0.001 (100 Hz control,
+    # half the settle time) → the policy was driven at double rate and stalled.
+    model.opt.timestep = _SIM_DT
     data = mujoco.MjData(model)
     idx = _build_index(model)
     return model, data, idx
