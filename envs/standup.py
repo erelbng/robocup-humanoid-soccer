@@ -337,14 +337,28 @@ def side_left() -> StandupPose:
 
 def side_right() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), -math.pi / 2)
-    # Mirror of side_left: LEFT arm/leg are the down-arm brace + bottom (tripod)
-    # leg and stay at their braced reference; the RIGHT (up) arm and RIGHT (top)
-    # leg randomize freely, and the LEFT bottom leg gets WIDE twisted ranges with
-    # hip-roll kept floor-ward (≥0). The pin→release→verify→filter pipeline in
-    # _build_pose_pool culls anything that rolls out of the side class, so the
-    # surviving pool is provably all genuine side poses.
+    # Mirror of side_left: every extremity randomizes. The RIGHT (up) arm and
+    # RIGHT (top) leg are full-range random; the LEFT bottom leg gets WIDE twisted
+    # ranges with hip-roll floor-ward (≥0); the LEFT down arm gets WIDE twisted
+    # ranges with shoulder-roll floor-ward (the brace prior). The
+    # pin→release→verify→filter pipeline in _build_pose_pool culls anything that
+    # rolls out of the side class, so the surviving pool is provably all genuine
+    # side poses.
     up_arm_right = ("ARight_Shoulder_Pitch", "Right_Shoulder_Roll",
                     "Right_Elbow_Pitch", "Right_Elbow_Yaw")
+    # DOWN arm (left) — WIDE twisted ranges, brace preserved (mirror of side_left's
+    # down arm). Shoulder-ROLL kept floor-ward (positive for both sides — see
+    # _POSE_SIDE_RIGHT Left_Shoulder_Roll 0.65) so the elbow stays a tripod
+    # contact; shoulder-pitch / elbow-pitch / elbow-yaw open up for twist/turn.
+    # Ranges copy directly from side_left's down arm (no sign flip needed). The
+    # rollover-verify + orientation/trunk_z/at-rest/penetration filters cull any
+    # config that loses the brace. Reference: pitch 0.6, roll 0.65, elbow_pitch 1.1.
+    down_arm_left = {
+        "Left_Shoulder_Roll": (0.45, 1.0),   # floor-ward — the brace prior
+        "ALeft_Shoulder_Pitch": (0.0, 1.2),  # turn upper arm fwd/back
+        "Left_Elbow_Pitch": (0.3, 1.6),      # forearm bend (elbow-vs-hand contact)
+        "Left_Elbow_Yaw": (-1.0, 1.0),       # twist
+    }
     # TOP leg (right) — full-range random (not load-bearing): twist/turn/bend/foot.
     top_leg_right = ("Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
                      "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll")
@@ -364,6 +378,7 @@ def side_right() -> StandupPose:
     return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13,
                        spawn_clearance=0.45, arm_random=True,
                        arm_random_joint_names=up_arm_right,
+                       arm_random_constrained=down_arm_left,
                        leg_random=True,
                        leg_random_joint_names=top_leg_right,
                        leg_random_constrained=bottom_leg_left)
