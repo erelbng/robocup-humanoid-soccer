@@ -43,6 +43,8 @@ from training.normalizers import RunningMeanStd
 
 _XML = os.path.join(os.path.dirname(__file__), "..", "models", "robot", "K1",
                     "K1_22dof.xml")
+_FIELD_JSON = os.path.join(os.path.dirname(__file__), "..", "configs",
+                           "field_hsl_2026.json")
 
 DT = 0.02
 SIM_DT = 0.002
@@ -93,12 +95,38 @@ def _rand_quat(rng):
 
 class StandupMujocoEval:
     def __init__(self, checkpoint, device="cpu", record_video=False,
-                 clamp_torque=False, match_genesis_dynamics=False):
+                 clamp_torque=False, match_genesis_dynamics=False,
+                 with_field=True):
         self.cfg = K1RobotConfig()
         self.device = torch.device(device)
         self.record_video = record_video
 
-        self.model = mujoco.MjModel.from_xml_path(os.path.abspath(_XML))
+        # Scene: the real HSL soccer pitch (carpet + markings + goals) spliced
+        # in via the shared field builder, so the eval runs on (and renders on)
+        # the same surface the robot actually plays on — not a bare checker
+        # plane. Falls back to the raw MJCF ground with --no-field. The field
+        # carpet sets its own friction/condim (0.8-1.0, condim 3-4), a more
+        # representative contact than the stock plane.
+        if with_field:
+            from models.field_builder import add_field_to_spec
+            from models.field_generator import FieldDimensions
+            spec = mujoco.MjSpec.from_file(os.path.abspath(_XML))
+            try:
+                g = spec.geom("ground")
+                if g is not None:
+                    spec.delete(g)
+            except Exception:
+                pass
+            add_field_to_spec(spec, mujoco,
+                              FieldDimensions.from_json(os.path.abspath(_FIELD_JSON)),
+                              add_ball=False)
+            light = spec.worldbody.add_light(
+                name="key", pos=[2, -2, 4], dir=[-0.4, 0.4, -0.8],
+                diffuse=[0.4, 0.4, 0.4])
+            light.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
+            self.model = spec.compile()
+        else:
+            self.model = mujoco.MjModel.from_xml_path(os.path.abspath(_XML))
         self.model.opt.timestep = SIM_DT
 
         # ── match Genesis joint dynamics (sim2sim CRITICAL) ──
@@ -175,6 +203,14 @@ class StandupMujocoEval:
               f"privileged={self.use_priv})")
 
         self.renderer = mujoco.Renderer(self.model, 480, 640) if record_video else None
+        # Broadcast-style framing on the pitch (robot stands at the origin).
+        self.cam = None
+        if record_video:
+            self.cam = mujoco.MjvCamera()
+            self.cam.lookat[:] = [0.0, 0.0, 0.4]
+            self.cam.distance = 3.4
+            self.cam.elevation = -15.0
+            self.cam.azimuth = 130.0
 
     # ── state ──
     def _q(self):  return self.data.qpos[self.qadr].copy()
@@ -252,7 +288,8 @@ class StandupMujocoEval:
             if trace and step % 25 == 0:
                 print(f"      step {step:3d}: up={up:+.2f} z={z:.3f}")
             if frames is not None and step % 2 == 0:
-                self.renderer.update_scene(self.data, camera=-1)
+                self.renderer.update_scene(
+                    self.data, camera=self.cam if self.cam is not None else -1)
                 frames.append(self.renderer.render().copy())
         return {"success": t_first is not None,
                 "t": (t_first*DT) if t_first is not None else None,
@@ -301,10 +338,14 @@ def main():
                     help="diagnostic: zero the MJCF joint armature (unstable; "
                          "default keeps the real armature, which training now "
                          "matches via set_dofs_armature)")
+    ap.add_argument("--no-field", action="store_true",
+                    help="use the bare MJCF ground plane instead of the HSL "
+                         "soccer pitch (default: field on)")
     a = ap.parse_args()
     ev = StandupMujocoEval(a.checkpoint, device=a.device,
                            record_video=a.record_video, clamp_torque=a.clamp_torque,
-                           match_genesis_dynamics=a.zero_armature)
+                           match_genesis_dynamics=a.zero_armature,
+                           with_field=not a.no_field)
     vp = a.video_path or os.path.join(
         "videos", f"standup_eval_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
     ev.evaluate(a.episodes, video_path=vp)
