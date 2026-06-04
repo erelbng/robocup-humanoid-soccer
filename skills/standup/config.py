@@ -328,7 +328,24 @@ class StandupConfig:
     # now possible — but we keep it conservative at 500 steps (1.0 s) in case
     # the brace doesn't fully hold. Higher rejection rate → more rounds.
     pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
-    pose_pool_side_rounds: int = 6          # compensates for higher filter rejection rate
+    # After the pinned side settle, RELEASE the trunk pin and free-step this
+    # many physics substeps to verify the pose actually stays on its side
+    # (runs for side poses with arm_random or leg_random, i.e. side_left). A
+    # random arm/leg config that doesn't brace will roll out of the side class
+    # here and be culled by the orientation / at-rest / trunk_z gates. 300 =
+    # 0.6 s at 500 Hz: legs have more leverage than arms and can roll the trunk
+    # more slowly, so the window is longer than the arm-only 150 to ensure a
+    # roll-prone config fully leaves the side class before the snapshot.
+    pose_pool_side_verify_steps: int = 300
+    # At-rest gate: after the unpinned verify, reject side snapshots whose base
+    # angular velocity exceeds this (rad/s) — they're still mid-roll, not a
+    # stable resting equilibrium. Guarantees every pooled side pose is settled.
+    pose_pool_side_max_ang_vel: float = 0.5
+    # Side rounds: random arms + legs (side_left) + the unpinned rollover-verify
+    # and at-rest filters reject more states than the old fixed-brace pose, so
+    # build more rounds to keep the side pool populated. Was 6 (fixed brace),
+    # then 12 (arm random); 18 covers the added leg randomization.
+    pose_pool_side_rounds: int = 18         # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
     # Prone + supine use wide uniform-random arm+leg joint targets
     # (StandupPose.arm_random + leg_random) to get diverse limb configs.

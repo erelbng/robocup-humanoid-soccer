@@ -564,17 +564,41 @@ class K1StandupEnv(SkillEnv):
             # penetration/orientation filters cull any invalid (limb-in-floor /
             # non-prone) result.
             if arm_random:
-                lo, hi = self._joint_random_bounds(
-                    self.robot_cfg.arm_joint_indices)
-                arm_cols = list(self.robot_cfg.arm_joint_indices)
+                # A pose may restrict randomization to a subset of arm joints
+                # (side poses: UP arm only — the DOWN arm stays braced so the
+                # trunk holds its side height and the leg reference stays valid).
+                names = getattr(pose, "arm_random_joint_names", None)
+                if names:
+                    arm_cols = [name_to_idx[n] for n in names
+                                if n in name_to_idx]
+                else:
+                    arm_cols = list(self.robot_cfg.arm_joint_indices)
+                lo, hi = self._joint_random_bounds(tuple(arm_cols))
                 jpos_target[:, arm_cols] = self.rng.uniform(
                     lo, hi, size=(N, len(arm_cols))).astype(np.float32)
             if leg_random:
-                lo, hi = self._joint_random_bounds(
-                    self.robot_cfg.leg_joint_indices)
-                leg_cols = list(self.robot_cfg.leg_joint_indices)
-                jpos_target[:, leg_cols] = self.rng.uniform(
-                    lo, hi, size=(N, len(leg_cols))).astype(np.float32)
+                # Full-range pass: all 12 leg joints (prone/supine) or a subset
+                # (side poses: the TOP leg only — the bottom leg is the tripod
+                # contact and uses the constrained pass below).
+                names = getattr(pose, "leg_random_joint_names", None)
+                if names:
+                    leg_cols = [name_to_idx[n] for n in names
+                                if n in name_to_idx]
+                else:
+                    leg_cols = list(self.robot_cfg.leg_joint_indices)
+                if leg_cols:
+                    lo, hi = self._joint_random_bounds(tuple(leg_cols))
+                    jpos_target[:, leg_cols] = self.rng.uniform(
+                        lo, hi, size=(N, len(leg_cols))).astype(np.float32)
+                # Constrained pass: explicit per-joint (lo, hi) — the BOTTOM leg
+                # of a side pose, kept floor-ward so the foot stays a contact.
+                constrained = getattr(pose, "leg_random_constrained", None)
+                if constrained:
+                    for jname, (clo, chi) in constrained.items():
+                        col = name_to_idx.get(jname)
+                        if col is not None:
+                            jpos_target[:, col] = self.rng.uniform(
+                                clo, chi, size=N).astype(np.float32)
 
             try:
                 self.robot.set_pos(pos, envs_idx=all_idx)
@@ -625,6 +649,19 @@ class K1StandupEnv(SkillEnv):
                             zero_ang, base_ang_dofs, envs_idx=all_idx)
                     except Exception:
                         pass
+
+                if arm_random or leg_random:
+                    # ROLLOVER VERIFICATION. The pinned settle above held the
+                    # trunk on its side while the RANDOMIZED arms/legs settled
+                    # against the floor — but pinning means a roll-prone config
+                    # can't reveal itself (the orientation gate below would
+                    # trivially pass). Now RELEASE the pin and let the trunk
+                    # integrate FREELY for a window: an arm/leg config that
+                    # doesn't brace the side will roll onto its back/belly here.
+                    # The orientation-class + at-rest + side trunk_z gates then
+                    # reject it, so only self-stable side poses reach the pool.
+                    for _ in range(c.pose_pool_side_verify_steps):
+                        self.scene.step()
             else:
                 for _ in range(settle_steps):
                     self.scene.step()
@@ -637,6 +674,20 @@ class K1StandupEnv(SkillEnv):
             except Exception as e:
                 print(f"[standup] pose pool '{pose.name}' snapshot failed: {e}")
                 continue
+
+            # At-rest check (side poses that ran the unpinned verify): a pose
+            # caught MID-ROLL can momentarily pass the orientation gate. Require
+            # the base angular velocity to have settled near zero so the
+            # snapshot is a genuine resting equilibrium, not a transient. Only
+            # meaningful when the trunk was free to move (verify ran).
+            verified = is_side and (arm_random or leg_random)
+            if verified:
+                try:
+                    ang_speed = np.linalg.norm(
+                        _to_np(self.robot.get_ang()), axis=1)
+                except Exception:
+                    # Don't reject on read failure — leave these states in.
+                    ang_speed = np.zeros(N, dtype=np.float32)
 
             up = upright_signal(q)
             # Penetration gate (applies to BOTH pool kinds): the lowest
@@ -678,6 +729,10 @@ class K1StandupEnv(SkillEnv):
                 if is_side:
                     ok &= (p[:, 2] > c.pose_pool_side_min_trunk_z)
                     ok &= (p[:, 2] < c.pose_pool_side_max_trunk_z)
+                    # At-rest gate: reject snapshots still rotating (mid-roll)
+                    # so every pooled side pose is a stationary equilibrium.
+                    if verified:
+                        ok &= (ang_speed < c.pose_pool_side_max_ang_vel)
             if ok.any():
                 pp = p[ok].copy()
                 pp[:, 0:2] = 0.0  # re-centre xy
