@@ -1240,7 +1240,12 @@ class K1StandupEnv(SkillEnv):
             start_supine=self._start_supine,
             weights=self._reward_weights,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
+            pose_joint_indices=(tuple(self.robot_cfg.arm_joint_indices)
+                                + tuple(self.robot_cfg.leg_joint_indices)),
             default_joint_pos=self._default_action,
+            stand_pose_dev_scale=self.cfg.stand_pose_dev_scale,
+            success_ema=self._success_rate_ema,
+            stand_pose_success_ref=self.cfg.stand_pose_success_ref,
             target_height=target_h,
             upright_threshold=upright_thresh,
             hold_steps=hold_steps,

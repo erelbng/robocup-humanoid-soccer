@@ -258,6 +258,30 @@ def standing_tall_signal(foot_z: np.ndarray, trunk_z: np.ndarray,
     return (feet * trunk * _upright_factor(upright)).astype(np.float32)
 
 
+# ─── target standing-pose reward ──────────────────────────────────────
+
+
+def stand_pose_signal(joint_pos: np.ndarray, pose_joint_indices: tuple,
+                      default_joint_pos: np.ndarray, upright: np.ndarray,
+                      dev_scale: float = 1.0) -> np.ndarray:
+    """Positive [0, 1] reward for holding the nominal standing pose — bent
+    knees, hip-wide feet, arms at the sides (i.e. the K1 `default_joint_pos`),
+    ready to transition to walking.
+
+    `exp(-Σ(q - q_rest)² / dev_scale)` over the shaped joints (arms + legs),
+    peaking at 1 when the body sits at the default pose. Multiplied by
+    `near_upright_gate(up)` so it is 0 through the whole recovery (the policy
+    keeps full freedom to stand up) and only shapes the FINAL pose. The caller
+    additionally ramps the whole term with the success-rate EMA, so it stays
+    off until the robot reliably stands and only then sculpts the end pose."""
+    if len(pose_joint_indices) == 0 or default_joint_pos is None:
+        return np.zeros(joint_pos.shape[0], dtype=np.float32)
+    dev = joint_pose_deviation(joint_pos, pose_joint_indices,
+                               default_joint_pos)
+    pose = np.exp(-dev / max(dev_scale, 1e-6))
+    return (pose * near_upright_gate(upright)).astype(np.float32)
+
+
 # ─── phase gating ─────────────────────────────────────────────────────
 
 
@@ -322,7 +346,11 @@ def compute_standup_reward(
     start_supine: np.ndarray = None, # (N,) bool — episode started on the back
     weights=None,
     arm_joint_indices: tuple = (),   # arm dofs (K1: 2..9)
+    pose_joint_indices: tuple = (),  # joints shaped to the target stand pose
     default_joint_pos: np.ndarray = None,
+    stand_pose_dev_scale: float = 1.0,
+    success_ema: float = 0.0,         # running frame-success rate (0..1)
+    stand_pose_success_ref: float = 0.5,
     target_height: float = 0.55,
     upright_threshold: float = 0.92,
     hold_steps: int = 30,
@@ -400,6 +428,19 @@ def compute_standup_reward(
     if len(arm_joint_indices) > 0 and default_joint_pos is not None:
         arm_dev = joint_pose_deviation(joint_pos, arm_joint_indices,
                                         default_joint_pos) * arm_gate
+
+    # Target standing-pose reward — positive, near-upright-gated reward that
+    # pulls the final pose to the nominal stand (bent knees, hip-wide feet,
+    # arms at the sides), ready for a walk transition. Ramped by the success-
+    # rate EMA (`pose_scale`): ~0 while the policy is still learning to stand,
+    # rising to full strength only once it reliably succeeds — so it never
+    # disturbs the proven get-up, it only sculpts the end pose afterwards.
+    pose = stand_pose_signal(joint_pos, pose_joint_indices,
+                             default_joint_pos, up,
+                             dev_scale=stand_pose_dev_scale)
+    pose_scale = float(np.clip(success_ema / max(stand_pose_success_ref, 1e-6),
+                               0.0, 1.0))
+    stand_pose = (pose * pose_scale).astype(np.float32)
 
     # Per-frame "looks standing" — env will count consecutive frames.
     # Gated by feet_ok (feet grounded + under base) so the post-success
@@ -507,6 +548,7 @@ def compute_standup_reward(
         + w.feet_tuck * tuck
         + w.foot_grounded_up * foot_up
         + w.standing_tall * tall
+        + w.stand_pose * stand_pose
         - w.supine_anti_flip * supine_flip_pen
     ).astype(np.float32)
     r_reg = (
@@ -550,6 +592,8 @@ def compute_standup_reward(
         "feet_tuck": float(np.mean(tuck)),
         "foot_grounded_up": float(np.mean(foot_up)),
         "standing_tall": float(np.mean(tall)),
+        "stand_pose": float(np.mean(stand_pose)),
+        "stand_pose_scale": float(pose_scale),
         "supine_anti_flip": float(np.mean(supine_flip_pen)),
         "feet_under_base": float(np.mean(under_base)),
         "mean_foot_z": float(np.mean(foot_z)),

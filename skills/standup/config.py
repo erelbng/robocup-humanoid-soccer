@@ -115,6 +115,16 @@ class StandupRewardWeights:
     # fix tuned for his recovery curriculum, which we no longer run.
     standing_tall: float = 5.0
 
+    # Target standing-pose reward — positive, near-upright-gated reward for
+    # holding the nominal stand (bent knees, hip-wide feet, arms at the sides;
+    # i.e. the K1 default_joint_pos), ready for a walk transition. exp(-Σ
+    # pose-dev² / stand_pose_dev_scale) × upright gate, then ramped by the
+    # success-rate EMA (see StandupConfig.stand_pose_success_ref) so it stays
+    # ~0 until the robot reliably stands and only THEN sculpts the end pose —
+    # the proven get-up is never disturbed. Positive (not a motion penalty),
+    # so it cannot tax the rise into a crouch-freeze.
+    stand_pose: float = 6.0
+
     # Anti-detour penalty for BACK (supine) starts — teaches a direct
     # back-recovery instead of the "roll onto the belly / cobra, then push
     # up" detour. Body-frame gravity-x is −1 when supine, +1 when prone,
@@ -539,6 +549,17 @@ class StandupConfig:
     # is clipped to [0, v_cap] then normalised, so the term saturates at a
     # brisk-but-controlled push and never rewards a destabilising launch.
     explosive_rise_v_cap: float = 0.8
+
+    # ── Target standing-pose reward (StandupRewardWeights.stand_pose) ─────
+    # exp(-Σ pose-dev² / scale): larger scale = broader, more forgiving basin;
+    # smaller = sharper pull to the exact default pose. The deviation sums
+    # over arms (2..9) + legs (10..21) — the head is left free.
+    stand_pose_dev_scale: float = 1.0
+    # Success-rate EMA at which the pose reward reaches FULL strength. The term
+    # is scaled by clip(success_ema / this, 0, 1), so it is ~0 while the policy
+    # is still learning to stand and ramps to full only once it reliably
+    # succeeds. 0.5 ≈ "stands about half the time" → start sculpting the pose.
+    stand_pose_success_ref: float = 0.5
 
     # ── PPO defaults (training.algorithms.ppo) ────────────────────
     total_timesteps: int = 50_000_000
