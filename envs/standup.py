@@ -251,6 +251,11 @@ _POSE_SIDE_LEFT = {
 # side_right: LEFT arm is DOWN arm, LEFT leg is BOTTOM leg (mirror of side_left).
 # By symmetry: same pitch/roll magnitudes, sign of Roll flips floor direction
 # (left arm roll > 0 → body +Y = world floor in side_right) → same brace result.
+# Like side_left, side_right() randomizes the UP arm (right) + TOP leg (right,
+# full range) + BOTTOM leg (left, WIDE twisted ranges, hip-roll kept floor-ward);
+# the DOWN arm (left) stays at its braced reference below (which holds the trunk
+# at z≈0.13 m). The angles below are the braced fallback / leg-jitter base; the
+# rollover-verify + orientation/at-rest/trunk_z filters guarantee side-class.
 _POSE_SIDE_RIGHT = {
     "AAHead_yaw": 0.0, "Head_pitch": 0.0,
     # DOWN arm (left) — FLOOR BRACE (mirror geometry, same elbow_z = +0.005 m).
@@ -315,8 +320,36 @@ def side_left() -> StandupPose:
 
 def side_right() -> StandupPose:
     q = _quat_from_axis_angle((1, 0, 0), -math.pi / 2)
+    # Mirror of side_left: LEFT arm/leg are the down-arm brace + bottom (tripod)
+    # leg and stay at their braced reference; the RIGHT (up) arm and RIGHT (top)
+    # leg randomize freely, and the LEFT bottom leg gets WIDE twisted ranges with
+    # hip-roll kept floor-ward (≥0). The pin→release→verify→filter pipeline in
+    # _build_pose_pool culls anything that rolls out of the side class, so the
+    # surviving pool is provably all genuine side poses.
+    up_arm_right = ("ARight_Shoulder_Pitch", "Right_Shoulder_Roll",
+                    "Right_Elbow_Pitch", "Right_Elbow_Yaw")
+    # TOP leg (right) — full-range random (not load-bearing): twist/turn/bend/foot.
+    top_leg_right = ("Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
+                     "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll")
+    # BOTTOM leg (left) — WIDE twisted ranges, mirror of side_left's bottom leg.
+    # Floor-ward hip-roll is POSITIVE for both sides (see _POSE_SIDE_RIGHT), so the
+    # ranges copy across unchanged EXCEPT Ankle_Roll, whose sign flips between the
+    # left/right reference poses (-0.2 vs +0.2) → its range is the sign-flipped
+    # mirror. Reference values: roll 0.3, pitch 0.2, yaw 0.0, knee 0.5, ankles ∓0.2.
+    bottom_leg_left = {
+        "Left_Hip_Roll": (0.0, 0.8),     # floor-ward (≥0) — the key stability prior
+        "Left_Hip_Pitch": (-1.0, 1.2),   # turn thigh fwd/back
+        "Left_Hip_Yaw": (-0.9, 0.9),     # twist
+        "Left_Knee_Pitch": (0.0, 1.8),   # near-straight → deeply bent
+        "Left_Ankle_Pitch": (-0.9, 0.6), # foot point
+        "Left_Ankle_Roll": (-0.4, 0.8),  # foot twist / sole angle (sign-flipped mirror)
+    }
     return StandupPose("side_right", _POSE_SIDE_RIGHT, q, trunk_height=0.13,
-                       spawn_clearance=0.45)
+                       spawn_clearance=0.45, arm_random=True,
+                       arm_random_joint_names=up_arm_right,
+                       leg_random=True,
+                       leg_random_joint_names=top_leg_right,
+                       leg_random_constrained=bottom_leg_left)
 
 
 def all_poses() -> List[StandupPose]:
