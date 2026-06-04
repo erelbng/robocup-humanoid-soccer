@@ -94,6 +94,14 @@ def build_scene(with_field: bool = True):
         name="key", pos=[2, -2, 4], dir=[-0.4, 0.4, -0.8], diffuse=[0.3, 0.3, 0.3]
     )
     light.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
+    # Sky gradient backdrop so the camera never frames the bare gray void.
+    sky = spec.add_texture()
+    sky.name = "presentation_sky"
+    sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
+    sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_GRADIENT
+    sky.width = sky.height = 512
+    sky.rgb1 = [0.46, 0.62, 0.86]   # upper sky
+    sky.rgb2 = [0.78, 0.84, 0.92]   # horizon haze
     model = spec.compile()
     data = mujoco.MjData(model)
     idx = _build_index(model)
@@ -230,7 +238,9 @@ def standup_obs(data, idx, last_action, step):
 # ───────────────────────── rendering primitives ──────────────────────────
 
 
-def make_camera(lookat=(0, 0, 0.3), dist=3.2, elev=-18.0, azim=130.0):
+def make_camera(lookat=(1.0, 0.0, 0.34), dist=4.7, elev=-13.0, azim=135.0):
+    """Default 3/4 broadcast view: robot framed at centre, a goal in shot, the
+    field filling the lower frame and the sky backdrop above (no gray void)."""
     cam = mujoco.MjvCamera()
     cam.lookat[:] = lookat
     cam.distance = dist
@@ -263,50 +273,90 @@ def add_arrow(renderer, p_from, p_to, rgba=(1.0, 0.2, 0.1, 1.0), width=0.02):
     scn.ngeom += 1
 
 
-def _font(size=22):
+_ACCENT = (54, 211, 178)          # teal accent
+_PANEL = (16, 20, 30, 180)        # translucent dark panel
+_FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def _font(size, bold=False):
     from PIL import ImageFont
 
-    for p in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
-        try:
-            return ImageFont.truetype(p, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.truetype(_FONT_BOLD if bold else _FONT_REG, int(size))
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _rounded(draw, box, radius, fill):
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return
+    try:
+        draw.rounded_rectangle(box, radius=radius, fill=fill)
+    except Exception:
+        draw.rectangle(box, fill=fill)
+
+
+def _bar_color(v):
+    lo, hi = (242, 178, 72), (74, 210, 150)   # amber (low) → green (high)
+    return tuple(int(lo[i] + (hi[i] - lo[i]) * v) for i in range(3)) + (240,)
 
 
 def overlay_text(frame, title=None, lines=None, bars=None):
-    """Draw a title, text lines, and optional labelled bars on an RGB frame."""
+    """Modern overlay: translucent rounded panels, a teal accent, fonts/spacing
+    scaled to the frame height (looks consistent at 360p test or 1080p final).
+    Title top-left; info lines below it; reward bars bottom-left."""
     from PIL import Image, ImageDraw
 
-    img = Image.fromarray(frame)
+    img = Image.fromarray(frame).convert("RGB")
     d = ImageDraw.Draw(img, "RGBA")
-    W = img.width
+    H = img.height
+    s = H / 720.0                                   # scale factor
+    px = lambda v: int(round(v * s))                # noqa: E731
+    pad = px(18)
+
+    y = pad
     if title:
-        f = _font(30)
-        d.rectangle([0, 0, W, 46], fill=(0, 0, 0, 140))
-        d.text((16, 8), title, fill=(255, 255, 255), font=f)
+        tf = _font(px(32), bold=True)
+        tw = d.textlength(title, font=tf)
+        h = px(50)
+        _rounded(d, [pad, y, pad + int(tw) + px(40), y + h], px(12), _PANEL)
+        _rounded(d, [pad, y, pad + px(6), y + h], px(3), _ACCENT + (255,))
+        d.text((pad + px(20), y + px(9)), title, font=tf, fill=(255, 255, 255))
+        y += h + px(8)
+
     if lines:
-        f = _font(20)
-        y = 56
+        lf = _font(px(20))
+        wmax = max(d.textlength(ln, font=lf) for ln in lines)
+        rh = px(28)
+        _rounded(d, [pad, y, pad + int(wmax) + px(28), y + rh * len(lines) + px(10)],
+                 px(10), (16, 20, 30, 150))
+        yy = y + px(8)
         for ln in lines:
-            d.text((16, y), ln, fill=(240, 240, 80), font=f)
-            y += 26
+            d.text((pad + px(14), yy), ln, font=lf, fill=(206, 224, 236))
+            yy += rh
+
     if bars:
-        f = _font(18)
-        y = img.height - 18 * len(bars) - 16
-        bx, bw = 170, 240
+        bf = _font(px(19), bold=True)
+        vf = _font(px(18))
+        lblw, trk = px(200), px(300)
+        row = px(34)
+        ph = row * len(bars) + px(20)
+        top = H - ph - pad
+        _rounded(d, [pad, top, pad + lblw + trk + px(86), H - pad], px(12), _PANEL)
+        yy = top + px(12)
+        tx = pad + px(14) + lblw
         for label, val in bars:
-            d.text((16, y - 2), label, fill=(255, 255, 255), font=f)
-            d.rectangle(
-                [bx, y, bx + bw, y + 14], outline=(255, 255, 255), fill=(0, 0, 0, 120)
-            )
-            fillw = int(bw * max(0.0, min(1.0, val)))
-            d.rectangle([bx, y, bx + fillw, y + 14], fill=(90, 200, 90))
-            d.text((bx + bw + 8, y - 2), f"{val:+.2f}", fill=(255, 255, 255), font=f)
-            y += 18
+            d.text((pad + px(14), yy + px(2)), label, font=bf, fill=(232, 240, 248))
+            _rounded(d, [tx, yy + px(4), tx + trk, yy + px(21)], px(8),
+                     (255, 255, 255, 45))
+            v = max(0.0, min(1.0, float(val)))
+            if v > 0.01:
+                _rounded(d, [tx, yy + px(4), tx + int(trk * v), yy + px(21)], px(8),
+                         _bar_color(v))
+            d.text((tx + trk + px(10), yy + px(2)), f"{val:.2f}", font=vf,
+                   fill=(232, 240, 248))
+            yy += row
     return np.asarray(img)
 
 
@@ -324,7 +374,7 @@ def write_video(frames, path, fps=30):
 # ───────────────────────────── videos ────────────────────────────────────
 
 
-def render_curriculum(out_dir, H=720, W=1280):
+def render_curriculum(out_dir, H=1080, W=1920):
     """Show each named start pose, then an air-drop→settle (how the pool is
     seeded). Kinematic poses + a short physics settle per pose."""
     model, data, idx = build_scene()
@@ -364,7 +414,7 @@ def render_assist_force(out_dir, H=1080, W=1920):
     without a policy."""
     model, data, idx = build_scene()
     renderer = mujoco.Renderer(model, H, W)
-    cam = make_camera(dist=3.0)
+    cam = make_camera()
     cfg = StandupConfig()
     pose = poses.prone()
     mujoco.mj_resetData(model, data)
@@ -410,7 +460,7 @@ def render_domain_randomization(out_dir, H=1080, W=1920):
     face of the domain randomisation that hardens the policy."""
     model, data, idx = build_scene()
     renderer = mujoco.Renderer(model, H, W)
-    cam = make_camera(dist=3.0)
+    cam = make_camera()
     rng = np.random.default_rng(0)
     mujoco.mj_resetData(model, data)
     data.qpos[0:3] = [0, 0, 0.52]
@@ -452,7 +502,7 @@ def render_reward_breakdown(out_dir, H=1080, W=1920):
     overlaid — illustrates what each shaping term measures."""
     model, data, idx = build_scene()
     renderer = mujoco.Renderer(model, H, W)
-    cam = make_camera(dist=3.0)
+    cam = make_camera()
     rc = K1RobotConfig()
     cfg = StandupConfig()
     start = poses.prone()
@@ -479,60 +529,36 @@ def render_reward_breakdown(out_dir, H=1080, W=1920):
         mujoco.mj_forward(model, data)
         quat = data.qpos[3:7][None, :].astype(np.float32)
         z = data.qpos[2:3][None].astype(np.float32)
+        zc = z[:, 0]
         jp = data.qpos[idx["qpos"]][None, :].astype(np.float32)
-        foot_z = np.array(
-            [[data.xpos[b, 2] for b in idx["foot_bid"]]], dtype=np.float32
-        )
+        foot_z = np.array([[data.xpos[b, 2] for b in idx["foot_bid"]]],
+                          dtype=np.float32)
+        foot_xy = np.array([[data.xpos[b, :2] for b in idx["foot_bid"]]],
+                           dtype=np.float32)
         up = R.upright_signal(quat)
         bars = [
-            ("upright", float(R.upright_signal(quat)[0] * 0.5 + 0.5)),
-            ("height", float(R.height_signal(z[:, 0], cfg.target_height)[0])),
-            (
-                "foot_grounded_up",
-                float(
-                    R.foot_grounded_up_signal(
-                        foot_z,
-                        z[:, 0],
-                        up,
-                        foot_max_z=cfg.foot_grounded_max_z,
-                        trunk_min_z=cfg.trunk_up_min_z,
-                    )[0]
-                ),
-            ),
-            (
-                "standing_tall",
-                float(
-                    R.standing_tall_signal(
-                        foot_z,
-                        z[:, 0],
-                        up,
-                        foot_max_z=cfg.foot_grounded_max_z,
-                        trunk_min_z=cfg.standing_tall_min_z,
-                        trunk_max_z=cfg.standing_tall_max_z,
-                    )[0]
-                ),
-            ),
-            (
-                "stand_pose",
-                float(
-                    R.stand_pose_signal(
-                        jp,
-                        pose_idx,
-                        q1.astype(np.float32),
-                        up,
-                        dev_scale=cfg.stand_pose_dev_scale,
-                    )[0]
-                ),
-            ),
+            ("upright", float(up[0] * 0.5 + 0.5)),
+            ("height", float(R.height_signal(zc, cfg.target_height)[0])),
+            ("feet under base", float(R.feet_under_base_score(
+                foot_xy, data.qpos[:2][None].astype(np.float32),
+                d_max=cfg.feet_under_base_soft_d,
+                plateau_d=cfg.feet_under_base_plateau_d)[0])),
+            ("foot grounded + up", float(R.foot_grounded_up_signal(
+                foot_z, zc, up, foot_max_z=cfg.foot_grounded_max_z,
+                trunk_min_z=cfg.trunk_up_min_z)[0])),
+            ("standing tall", float(R.standing_tall_signal(
+                foot_z, zc, up, foot_max_z=cfg.foot_grounded_max_z,
+                trunk_min_z=cfg.standing_tall_min_z,
+                trunk_max_z=cfg.standing_tall_max_z)[0])),
+            ("stand pose (final)", float(R.stand_pose_signal(
+                jp, pose_idx, q1.astype(np.float32), up,
+                dev_scale=cfg.stand_pose_dev_scale)[0])),
         ]
         renderer.update_scene(data, camera=cam)
-        frames.append(
-            overlay_text(
-                renderer.render(),
-                title="Reward shaping — live signal breakdown",
-                bars=bars,
-            )
-        )
+        frames.append(overlay_text(
+            renderer.render(),
+            title="Reward shaping — live signal breakdown",
+            bars=bars))
     write_video(frames, os.path.join(out_dir, "reward_breakdown.mp4"))
     del renderer
 
@@ -615,7 +641,7 @@ def _rollout_checkpoint(ckpt, create_policy, load_checkpoint, H, W, steps):
         obs_norm = RunningMeanStd(shape=(obs_dim,))
         obs_norm.load_state_dict(obs_norm_sd)
     renderer = mujoco.Renderer(model, H, W)
-    cam = make_camera(dist=3.2)
+    cam = make_camera()
     mujoco.mj_resetData(model, data)
     set_pose(data, idx, poses.prone())
     mujoco.mj_forward(model, data)
