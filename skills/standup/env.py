@@ -1479,7 +1479,7 @@ class K1StandupEnv(SkillEnv):
         self._sustained_now[envs_idx] = False
         self._achieved_sustained[envs_idx] = False
         self.best_supine_metric[reset_idx] = 0.0
-        self._prev_prev_action[envs_idx] = 0.0  # zero delta = hold default pose
+        self._prev_prev_action[reset_idx] = 0.0  # zero delta = hold default pose
         # Initialise prev_upright from the just-reset robot's actual
         # orientation, so the first-step progress reward is 0 instead of
         # the +(up+1) freebie we'd get by comparing against a fake -1
