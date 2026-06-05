@@ -67,6 +67,7 @@ events.out.tfevents.*
 *.npy
 *.replay
 *.buffer
+videos/
 
 # ─── Genesis simulator cache ───────────────────────────────────────
 # Genesis caches compiled kernels and decimated meshes per-machine.
