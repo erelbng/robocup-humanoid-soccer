@@ -191,6 +191,7 @@ class K1StandupEnv(SkillEnv):
         # reward term. Initialised to -1 (fully inverted) so the first
         # step from any fallen pose produces a positive Δup credit.
         self._prev_upright = -np.ones(self.num_envs, dtype=np.float32)
+        self.best_supine_metric = np.zeros(self.num_envs, dtype=np.float32)
 
         # Mean assist force applied last step (N) — for logging.
         self._last_assist_force_mean: float = 0.0
@@ -1299,6 +1300,20 @@ class K1StandupEnv(SkillEnv):
             under_base_max_d=self.cfg.success_under_base_max_d,
         )
 
+        g = projected_gravity(root_quat)
+
+        backness = np.clip(g[:, 0], 0.0, 1.0)
+        metric = (
+            0.8 * (1.0 - backness)
+            + 0.2 * np.clip(root_pos[:, 2] / 0.35, 0.0, 1.0)
+        )
+
+        prev_supine = self.best_supine_metric.copy()
+        self.best_supine_metric = np.maximum(
+            self.best_supine_metric,
+            metric,
+        )
+
         prev_streak = self._success_streak.copy()
         frame_now = success_frame_mask(
             root_quat, root_pos[:, 2],
@@ -1336,6 +1351,7 @@ class K1StandupEnv(SkillEnv):
             prev_action=self._last_action,
             prev_prev_action=self._prev_prev_action,
             prev_upright=self._prev_upright,
+            prev_supine=prev_supine,
             success_streak=new_streak,
             sustained_now=sustained_now,
             achieved_sustained=achieved_sustained,
@@ -1462,6 +1478,7 @@ class K1StandupEnv(SkillEnv):
         self._success_streak[envs_idx] = 0
         self._sustained_now[envs_idx] = False
         self._achieved_sustained[envs_idx] = False
+        self.best_supine_metric[reset_ids] = 0.0
         self._prev_prev_action[envs_idx] = 0.0  # zero delta = hold default pose
         # Initialise prev_upright from the just-reset robot's actual
         # orientation, so the first-step progress reward is 0 instead of
