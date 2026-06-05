@@ -18,7 +18,16 @@ class StandupRewardWeights:
     # Primary shaping — positive everywhere in [0, 1], smooth monotonic
     # gradient from upside-down → sideways → upright.
     upright: float = 3.0               # (cos(trunk-z, world-z) + 1) / 2
-    height: float = 2.0                # gaussian around target_height (σ=0.3)
+    # FEET-FIRST EXPERIMENT (standup-feet-first branch): halved 2.0→1.0. The bare
+    # height term is UNGATED by feet/foundation, so it rewards raising the trunk
+    # regardless of whether the feet are under the body — which incentivises a
+    # premature torso-lift (cobra) instead of the reference "position feet first,
+    # body up last" sequence. It's also nearly maxed at a crouch (σ=0.3), so it
+    # mostly drives the early fallen→crouch lift, not the final stand. We lean on
+    # the FOUNDATION-GATED height rewards (foot_grounded_up, standing_tall) +
+    # feet_tuck instead. Kept non-zero (not deferred to post-success) to preserve
+    # the dense early gradient — full deferral risked non-convergence.
+    height: float = 1.0                # gaussian around target_height (σ=0.3)
     # Progress shaping — paid only for active uprightening (Δup > 0).
     # Without this, side-plank (up≈0.7) is a stable basin — the marginal
     # gradient toward standing is too weak to motivate PPO's risk-averse
@@ -47,10 +56,16 @@ class StandupRewardWeights:
     # body). Dense, trunk-pose-UNGATED reward for both feet grounded AND tucked
     # under the base → teaches the squat-ready stance the policy never found.
     # A TASK term (drives the get-up) → ON in the discovery stage.
-    feet_tuck: float = 0.0             # weight on grounded × feet_under_base
-                                       # (0 = Karl's e52b48b config; this term
-                                       #  did not exist on his branch. Code kept
-                                       #  in rewards.py, inert at weight 0.)
+    feet_tuck: float = 3.0             # weight on grounded × feet_under_base.
+                                       # FEET-FIRST EXPERIMENT: turned ON 0.0→3.0.
+                                       # Trunk-pose-UNGATED reward for both feet
+                                       # grounded AND under the base → rewards
+                                       # "position the feet into a foundation
+                                       # FIRST" (the reference video's opening),
+                                       # before/independent of raising the trunk.
+                                       # Pairs with the halved bare `height` so
+                                       # the net incentive is feet-under → rise,
+                                       # not torso-up-first.
 
     # Arm-pose deviation penalty — drives the final standing pose to
     # arms-hanging-at-the-sides (the corrected K1 default with shoulder
