@@ -8,196 +8,32 @@ from dataclasses import dataclass, field
 
 @dataclass
 class StandupRewardWeights:
-    """Weights for the standup composite reward.
-
-    Speed: ONE term (`time_penalty`, dense) + ONE terminal (`success_bonus`,
-    time-scaled). Stability: several terms — all quadratic deviations that
-    vanish at the standing equilibrium, so the optimum stays at 'upright
-    + still' and isn't pulled away by any one term.
-    """
-    # Primary shaping — positive everywhere in [0, 1], smooth monotonic
-    # gradient from upside-down → sideways → upright.
-    upright: float = 3.0               # (cos(trunk-z, world-z) + 1) / 2
-    height: float = 2.0                # gaussian around target_height (σ=0.3)
-    # Progress shaping — paid only for active uprightening (Δup > 0).
-    # Without this, side-plank (up≈0.7) is a stable basin — the marginal
-    # gradient toward standing is too weak to motivate PPO's risk-averse
-    # exploration through the high-motion transition zone. Bumped from
-    # 5.0 to 10.0 because the policy got stuck in a sit/kneel attractor
-    # (z ≈ 0.25, up ≈ 0.85) where Δup ≈ 0; a stronger progress weight
-    # amplifies the tiny gradient that pulls the policy onward.
-    upright_progress: float = 10.0     # weight on max(0, up_t - up_{t-1})
-                                       # (restored to Karl's e52b48b value;
-                                       #  Eric's 15 was for his recovery curric.)
-
-    # Explosive-rise shaping — direct per-step reward for a fast UPWARD trunk
-    # velocity while still low (gated to the recovery phase, vanishing near
-    # upright; capped by `explosive_rise_v_cap`). This is the carrot for the
-    # snappy hip/knee extension of the reference fast-standup that the
-    # rate-capped, speed-independent `upright_progress` term doesn't pay for.
-    # A TASK term (drives the get-up) → stays ON in the discovery stage; it is
-    # deliberately NOT in `_DISCOVERY_ZEROED_WEIGHTS`.
-    explosive_rise: float = 0.0        # weight on clip(v_z,0,v_cap)/v_cap × gates
-                                       # (0 = Karl's e52b48b config; this term
-                                       #  did not exist on his branch. Code kept
-                                       #  in rewards.py, inert at weight 0.)
-
-    # Feet-tuck — run #4 fix for the stubborn ~0.30 m sprawl plateau (runs #1-3
-    # all raised the torso but left legs splayed flat, feet never under the
-    # body). Dense, trunk-pose-UNGATED reward for both feet grounded AND tucked
-    # under the base → teaches the squat-ready stance the policy never found.
-    # A TASK term (drives the get-up) → ON in the discovery stage.
-    feet_tuck: float = 0.0             # weight on grounded × feet_under_base
-                                       # (0 = Karl's e52b48b config; this term
-                                       #  did not exist on his branch. Code kept
-                                       #  in rewards.py, inert at weight 0.)
-
-    # Arm-pose deviation penalty — drives the final standing pose to
-    # arms-hanging-at-the-sides (the corrected K1 default with shoulder
-    # rolls at ±π/2). Phase-gated on a [0.5, 0.85] band so arms are
-    # completely free during the entire recovery (up < 0.5) and the
-    # penalty only ramps in as the robot approaches its final pose.
-    # Many standup motions need arm push-off through up≈0.3–0.5, so the
-    # gate has to stay open through that range.
-    arm_pose_dev: float = 0.2          # Σ (q_arm - q_arm_rest)² × arm_gate
-
-    # Stability penalties — ALL phase-gated by `near_upright_gate`, so
-    # they vanish during deep recovery (the policy needs full motion
-    # freedom to actually stand up) and ramp in only as we approach the
-    # standing pose. They vanish again at the equilibrium itself.
-    base_ang_vel_sway: float = 0.05    # ωx² + ωy² — roll/pitch rate
-    base_lin_vel_drift: float = 0.5    # ||v||² — trunk linear drift
-    joint_vel_quiet: float = 0.0003    # Σ q̇² — joint kinetic activity. Lowered
-                                       # 0.001→0.0003 (stage-2 squat fix): the old
-                                       # value made "stay still" cheapest in a LOW
-                                       # braced squat (min balance corrections);
-                                       # stillness is still rewarded by
-                                       # post_success_still, so the policy can be
-                                       # still in an ERECT pose instead.
-    action_smoothness: float = 0.05    # (a - a_{-1})² — first derivative (was 0.1;
-                                       # eased so standing tall isn't over-taxed)
-    action_jerk: float = 0.05          # (a - 2 a_{-1} + a_{-2})² — jitter (was 0.1)
-
-    # Speed signal — exactly one dense term + one terminal pulse.
-    # Default τ=150 steps (3.0 s) keeps the bonus meaningful across the
-    # realistic standup time range: a 1 s stand pays ~330, a 2 s stand
-    # ~150, a 3 s stand ~100, a 4 s stand ~55. Sub-second standups still
-    # get the largest pulse but slow ones are no longer disqualified.
-    time_penalty: float = 3.0          # per step until sustained-success
-                                       # (restored to Karl's e52b48b value;
-                                       #  ≥2.5 to make floor net-negative:
-                                       #  upright≈0.5×3 + height≈0.3 − 3.0 < 0)
-    success_bonus: float = 400.0       # paid on streak completion, scaled
-                                       #   by exp(-t_first / tau)
-    success_persistence: float = 5.0   # per step while in the hold window
-
-    # Post-success standing reward. The env does NOT terminate on
-    # sustained success — episodes run to the full MAX_EPISODE_STEPS so
-    # the robot must prove it can keep standing after the bonus is paid.
-    # Each frame after success where frame_success is still True earns
-    # this reward; falling back over forfeits the rest of the episode
-    # (no termination penalty, but the opportunity cost is huge — a
-    # 5 s episode with a 1.5 s standup yields ~175 steps × 10 = 1750
-    # of post-success reward, easily dominating any other term).
+    upright: float = 3.0
+    height: float = 2.0
+    upright_progress: float = 10.0
+    supine_situp_progress: float = 1
+    explosive_rise: float = 0.0
+    feet_tuck: float = 0.0
+    arm_pose_dev: float = 0.2
+    base_ang_vel_sway: float = 0.05
+    base_lin_vel_drift: float = 0.5
+    joint_vel_quiet: float = 0.0003
+    action_smoothness: float = 0.05
+    action_jerk: float = 0.05
+    time_penalty: float = 3.0
+    success_bonus: float = 400.0
+    success_persistence: float = 5.0
     post_success_standing: float = 10.0
-
-    # Anti-gaming term — pays only when BOTH feet are on the ground AND
-    # the trunk is lifted. Closes the local-optima loophole where the
-    # policy gets partial upright/height credit from bridge / shoulder-
-    # stand / sprawled poses that never touch its feet to the floor.
-    # Smooth multiplicative gate (left_foot_proximity × right_foot_proximity
-    # × trunk_lift_score) so PPO gets gradient toward the threshold even
-    # before satisfying it. At a fallen pose: 0 (trunk down). At any
-    # bridge / sprawl: 0 (feet not grounded). At a squat (trunk ≥ 0.30):
-    # saturated at ~1.0. Doesn't distinguish squat from full standing.
     foot_grounded_up: float = 5.0
-
-    # Continues where `foot_grounded_up` saturates. Same feet-grounded
-    # gate × trunk ramp on [0.30, 0.55] — 0 at squat, 1.0 at full stand
-    # height. Stacks ADDITIVELY on top of foot_grounded_up so the squat
-    # reward is unchanged (no destabilising regression), but full
-    # extension pays an extra ~5/step → ~1250 over the post-squat
-    # trajectory. Pulls the policy out of the squat local optimum.
-    # Restored to Karl's e52b48b value (5.0); Eric's 10.0 was a kneel-attractor
-    # fix tuned for his recovery curriculum, which we no longer run.
     standing_tall: float = 5.0
-
-    # Target standing-pose reward — positive, near-upright-gated reward for
-    # holding the nominal stand (bent knees, hip-wide feet, arms at the sides;
-    # i.e. the K1 default_joint_pos), ready for a walk transition. exp(-Σ
-    # pose-dev² / stand_pose_dev_scale) × upright gate, then ramped by the
-    # success-rate EMA (see StandupConfig.stand_pose_success_ref) so it stays
-    # ~0 until the robot reliably stands and only THEN sculpts the end pose —
-    # the proven get-up is never disturbed. Positive (not a motion penalty),
-    # so it cannot tax the rise into a crouch-freeze.
-    # Raised 6.0→12.0 (stage-2 squat fix): this is the term that pulls the legs
-    # (knee/hip) and arms to the slight-bend, shoulder-wide ERECT target. At 6.0
-    # it was out-competed by the stillness incentive and the policy settled into
-    # a deep forward-leaning squat. Stronger + a sharper basin
-    # (stand_pose_dev_scale 1.0→0.5) makes the erect target the stable optimum.
     stand_pose: float = 12.0
-
-    # NOTE (regression fix): the anti-slam terms below over-constrained FRESH
-    # discovery (v3 froze in a passive z≈0.28 crouch, never standing, vs v2
-    # which stood by ~42M). Trunk_contact_force is now SUCCESS-RAMPED (off
-    # until the robot reliably stands — see compute_standup_reward), the
-    # progress ratchet is OFF by default, and knee_support is disabled (it was
-    # rewarding the knees-down crouch and reinforcing the very failure mode).
-
-    # Post-success STILLNESS — once a sustained stand is achieved AND still
-    # holding, highly reward being motionless: exp(-(Σq̇²/jv + ‖v‖²/vs)),
-    # paid per post-success frame on TOP of post_success_standing. Gated by
-    # (achieved_sustained & frame_success), so it can only ever reward a robot
-    # that has already stood — it never touches the get-up. This is the "stand
-    # still in the pose after a successful standup" reward.
     post_success_still: float = 8.0
-
-    # Stand "on the spot" — penalise horizontal travel of the base from the
-    # spawn point, (max(0, ‖xy − xy0‖ − tol))². With a generous tolerance a
-    # normal in-place get-up (incl. a short roll) pays ~0, while a policy that
-    # jiggles metres across the field to stand up is taxed hard (quadratic).
-    # A position penalty (not a velocity one), so it never penalises the
-    # vigorous motion a get-up needs — only NET displacement.
     on_spot: float = 6.0
-
-    # Anti-detour penalty for BACK (supine) starts — teaches a direct
-    # back-recovery instead of the "roll onto the belly / cobra, then push
-    # up" detour. Body-frame gravity-x is −1 when supine, +1 when prone,
-    # ~0 when upright or on a side, so max(0, proj_g_x) is >0 ONLY once a
-    # back-start robot has flipped face-down. Gated to supine-start envs
-    # (detected from the reset orientation), so prone recovery is untouched.
-    # A clean sit-up/roll-up keeps proj_g_x ≤ 0 and pays nothing. NOT zeroed
-    # in the discovery stage (it shapes *which* strategy is found). 0 = off.
-    # Best used as a fine-tune on a policy that already stands (--init-from):
-    # it then pushes the existing motion off the flip route. Raise if the
-    # progress reward still makes the detour worthwhile.
     supine_anti_flip: float = 3.0
-
-    # ── Anti cobra/dolphin-slam terms ────────────────────────────────────
-    # Trunk contact-force penalty — suppresses the "slam the torso into the
-    # ground for momentum" exploit that would damage a real robot. Penalises
-    # the NET ground-contact force on the Trunk link ABOVE a threshold (so
-    # merely resting on the floor at the start is free, only violent impacts
-    # are taxed): (clip((‖F_trunk‖ − thresh)/scale, 0, ∞))². SUCCESS-RAMPED
-    # (× the success EMA, like stand_pose) so it is ~0 during fresh discovery
-    # and only bites once the robot reliably stands — a penalty active from
-    # step 0 froze v3 in a passive crouch. 0 = off.
     trunk_contact_force: float = 1.5
-
-    # Knee/shin support credit — DISABLED (0.0). It was meant to make a knee-
-    # based get-up viable, but as a per-step bump for knees-down + upright at
-    # kneeling height it instead REWARDED the z≈0.28 crouch and reinforced the
-    # exact failure mode v3 got stuck in. Kept in the reward (gated, fades at
-    # standing) for a future redesign (e.g. gated on upward trunk velocity so
-    # it only rewards a kneel-and-PUSH, never static kneeling). 0 = off.
     knee_support: float = 0.0
 
 
-# Regularizer weights zeroed in the "discovery" reward stage. These are
-# motion-quality / deployability shaping terms — useful for a SMOOTH final
-# motion, but (per HumanUP, arXiv:2502.12152) early regularization blocks
-# task discovery. Stage 1 turns them OFF so the policy can find *any*
-# standup; stage 2 ("deploy") turns them back on to refine the motion.
 _DISCOVERY_ZEROED_WEIGHTS = (
     "arm_pose_dev",
     "base_ang_vel_sway",
@@ -213,516 +49,129 @@ def discovery_weights(base: StandupRewardWeights) -> StandupRewardWeights:
     — the Stage-1 (discovery) reward set: upright + height + progress +
     feet-grounded + standing-tall + speed/success terms ONLY."""
     return dataclasses.replace(
-        base, **{name: 0.0 for name in _DISCOVERY_ZEROED_WEIGHTS})
+        base, **{name: 0.0 for name in _DISCOVERY_ZEROED_WEIGHTS}
+    )
 
 
 @dataclass
 class StandupConfig:
-    # ── env ────────────────────────────────────────────────────────
     num_envs: int = 1024
-    max_episode_steps: int = 250       # 5 s at 50 Hz — enough for a 3 s
-                                       #   standup + 2 s margin
+    max_episode_steps: int = 250  # 5 s at 50 Hz — enough for a 3 s
     dt: float = 0.02
     sim_dt: float = 0.002
-    gait_freq_hz: float = 1.5          # unused but keeps obs layout uniform
-
-    # Initial-pose generation: spawn robot in the air with random
-    # orientations + random joint perturbations, let physics settle it
-    # in parallel across all envs, snapshot the resulting states into a
-    # pool. Each subsequent reset samples uniformly from the pool — no
-    # mid-rollout physics step needed (which would desynchronize the
-    # other envs).
-    spawn_height_min: float = 0.8        # m
-    spawn_height_max: float = 1.5        # m
-    settle_steps: int = 1500            # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
-                                       # to resolve self-collisions from randomised DOFs;
-                                       # 3 s is a practical GPU compromise. Was 300 (0.6 s) —
-                                       # too short to actually let the pose settle.
-    settle_pool_rounds: int = 4          # pool_size = num_envs × rounds
-    # Filter the pool: keep only states with a clearly fallen robot.
-    # Avoids "robot landed upright" trivial-success starts.
-    pool_max_upright: float = 0.7        # upright signal upper bound
-    pool_max_height: float = 0.4         # trunk-z upper bound (m)
-    # Joint noise added on every pool-sample → effectively unlimited
-    # per-reset variation on top of the discrete pool. 0.10 rad ≈ ±6°.
-    # Raised from 0.03 (±1.7°, too small to give real start diversity);
-    # the pool was already settled at this magnitude so penetration risk
-    # is low.
+    gait_freq_hz: float = 1.5  # unused but keeps obs layout uniform
+    spawn_height_min: float = 0.8  # m
+    spawn_height_max: float = 1.5  # m
+    settle_steps: int = 1500  # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
+    settle_pool_rounds: int = 4  # pool_size = num_envs × rounds
+    pool_max_upright: float = 0.7  # upright signal upper bound
+    pool_max_height: float = 0.4  # trunk-z upper bound (m)
     joint_jitter_rad: float = 0.10
-
-    # ── Assistive-force curriculum (HoST, arXiv:2502.08378) ──────────
-    # The single highest-leverage exploration aid for standup: apply a
-    # DECAYING upward "support" force on the trunk — like helping an
-    # infant stand. Early in training the force nearly holds the robot up,
-    # so the policy reliably reaches the standing pose and learns what the
-    # whole fallen→upright trajectory feels like; the force then weans to
-    # zero so the final policy stands unaided.
     assist_force_enabled: bool = True
-    # Peak upward force (N) at full assist. Robot weighs ~20 kg (≈196 N),
-    # so 160 N supports most of body weight without launching it — the
-    # policy still has to do the last ~20% and get its feet underneath.
     assist_force_max: float = 300.0
-    # Spring shape: force ramps with height deficit (target − z), so it's
-    # strongest when fully fallen and releases to ~0 near standing height.
-    # Upward-only (never pushes the trunk down). This keeps the assist from
-    # fighting the robot once it's nearly up.
     assist_spring_shape: bool = True
-    # PERFORMANCE-COUPLED assist (primary driver). The assist fraction is
-    # tied directly to the success EMA:
-    #   success_frac = clip(1 - success_ema / assist_success_target, 0, 1)
-    # → full support at zero competence, fading to ~0 as the policy reaches
-    # `assist_success_target`. This auto-couples the assist to the pose
-    # curriculum: a level-up introduces a harder pose, the success EMA drops,
-    # and the assist rises back to help — no explicit per-level logic needed.
-    # Set slightly ABOVE the highest advance threshold (0.60 vs 0.55/0.60) so
-    # that at the moment of advancement the assist is already LOW (but not
-    # exactly 0). The old `assist_min_success`/`assist_min_frac` floor is
-    # replaced by this: it pinned the assist at 0.60 right up to the 0.50
-    # advance threshold, so the policy advanced *before* it was weaned.
     assist_success_target: float = 0.60
-    # Time-decay BACKSTOP (multiplicative). On its own the success coupling
-    # would let a policy that plateaus BELOW the target lean on the assist
-    # forever. Multiply success_frac by a linear time ramp (1.0 → 0.0 over
-    # this many cumulative env-steps) so support is always weaned out
-    # eventually, regardless of success. Should be on the same order as the
-    # discovery phase length (a good chunk of total_timesteps).
     assist_curriculum_env_steps: int = 150_000_000
-    # Anti-cobra assist gate. The naive fix — multiply the assist by a "feet
-    # under base" score — is WRONG: a freshly fallen robot also has its feet
-    # splayed out, so that gate zeroes the assist in *every* legitimate fall,
-    # killing the HoST bootstrap (≈167 N → 0 N at z≈0.13). The real cobra
-    # marker is TRUNK LIFTED *and* FEET BEHIND simultaneously — a fallen
-    # robot has the trunk DOWN, so it must still be fully supported. We only
-    # throttle the assist once the chest is up but the feet haven't tucked:
-    #   cobra_factor = 1 - trunk_lifted · (1 - feet_under_base)
-    # → fallen: ~1 (full support), cobra: ~0 (cut), real stand: ~1 (deficit≈0
-    #   makes the force ~0 anyway). Set False for unconditional upward assist.
     assist_cobra_gate: bool = True
-    # Soft ramp width (m) for the feet-under-base term inside the cobra gate:
-    # 1 at foot-under-base (d=0), → 0 at d ≥ this. Matches the reward-side
-    # feet_under_base_soft_d so assist and on-feet reward agree on geometry.
     assist_under_base_soft_d: float = 0.40
-    # Trunk-z band (m) for the `trunk_lifted` ramp in the cobra gate: 0 at
-    # z ≤ z_low (fallen — full support), 1 at z ≥ z_high (chest clearly up —
-    # cobra territory if feet still behind). Fallen prone/supine sits ≈0.13.
     assist_cobra_z_low: float = 0.15
     assist_cobra_z_high: float = 0.35
-
-    # Reward stage. "discovery" (Stage 1) zeroes the motion regularizers so
-    # the policy can find ANY standup; "deploy" (Stage 2) uses the full
-    # weight set for a smooth, sim2real-ready motion. Train discovery →
-    # warm-start a deploy run from its checkpoint via --init-from.
-    reward_stage: str = "deploy"           # "discovery" | "deploy"
-    # HoST recipe (standup-host-recipe branch): success-ramp the motion-quality
-    # group (r_reg: smoothness, jerk, joint-velocity, sway, drift, arm-posture)
-    # by the success EMA — the "fold light style into one run" path. With
-    # reward_stage="deploy" the reg weights are live, but × pose_scale keeps
-    # them ~0 during the get-up (discovery stays free) and ramps them in only
-    # once the policy reliably stands, so they SCULPT the motion (smoother,
-    # implicit motion-speed bound, arms-to-sides) without trapping discovery.
-    # This is also the main sim2sim lever: a gentler, lower-impact motion
-    # exploits fewer Genesis-specific contact quirks → transfers better.
+    reward_stage: str = "deploy"  # "discovery" | "deploy"
     reg_success_ramp: bool = True
-
-    # ── Single-run TWO-STAGE gate (curriculum-completion, not global success) ──
-    # The fix for the L0 stall: instead of ramping the style/quality terms by the
-    # global success EMA (which crossed 0.5 DURING L0 and capped per-frame success
-    # just under the 0.55 advance gate, freezing the curriculum at prone-only),
-    # hold them at 0 until Karl's pose curriculum is COMPLETE (final level), then
-    # ramp by the (reset-to-0-on-advance) L3 success EMA. Stage 1 = proven
-    # discovery + full L0→L3 curriculum; stage 2 = style / "stand still" on an
-    # already-generalising policy. Karl's curriculum is untouched — this only
-    # changes WHEN style activates. Set False for the legacy global-EMA ramp.
     style_stage_gate: bool = True
-    # Stage-2 ramp reference: style_scale = clip(L3_success_ema / this, 0, 1)
-    # once the curriculum is complete. 0.5 ≈ "stands ~half the L3 mix" → start
-    # sculpting; raise for a later/gentler style onset.
     style_success_ref: float = 0.5
-
-    # ── Multi-critic PPO (HoST, arXiv:2502.08378) ────────────────────
-    # One value head per reward group (STANDUP_CRITIC_GROUPS: task / reg /
-    # success) instead of a single critic over the full heterogeneous
-    # reward. HoST found single-critic = ~zero success because the value
-    # net can't fit a return mixing a +400 terminal pulse with dense [0,1]
-    # shaping and small penalties. Each critic fits one homogeneous-scale
-    # group; advantages are normalized per group then weighted-summed.
-    # Standup-only (the other skills keep single-critic PPO).
-    use_multi_critic: bool = True   # standup-host-recipe: ON. HoST's multi-
-                                    # critic — one value head per reward group
-                                    # (task/reg/success), each fitting a
-                                    # homogeneous-scale return. n_critics=3, so
-                                    # an `--init-from` of a single-critic ckpt
-                                    # partial-loads the ACTOR (warm get-up) and
-                                    # starts the 3 critics fresh.
-    # Aggregation weights, aligned to STANDUP_CRITIC_GROUPS = (task, reg,
-    # success). Bias toward `task` early to drive the get-up; `reg` is ~0
-    # in the discovery stage anyway (its weights are zeroed).
+    use_multi_critic: bool = True  # standup-host-recipe: ON. HoST's multi-
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
-
-    # ── Pose difficulty curriculum (discrete, L0–L3) ──────────────────────
-    # Each level presents harder starting poses. Advancement is gated on both
-    # sustained EMA success and minimum time at threshold.
-    #
-    #   L0: prone only                — easiest single entry pose (belly)
-    #   L1: prone + supine (50/50)    — add the back recovery
-    #   L2: all 4 named poses (25% each) — + side_left + side_right
-    #   L3: named 50% + random fallen 50% — full robustness
-    #
-    # Prone (arm push-up → tuck → stand) and supine (roll/sit up) are
-    # different motor strategies. Training both 50/50 from the start averages
-    # the gradients so the policy learns neither cleanly, and the combined
-    # success EMA stalls below the gate when one pose lags — so supine is held
-    # back to L1 and gets there only after prone is solid. Recovery from
-    # fully-fallen poses is bootstrapped by the decaying assist force. Set
-    # pose_curriculum_start_level=3 to train directly on the full mixed
-    # distribution (no curriculum ramp).
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
-
-    # EMA threshold to advance FROM each level. Element i controls the
-    # transition from level i → i+1. Length = (num_levels - 1) = 3.
-    #   L0→L1 (prone solid before adding supine), L1→L2, L2→L3.
-    # Set just below assist_success_target (0.60) so advancement requires
-    # genuine, largely-unassisted competence — by the time the success EMA
-    # hits 0.55 the performance-coupled assist is already low (~0.08).
     pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
-
-    # Pose-level WINDOW [min, max] (inclusive) in which `supine_anti_flip` is
-    # armed. Default = only L1:
-    #   * L0 (prone-only, belly) has no back starts yet, so there is nothing
-    #     for the anti-flip to act on — leave it free (pure discovery).
-    #   * L1 (prone+supine) is where back starts are introduced, and the
-    #     freshly-learned prone arm-push gets misapplied to those back starts
-    #     (roll-to-belly / cobra detour) → arm the anti-flip here to force
-    #     direct back-recovery.
-    #   * L2 (side poses) / L3 (random) want unconstrained generalisation, and
-    #     a back-lying random start must not trigger it → off.
-    # Non-back starts are additionally exempt via the orientation test.
     supine_anti_flip_min_level: int = 1
     supine_anti_flip_max_level: int = 1
-
-    # How many cumulative env-steps the EMA must CONTINUOUSLY stay above the
-    # threshold before advancing. Prevents a single lucky spike triggering a
-    # level jump. At 2048 envs, 1M steps ≈ 488 control steps ≈ ~10 s.
     pose_advance_sustain_steps: int = 1_000_000
-
-    # Named-pose pool build parameters. Same settle mechanism as the main
-    # settle pool but starting from the named pose's reference orientation.
-    pose_pool_settle_steps: int = 1000     # physics substeps per round = 2.0 s at 500 Hz.
-                                            # Was 150 (0.3 s) — too short to damp bouncing
-                                            # after 0.19 s free-fall from spawn height.
-    # Side poses use a shorter settle than supine/prone. The elbow-brace
-    # configuration (Shoulder_Pitch=1.2, Elbow_Pitch=1.1) creates a floor
-    # contact that stabilises the trunk against rolling, so longer settle is
-    # now possible — but we keep it conservative at 500 steps (1.0 s) in case
-    # the brace doesn't fully hold. Higher rejection rate → more rounds.
+    pose_pool_settle_steps: int = 1000  # physics substeps per round = 2.0 s at 500 Hz.
     pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
-    pose_pool_side_rounds: int = 6          # compensates for higher filter rejection rate
-    pose_pool_rounds: int = 2               # total snapshots = rounds × num_envs
-    # Orientation noise on the trunk quat during pool build. Smaller values →
-    # more consistent pose class; larger → more variety but risk of rolling
-    # out of class during settle. 0.15 rad (≈±8°) gives enough variation
-    # without rolling supine into prone or side into prone.
-    # Was 0.30 (±17°) — too large, caused side poses to settle into prone
-    # and supine joints to reach extreme angles that buried feet.
+    pose_pool_side_rounds: int = 6  # compensates for higher filter rejection rate
+    pose_pool_rounds: int = 2  # total snapshots = rounds × num_envs
     pose_pool_quat_noise_rad: float = 0.15
-    # Joint noise for named-pose pools. Smaller than the original 0.30 (±17°)
-    # which caused extreme limb positions to penetrate the floor, especially
-    # for supine (feet driven toward floor) and side (down-arm rolled into
-    # ground). 0.15 rad (±9°) still gives genuine variation while keeping
-    # all limbs in safe positions given the reference joint targets.
     pose_pool_joint_jitter_rad: float = 0.15
-    # Filter: keep pool entries with trunk_z < trunk_height + this margin.
-    # Named poses settle to ~0.13 m; 0.30 m margin catches bounced states.
     pose_pool_max_height_margin: float = 0.30
-    # Side-pose MINIMUM trunk height filter. A side-lying robot has trunk
-    # centre at ≈0.10–0.18 m (half trunk width above floor). Supine/prone
-    # robots settle at ≈0.06–0.09 m (half trunk depth). Raised from 0.07
-    # to 0.10 because the eval script showed z=0.091 back-lying states
-    # still passing. Any pool state below this has rolled to supine/prone.
     pose_pool_side_min_trunk_z: float = 0.10
-    # Side-pose MAXIMUM trunk height filter. A settled side-lying robot
-    # should not exceed ≈0.20 m. Unusually high states (e.g. z=0.31) indicate
-    # the robot is propped up in an unstable pose (leg brace, arched back)
-    # that will immediately collapse at episode start.
     pose_pool_side_max_trunk_z: float = 0.20
-    # DEPRECATED / unused. Side poses are now held on their side by
-    # kinematically pinning the trunk quaternion every physics step during the
-    # pool settle (see _build_pose_pool), not by an external restoring torque —
-    # the torque was damped out by the solver and failed to prevent rolling.
-    # Kept only so older configs/checkpoints referencing it don't break.
     pose_pool_side_stabilize_torque: float = 80.0
-    # Orientation-CLASS filter for named-pose pools. After settling, keep only
-    # states whose body-frame gravity still points (roughly) in the pose's
-    # nominal direction — i.e. dot(g_settled, g_nominal) > this. A side pose
-    # has g≈(0,±1,0); if it rolls onto its back/belly during settle the
-    # gravity swings to (±1,0,0) → dot 0 → rejected. Guarantees a "side"
-    # start is actually on its side (not a back/belly start that drifted in),
-    # and likewise that supine/prone pools stay in-class.
-    # Was 0.5 (within 60°) — far too loose. Images showed blatantly prone
-    # robots passing the side-pose filter (rolled ≈55° from nominal but still
-    # dot=0.57 > 0.5). 0.80 (within ~37°) enforces genuinely side-lying poses
-    # while still allowing the natural tilt variation from settle physics.
     pose_pool_orient_dot_min: float = 0.80
-    # Penetration guard for ALL pose pools (named + random settle). After
-    # settling, reject any snapshot whose LOWEST COLLISION-MESH VERTEX sits
-    # below `-this` (m). This is measured via `robot.get_verts()` — the actual
-    # collision geometry in world frame — NOT link origins. A foot link origin
-    # sits at the ankle (well above the floor) even when the SOLE penetrates,
-    # so the old origin-based check silently passed legs-in-the-ground states.
-    # The vertex check is exact: a cleanly settled pose rests ON the floor
-    # (lowest vertex ≈ 0, within the solver's small steady-state contact
-    # penetration); a buried sole/shin/knee/elbow drives it clearly negative.
-    # 0.02 m tolerates the soft-contact steady-state penetration while still
-    # rejecting the several-cm burials seen in the eval screenshots.
     pose_pool_penetration_eps: float = 0.02
-
-    # L3: random-pool fraction (rest drawn equally from the 4 named poses).
     pose_mix_random_frac: float = 0.50
-
-    # Level-up mix bias. On every advance the sampler over-weights the
-    # newly-introduced pose (supine@L1, sides@L2, random@L3) by this fraction
-    # and relaxes back to the level's base mix over `pose_mix_bias_env_steps`
-    # on the PER-LEVEL clock. Concentrates fresh capacity on the hard new
-    # pose and makes success_rate_ema track it, so the advance gate measures
-    # progress on the new pose instead of being dominated/rushed by the
-    # already-mastered ones. 0 = uniform mix (no bias).
     pose_mix_bias_start: float = 0.80
-    # Per-level horizon over which the new-pose bias decays start→0. Kept
-    # below the success-criteria horizon (25M) so the mix has relaxed to the
-    # full level distribution well before the gate can advance.
     pose_mix_bias_env_steps: int = 15_000_000
-
-    # ── Reverse start-state (height) get-up curriculum ──────────────────────
-    # The OUTER curriculum that addresses the stubborn ~0.30 m sprawl plateau
-    # (runs #1-4: the policy raises its torso but never tucks its feet under to
-    # push up). Start the robot near standing (a stable upright crouch) so it
-    # only learns the easy FINISH, then move the start progressively further
-    # from the goal (squat → deep squat → ... → full fallen) as success-EMA
-    # passes a gate. Mastering "stand from a squat" first bootstraps the full
-    # get-up. Stages R0..R_final: R0..R(K-1) are upright crouch pools (K =
-    # len(recovery_crouch_heights)); the FINAL stage R_K hands off to the
-    # existing L0-L3 fallen-pose curriculum unchanged.
-    #
-    # DISABLED (mergefixes): per project decision we run ONLY Karl's pose-
-    # difficulty curriculum (L0-L3, _sample_reset_from_level / _maybe_advance_
-    # level) and no other start-state curriculum. With this False the env sets
-    # _recovery_stage = _recovery_final_stage at construction, so _sample_reset
-    # hands off to Karl's pose curriculum from step 0 and the crouch pools are
-    # never built. (The recovery code is kept, dormant + correct, behind this
-    # flag in case it's wanted again.)
     recovery_curriculum_enabled: bool = False
-    # Stage to start at. 0 = shallowest crouch. Set to len(recovery_crouch_heights)
-    # (the final stage) to DISABLE the ramp and train directly on fallen poses.
     recovery_start_stage: int = 0
-    # Spawn trunk-z for each crouch stage (descending = deeper squat / harder).
-    # Settling resolves the exact resting height; these are spawn heights.
     recovery_crouch_heights: tuple = (0.47, 0.38, 0.30)
-    # Squat depth per crouch stage: flexion delta = bend_scale × (d_hip,d_knee,
-    # d_ankle), added to the default standing pose. Larger = deeper.
     recovery_bend_scales: tuple = (0.5, 1.0, 1.5)
     recovery_crouch_delta_hip: float = -0.6
     recovery_crouch_delta_knee: float = 0.9
     recovery_crouch_delta_ankle: float = -0.5
-    # EMA success thresholds to advance R0→R1→R2→R_final (length = num crouch
-    # stages = len(recovery_crouch_heights)). Crouches are easy so gates are
-    # high; the last gate (entering full-fallen) is a touch lower.
     recovery_stage_thresholds: tuple = (0.60, 0.55, 0.50)
-    # Cumulative env-steps the EMA must stay above threshold before advancing
-    # (same mechanism as the pose curriculum's pose_advance_sustain_steps).
     recovery_advance_sustain_steps: int = 1_000_000
-    # Crouch pools are statically MARGINAL (a squat needs active balance), so —
-    # unlike the passively-stable fallen pools — they must spawn with SMALL
-    # noise or they topple during settling and the pool builds (near-)empty
-    # (→ silent fallback to fallen sampling, defeating the curriculum). Tight
-    # tilt/joint noise + a shorter settle keep the squat upright.
-    recovery_crouch_quat_noise_rad: float = 0.05    # ≈ ±3° tilt
+    recovery_crouch_quat_noise_rad: float = 0.05  # ≈ ±3° tilt
     recovery_crouch_joint_jitter_rad: float = 0.05  # ≈ ±3° per joint
-    recovery_crouch_settle_steps: int = 500         # 1.0 s at 500 Hz
+    recovery_crouch_settle_steps: int = 500  # 1.0 s at 500 Hz
 
-    # ── Standup leg gains ────────────────────────────────────────────────────
-    # DISABLED (2026-06-03): the frequency-derived gains (kp ~30/60/36, kd
-    # 3.6–4.8) were too soft on kp and over-damped. We now use the per-group
-    # gains in K1RobotConfig, which were set to NaoHTWK's own K1 RL config
-    # (htwk-gym envs/K1/Parameter_Walk.yaml): kp Hip/Knee 100, Ankle 50; kd
-    # Hip/Knee 2, Ankle 1 — the authoritative reference for this robot. Set
-    # use_frequency_gains=True only to revisit the natural-frequency scheme.
     use_frequency_gains: bool = False
     gain_natural_freq_hz: float = 4.0
     gain_damping_ratio_leg: float = 1.5
     gain_damping_ratio_knee: float = 1.0
 
-    # Sim2real flag. Contact-obs addons (foot/hand z + contact bool)
-    # require knowing the absolute floor position — privileged info the
-    # real robot doesn't have. Set True to remove the contact dims from
-    # the policy obs: training is slower (no contact signal) but the
-    # resulting policy is directly deployable. Production sim2real path:
-    # leave this False and use the teacher-student pipeline (`--mode
-    # teacher` → `--mode student`) so the student learns to estimate
-    # contact implicitly from proprio.
     proprio_only: bool = False
-
-    # Sustained-success thresholds (END of curriculum — see _start values
-    # below). A standup is "done" once `success_hold_steps` consecutive
-    # frames satisfy both upright and height conditions.
-    target_height: float = 0.55               # restored to Karl's e52b48b value
-                                              # (Eric lowered to 0.50 for his
-                                              # recovery curriculum).
-    upright_threshold: float = 0.92            # restored to Karl's e52b48b value
-                                              # (cosine ~23°; Eric used 0.88).
-    success_hold_steps: int = 50               # 1.0 s at 50 Hz
-
-    # Curricula on the success criteria. All three independently ramp
-    # from their `_start` value to the final value over
-    # `*_curriculum_env_steps` cumulative env-steps.
-    #
-    # Why three curricula:
-    #   * hold_steps tightens HOW LONG you must hold (1 s = real stability)
-    #   * upright_threshold tightens HOW UPRIGHT (0.92 = deployment quality)
-    #   * target_height tightens HOW TALL (0.55 = K1 standing height)
-    #
-    # Without the threshold curricula the policy commonly gets stuck in a
-    # sit/kneel attractor at z ≈ 0.25, up ≈ 0.85 that pays well from the
-    # dense terms but never triggers `frame_success` (which requires
-    # up > 0.92 AND z > 0.45), so the terminal bonus and post-success
-    # standing reward never fire. The looser starting criteria give the
-    # policy partial credit at intermediate poses, then tighten as it
-    # masters the harder ones.
-    success_hold_steps_start: int = 15         # 0.3 s at 50 Hz
+    target_height: float = 0.55
+    upright_threshold: float = 0.92
+    success_hold_steps: int = 50  # 1.0 s at 50 Hz
+    success_hold_steps_start: int = 15  # 0.3 s at 50 Hz
     hold_curriculum_env_steps: int = 25_000_000
 
-    upright_threshold_start: float = 0.80      # cosine ~37° tilt — kneel-ish
-    target_height_start: float = 0.40          # frame_success at z > 0.30
+    upright_threshold_start: float = 0.80  # cosine ~37° tilt — kneel-ish
+    target_height_start: float = 0.40  # frame_success at z > 0.30
     threshold_curriculum_env_steps: int = 25_000_000
 
-    # Thresholds for the `foot_grounded_up` anti-gaming reward.
-    foot_grounded_max_z: float = 0.10          # feet "on ground" when z < this
-    trunk_up_min_z: float = 0.30               # trunk "lifted" when z > this
+    foot_grounded_max_z: float = 0.10  # feet "on ground" when z < this
+    trunk_up_min_z: float = 0.30  # trunk "lifted" when z > this
+    feet_under_base_soft_d: float = 0.40  # soft ramp: 1 at d=0, 0 at d≥this
+    success_under_base_max_d: float = 0.25  # hard: feet must be within this of base
+    success_foot_max_z: float = 0.12  # hard: feet must be on the ground
+    standing_tall_min_z: float = 0.30  # signal starts ramping here
+    standing_tall_max_z: float = 0.55  # signal saturates at K1 standing height
 
-    # ── Feet-under-base (anti-cobra / anti-push-up) ──────────────────────
-    # The missing discriminator between "standing on its feet" and "lying
-    # with its feet flat and splayed". `_feet_grounded_score` only checks
-    # foot_z, which a prone / cobra / L-sit pose satisfies trivially — so
-    # the policy got ~10/step from foot_grounded_up + standing_tall while
-    # keeping its legs flat on the floor and letting the assist hold the
-    # trunk up. These gate both stand-on-feet rewards (soft, for gradient)
-    # and success detection (hard, so the +400 bonus can't be farmed from
-    # a propped pose) on the horizontal foot↔base distance.
-    feet_under_base_soft_d: float = 0.40       # soft ramp: 1 at d=0, 0 at d≥this
-    success_under_base_max_d: float = 0.25     # hard: feet must be within this of base
-    success_foot_max_z: float = 0.12           # hard: feet must be on the ground
-
-    # Thresholds for the `standing_tall` reward — pulls the policy from
-    # squat (trunk ~0.30) to full standing (trunk ~0.55).
-    standing_tall_min_z: float = 0.30          # signal starts ramping here
-    standing_tall_max_z: float = 0.55          # signal saturates at K1 standing height
-
-    # Time-scaling for the terminal bonus. Bonus *= exp(-t_first / tau).
-    # Restored to Karl's e52b48b value τ=60 (Eric steepened to 45 alongside his
-    # explosive-rise reward, which we no longer use). The speed reward still has
-    # a usable gradient in the range standups occur: at τ=60, 70→45 steps is
-    # 0.31→0.47 (+52%).
     time_to_stand_tau_steps: float = 60.0
 
-    # Velocity cap (m/s) for the explosive-rise reward: upward trunk velocity
-    # is clipped to [0, v_cap] then normalised, so the term saturates at a
-    # brisk-but-controlled push and never rewards a destabilising launch.
     explosive_rise_v_cap: float = 0.8
 
-    # ── Target standing-pose reward (StandupRewardWeights.stand_pose) ─────
-    # exp(-Σ pose-dev² / scale): larger scale = broader, more forgiving basin;
-    # smaller = sharper pull to the exact default pose. The deviation sums
-    # over arms (2..9) + legs (10..21) — the head is left free.
-    stand_pose_dev_scale: float = 0.5   # sharper basin (was 1.0): pulls harder to
-                                        # the exact slight-bend erect target so the
-                                        # stand_pose reward can win over a squat.
-    # Success-rate EMA at which the pose reward reaches FULL strength. The term
-    # is scaled by clip(success_ema / this, 0, 1), so it is ~0 while the policy
-    # is still learning to stand and ramps to full only once it reliably
-    # succeeds. 0.5 ≈ "stands about half the time" → start sculpting the pose.
+    stand_pose_dev_scale: float = 0.5  # sharper basin (was 1.0): pulls harder to
     stand_pose_success_ref: float = 0.5
 
-    # Hip-roll abduction (rad) applied to the stand_pose TARGET so the desired
-    # final stance is SHOULDER-wide, not hip-wide. Left_Hip_Roll += this,
-    # Right_Hip_Roll -= this (URDF axis 1 0 0 → +left/-right spreads the feet).
-    # ~0.15 rad ≈ +13 cm total stance width over the hip-width default → about
-    # shoulder width. The knees keep the default's slight bend.
     stand_target_hip_abduction: float = 0.15
-    # Free-zone radius (m) for feet_under_base: a foot within this of the base
-    # gets full credit, so a shoulder-wide stance is NOT pulled together. Must
-    # cover the shoulder-wide foot offset (~0.16 m) with margin, while still
-    # well below feet_under_base_soft_d (0.40) so cobra/sprawl scores 0.
     feet_under_base_plateau_d: float = 0.22
 
-    # ── Post-success stillness (StandupRewardWeights.post_success_still) ──
-    # exp(-(Σq̇²/jv_scale + ‖v‖²/v_scale)): smaller scales = stricter stillness.
-    post_success_still_jv_scale: float = 3.0    # joint kinetic-energy scale
-    post_success_still_v_scale: float = 0.2     # base linear-velocity scale
+    post_success_still_jv_scale: float = 3.0  # joint kinetic-energy scale
+    post_success_still_v_scale: float = 0.2  # base linear-velocity scale
 
-    # ── Stand-on-the-spot (StandupRewardWeights.on_spot) ─────────────────
-    # Horizontal base travel from the spawn point up to this radius (m) is
-    # free; beyond it the penalty grows quadratically. Generous enough for an
-    # in-place get-up incl. a short roll, tight enough to forbid wandering.
     on_spot_tol: float = 0.6
 
-    # ── Anti-slam: trunk contact-force penalty ───────────────────────────
-    # Net Trunk contact force (N) below this is free (covers resting on the
-    # floor at spawn ≈ partial body weight); above it the penalty ramps. The
-    # robot weighs ~20 kg (≈196 N), so 280 N ≈ 1.4× weight catches genuine
-    # impacts/slams while leaving a normal rest/roll untaxed.
     trunk_contact_force_thresh: float = 280.0
-    # Normaliser (N) for the excess force before squaring — one body weight,
-    # so an impact one body-weight over threshold contributes a penalty of 1.0.
     trunk_contact_force_scale: float = 196.0
 
-    # ── Knee/shin support credit (StandupRewardWeights.knee_support) ─────
-    # A shank counts as "in ground contact" when its net contact force exceeds
-    # this (N). Small so light knee contact registers.
     knee_contact_force_thresh: float = 20.0
-    # Trunk-height band (m) over which the knee bump is active: ramps in above
-    # min (off when fully fallen) and fades to 0 above max (so at standing
-    # height the feet, not the knees, carry the reward — no kneel attractor).
     knee_support_min_z: float = 0.20
     knee_support_max_z: float = 0.45
 
-    # ── Anti-pump: progress ratchet ──────────────────────────────────────
-    # The progress reward pays max(0, up − reference). With the ratchet ON the
-    # reference is the EPISODE high-water mark of uprightness, so re-gaining
-    # ground already covered (the down→up "pump" of the dolphin slam) earns
-    # nothing — only genuinely NEW progress is paid. OFF = the old per-step
-    # reference (rewards oscillatory pumping).
-    #
-    # DEFAULT OFF (regression fix): with the ratchet ON, the rise reward
-    # collapsed (a climb-with-wobble only pays for the new highs, far less than
-    # the per-step signal) and v3 never left the crouch. The trunk contact-
-    # force penalty already targets the actual slam (impact), so the ratchet's
-    # anti-pump role isn't worth the lost rise drive. Flip True to experiment.
     progress_ratchet: bool = False
 
-    # ── Assist re-bootstrap on curriculum level-up ───────────────────────
-    # On a pose-level advance, reset the success-rate EMA to 0 so the HoST
-    # assist force (which is coupled to the EMA) jumps back to full for the
-    # new, harder pose — and the stand_pose end-pose term re-disarms until the
-    # new pose is mastered. Without this the EMA stays high across the advance
-    # and the assist comes back at only ~8%.
     reset_success_ema_on_level_up: bool = True
 
-    # ── PPO defaults (training.algorithms.ppo) ────────────────────
-    total_timesteps: int = 500_000_000   # two-stage run: ~L0-L3 curriculum
-                                          # (stage 1) + a long stage-2 style /
-                                          # stand-still refinement at L3.
+    total_timesteps: int = 500_000_000  # two-stage run: ~L0-L3 curriculum
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     entropy_coef: float = 0.002  # Restored 0.005→0.002 (mergefixes): at 0.005
-                                 # the entropy bonus out-earned the (hard)
-                                 # standup gradient → entropy RAN AWAY (observed
-                                 # 20→27.5, std→0.84/cap) and the policy never
-                                 # committed to a coherent get-up. Karl's design
-                                 # (b09d769) needs entropy to DECAY over time and
-                                 # be re-injected only at level-ups via the
-                                 # log_std pump — incompatible with a high coef.
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
@@ -731,21 +180,10 @@ class StandupConfig:
     obs_dim: int = 0
     act_dim: int = 22
 
-    # ── Level-up exploration / LR reset (training.algorithms.ppo) ──────
-    # The env resets assist / success-criteria / pose-mix on every pose
-    # level-up, but exploration and LR also need a reset — a new pose class
-    # needs a fresh motor program, yet by then entropy has decayed and the
-    # adaptive LR has ratcheted down (~1.3e-4), so the new behaviour is barely
-    # explored. On each level-up the trainer:
-    #   * pumps the actor's per-action log_std by `level_up_log_std_pump`
-    #     (additive, then clamped) → re-injects exploration (the std reset),
-    #   * snaps LR back to `learning_rate` if `level_up_reset_lr` → full
-    #     learning speed for the new task (the LR reset).
-    level_up_log_std_pump: float = 0.5     # 0 disables the exploration pump
+    level_up_log_std_pump: float = 0.5  # 0 disables the exploration pump
     level_up_reset_lr: bool = True
-    # Adaptive-LR KL target. Slightly above the 0.01 default so the LR doesn't
-    # ratchet down as aggressively during late-curriculum learning.
     desired_kl: float = 0.015
 
     rewards: StandupRewardWeights = field(
-        default_factory=lambda: StandupRewardWeights())
+        default_factory=lambda: StandupRewardWeights()
+    )
