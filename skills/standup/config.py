@@ -67,9 +67,16 @@ class StandupRewardWeights:
     # standing pose. They vanish again at the equilibrium itself.
     base_ang_vel_sway: float = 0.05    # ωx² + ωy² — roll/pitch rate
     base_lin_vel_drift: float = 0.5    # ||v||² — trunk linear drift
-    joint_vel_quiet: float = 0.001     # Σ q̇² — joint kinetic activity
-    action_smoothness: float = 0.1     # (a - a_{-1})² — first derivative
-    action_jerk: float = 0.1           # (a - 2 a_{-1} + a_{-2})² — jitter
+    joint_vel_quiet: float = 0.0003    # Σ q̇² — joint kinetic activity. Lowered
+                                       # 0.001→0.0003 (stage-2 squat fix): the old
+                                       # value made "stay still" cheapest in a LOW
+                                       # braced squat (min balance corrections);
+                                       # stillness is still rewarded by
+                                       # post_success_still, so the policy can be
+                                       # still in an ERECT pose instead.
+    action_smoothness: float = 0.05    # (a - a_{-1})² — first derivative (was 0.1;
+                                       # eased so standing tall isn't over-taxed)
+    action_jerk: float = 0.05          # (a - 2 a_{-1} + a_{-2})² — jitter (was 0.1)
 
     # Speed signal — exactly one dense term + one terminal pulse.
     # Default τ=150 steps (3.0 s) keeps the bonus meaningful across the
@@ -123,7 +130,12 @@ class StandupRewardWeights:
     # ~0 until the robot reliably stands and only THEN sculpts the end pose —
     # the proven get-up is never disturbed. Positive (not a motion penalty),
     # so it cannot tax the rise into a crouch-freeze.
-    stand_pose: float = 6.0
+    # Raised 6.0→12.0 (stage-2 squat fix): this is the term that pulls the legs
+    # (knee/hip) and arms to the slight-bend, shoulder-wide ERECT target. At 6.0
+    # it was out-competed by the stillness incentive and the policy settled into
+    # a deep forward-leaning squat. Stronger + a sharper basin
+    # (stand_pose_dev_scale 1.0→0.5) makes the erect target the stable optimum.
+    stand_pose: float = 12.0
 
     # NOTE (regression fix): the anti-slam terms below over-constrained FRESH
     # discovery (v3 froze in a passive z≈0.28 crouch, never standing, vs v2
@@ -621,7 +633,9 @@ class StandupConfig:
     # exp(-Σ pose-dev² / scale): larger scale = broader, more forgiving basin;
     # smaller = sharper pull to the exact default pose. The deviation sums
     # over arms (2..9) + legs (10..21) — the head is left free.
-    stand_pose_dev_scale: float = 1.0
+    stand_pose_dev_scale: float = 0.5   # sharper basin (was 1.0): pulls harder to
+                                        # the exact slight-bend erect target so the
+                                        # stand_pose reward can win over a squat.
     # Success-rate EMA at which the pose reward reaches FULL strength. The term
     # is scaled by clip(success_ema / this, 0, 1), so it is ~0 while the policy
     # is still learning to stand and ramps to full only once it reliably
