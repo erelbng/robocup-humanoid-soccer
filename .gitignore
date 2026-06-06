@@ -64,6 +64,7 @@ events.out.tfevents.*
 *.ckpt
 *.safetensors
 *.npz
+!data/motions/k1_standup_amp.npz
 *.npy
 *.replay
 *.buffer

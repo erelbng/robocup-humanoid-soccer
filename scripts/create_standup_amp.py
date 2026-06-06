@@ -384,9 +384,12 @@ def trajectory_to_amp(sim: K1Sim, traj: np.ndarray) -> np.ndarray:
     ang_vel[:-1] = quat_ang_vel(root_quat[:-1], root_quat[1:], DT)
     ang_vel[-1] = ang_vel[-2]
 
+    # Foot clearance with the SAME formula the standup env's amp_observation()
+    # uses (foot_link z − 0.02, clipped) so the reference and the policy compute
+    # this feature identically. In MuJoCo a planted foot_link sits at z≈0.021, so
+    # this reads ≈0 when planted and grows in swing — exactly as intended.
     foot_z = np.array([sim.foot_heights(traj[i]) for i in range(M)])
-    ground = foot_z.min(0)                       # per-foot planted height
-    foot_clear = np.clip(foot_z - ground, 0.0, 0.5)
+    foot_clear = np.clip(foot_z - 0.02, 0.0, 0.5)
 
     amp = np.zeros((M, AMP_OBS_DIM), dtype=np.float32)
     for i in range(M):
