@@ -162,11 +162,11 @@ class StandupConfig:
     knee_support_min_z: float = 0.20
     knee_support_max_z: float = 0.45
 
-    progress_ratchet: bool = False
+    progress_ratchet: bool = True
 
     reset_success_ema_on_level_up: bool = True
 
-    total_timesteps: int = 500_000_000  # two-stage run: ~L0-L3 curriculum
+    total_timesteps: int = 300_000_000  # two-stage run: ~L0-L3 curriculum
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
