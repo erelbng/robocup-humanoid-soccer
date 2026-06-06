@@ -166,6 +166,15 @@ class StandupConfig:
 
     reset_success_ema_on_level_up: bool = True
 
+    use_amp: bool = False
+    amp_motion_file: str = "data/motions/k1_standup_amp.npz"
+    amp_reward_coef: float = 0.5
+    amp_task_reward_coef: float = 0.5
+    amp_disc_lr: float = 6e-5
+    amp_disc_updates: int = 1
+    amp_disc_batch: int = 4096
+    amp_grad_penalty: float = 5.0
+
     total_timesteps: int = 300_000_000  # two-stage run: ~L0-L3 curriculum
     learning_rate: float = 3e-4
     gamma: float = 0.99

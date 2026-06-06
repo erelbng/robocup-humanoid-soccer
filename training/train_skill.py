@@ -119,6 +119,40 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
     algo_kwargs = dict(algo_kwargs or {})
 
     if algorithm == "ppo":
+        # Adversarial Motion Priors (AMP) path.
+        use_amp = bool(getattr(cfg, "use_amp", False))
+        if use_amp:
+            from training.algorithms.amp import train_ppo_amp_vec, load_motion_dataset
+            # Load the reference dataset (mink-generated or mocap)
+            motion_file = getattr(cfg, "amp_motion_file", None)
+            if not motion_file or not os.path.exists(motion_file):
+                print(f"[train_skill] WARNING: amp_motion_file {motion_file} "
+                      f"missing! Falling back to parametric walk dataset.")
+                from training.algorithms.amp import parametric_walk_dataset
+                motion_dataset = parametric_walk_dataset(env._default_action, device)
+            else:
+                motion_dataset = load_motion_dataset(motion_file, device)
+            
+            policy = create_policy(env.obs_dim, env.act_dim)
+            if init_from:
+                load_checkpoint(init_from, policy)
+            elif resume:
+                load_checkpoint(resume, policy)
+            
+            return train_ppo_amp_vec(
+                env, policy, cfg, motion_dataset, logger,
+                phase=f"skill_{env.SKILL_NAME}",
+                checkpoint_dir=checkpoint_dir,
+                task_reward_coef=getattr(cfg, "amp_task_reward_coef", 0.5),
+                style_reward_coef=getattr(cfg, "amp_reward_coef", 0.5),
+                disc_lr=getattr(cfg, "amp_disc_lr", 6e-5),
+                disc_updates_per_iter=getattr(cfg, "amp_disc_updates", 1),
+                disc_batch=getattr(cfg, "amp_disc_batch", 4096),
+                grad_penalty_coef=getattr(cfg, "amp_grad_penalty", 5.0),
+                device=device,
+                **algo_kwargs,
+            )
+
         # Multi-critic path (HoST): only when the env decomposes its reward
         # into ≥2 groups AND the config opts in. The other skills expose no
         # groups, so they transparently fall through to single-critic PPO.

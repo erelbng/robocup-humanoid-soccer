@@ -1387,3 +1387,29 @@ class K1StandupEnv(SkillEnv):
             self._prev_upright[envs_idx] = -1.0
             self._max_upright[envs_idx] = -1.0
             self._start_supine[envs_idx] = False
+
+    def amp_observation(self) -> np.ndarray:
+        from training.algorithms.amp import build_amp_obs
+        try:
+            root_pos = _to_np(self.robot.get_pos())
+            root_quat = _to_np(self.robot.get_quat())
+            root_ang_vel = _to_np(self.robot.get_ang())
+            jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
+            jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
+            
+            # Foot clearance: height relative to floor.
+            # Booster K1 foot thickness is ~0.02m.
+            foot_pos = self._read_foot_pos()
+            foot_clear = np.clip(foot_pos[:, :, 2] - 0.02, 0.0, 0.5)
+        except Exception:
+            from training.algorithms.amp import AMP_OBS_DIM
+            return np.zeros((self.num_envs, AMP_OBS_DIM), dtype=np.float32)
+        
+        return build_amp_obs(
+            root_pos[:, 2],
+            projected_gravity(root_quat),
+            root_ang_vel,
+            jpos,
+            jvel,
+            foot_clear
+        )

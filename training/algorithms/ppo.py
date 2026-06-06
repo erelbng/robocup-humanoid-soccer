@@ -1123,6 +1123,17 @@ def train_ppo(env, policy, config, logger=None, phase="phase1",
 # ─── helpers ───────────────────────────────────────────────────────────
 
 
+def _mean_trunk_height(obs_buf, obs_norm) -> float:
+    """True mean trunk height (metres) for logging.
+
+    `obs_buf` holds NORMALIZED observations; channel 0 is root height (see
+    skills/common_obs). Un-normalize channel 0 back to metres.
+    """
+    # obs_buf can be (T, N, O) or (N, O)
+    norm_h = float(obs_buf[..., 0].mean())
+    return norm_h * float(obs_norm.std[0]) + float(obs_norm.mean[0])
+
+
 def _log_metrics(logger, metrics: dict, step: int) -> None:
     if logger is None:
         return
