@@ -470,6 +470,8 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                               phase="phase1", curriculum_stage=None,
                               checkpoint_dir: str = "checkpoints",
                               group_weights=None,
+                              amp_dataset=None,
+                              amp_kwargs=None,
                               desired_kl: float = 0.01,
                               use_value_clipping: bool = True,
                               adaptive_lr: bool = True,
@@ -495,16 +497,34 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
 
     The scalar `reward` from `env.step` is still used for episode-return
     bookkeeping/logging, so dashboards stay comparable to single-critic.
+
+    AMP (optional): if `amp_dataset` (a `MotionDataset`) is given, an adversarial
+    style reward (AMP, arXiv:2104.02180) is added as ONE EXTRA critic group
+    "style" on top of the env's groups (so the policy keeps the HoST multi-critic
+    treatment AND learns to move like the reference). The env must then expose
+    `amp_observation() -> (N, AMP_OBS_DIM)`, and `policy.n_critics` must be
+    `len(env.CRITIC_GROUP_NAMES) + 1`. `amp_kwargs` keys: `style_weight`
+    (the style group's aggregation weight), `disc_lr`, `disc_updates`,
+    `disc_batch`, `grad_penalty`.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     group_names = tuple(getattr(env, "CRITIC_GROUP_NAMES", ()))
-    n_groups = len(group_names)
-    if n_groups < 2:
+    n_env_groups = len(group_names)
+    if n_env_groups < 2:
         raise ValueError(
             "train_ppo_multicritic_vec needs env.CRITIC_GROUP_NAMES with "
             f"≥2 groups; got {group_names!r}. Use train_ppo_vec instead.")
+
+    # AMP adds a "style" critic group on top of the env's reward groups.
+    amp_on = amp_dataset is not None
+    akw = dict(amp_kwargs or {})
+    if amp_on:
+        assert hasattr(env, "amp_observation"), \
+            "AMP multi-critic needs env.amp_observation()"
+        group_names = group_names + ("style",)
+    n_groups = len(group_names)
 
     if policy is None:
         policy = PPOActorCritic(config.obs_dim, config.act_dim,
@@ -516,7 +536,10 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     policy = policy.to(device)
 
     if group_weights is None:
-        group_weights = [1.0] * n_groups
+        group_weights = [1.0] * n_env_groups
+    group_weights = list(group_weights)
+    if amp_on and len(group_weights) == n_env_groups:
+        group_weights = group_weights + [float(akw.get("style_weight", 0.5))]
     gw = torch.as_tensor(group_weights, dtype=torch.float32, device=device)
     assert gw.shape == (n_groups,), f"group_weights must be {n_groups}-dim"
 
@@ -537,7 +560,24 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
 
     obs_norm = RunningMeanStd(shape=(obs_dim,))
     # One return-normalizer per group — each group's return has its own scale.
+    # (The style group, when AMP is on, is the last entry and gets its own too.)
     ret_norms = [ReturnNormalizer(gamma=config.gamma) for _ in range(n_groups)]
+
+    # ── AMP discriminator (only when amp_dataset given) ──
+    disc = disc_opt = None
+    amp_dim = disc_updates = disc_batch = 0
+    grad_penalty = 0.0
+    style_q = deque(maxlen=200)
+    if amp_on:
+        from training.algorithms.amp import AMPDiscriminator
+        amp_dim = amp_dataset.amp_obs_dim
+        disc = AMPDiscriminator(amp_dim).to(device)
+        disc.set_obs_norm(*amp_dataset.feature_stats())
+        disc_opt = torch.optim.Adam(disc.parameters(),
+                                    lr=float(akw.get("disc_lr", 6e-5)))
+        disc_updates = int(akw.get("disc_updates", 1))
+        disc_batch = int(akw.get("disc_batch", 4096))
+        grad_penalty = float(akw.get("grad_penalty", 5.0))
 
     ep_rewards = deque(maxlen=200)
     ep_lengths = deque(maxlen=200)
@@ -565,6 +605,7 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     obs_norm.update(obs)
     obs_t = torch.as_tensor(obs_norm.normalize(obs),
                             dtype=torch.float32, device=device)
+    amp_obs = env.amp_observation() if amp_on else None  # (N, amp_dim) raw
 
     obs_buf = torch.zeros(n_steps, n_envs, obs_dim, device=device)
     act_buf = torch.zeros(n_steps, n_envs, act_dim, device=device)
@@ -576,6 +617,9 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     term_buf = torch.zeros(n_steps, n_envs, device=device)
     trunc_buf = torch.zeros(n_steps, n_envs, device=device)
     truncval_buf = torch.zeros(n_steps, n_envs, n_groups, device=device)
+    # AMP transitions (s_t, s_{t+1}) collected this rollout for the discriminator.
+    amp_tr_buf = (torch.zeros(n_steps, n_envs, 2 * amp_dim, device=device)
+                  if amp_on else None)
 
     for iteration in range(num_iterations):
         if (video_supported and not video_recording
@@ -606,9 +650,16 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 obs_buf[step] = obs_t
                 act_buf[step] = action
                 logp_buf[step] = log_prob
-                rew_buf[step] = torch.as_tensor(np.asarray(group_rew),
-                                                device=device,
-                                                dtype=torch.float32)
+                # Env reward groups fill the first n_env_groups columns; the
+                # style group (last column, AMP only) is filled after the rollout.
+                rew_buf[step, :, :n_env_groups] = torch.as_tensor(
+                    np.asarray(group_rew), device=device, dtype=torch.float32)
+                if amp_on:
+                    next_amp_obs = env.amp_observation()
+                    amp_tr_buf[step] = torch.as_tensor(
+                        np.concatenate([amp_obs, next_amp_obs], axis=1),
+                        dtype=torch.float32, device=device)
+                    amp_obs = next_amp_obs
                 val_buf[step] = value
                 done_buf[step] = torch.as_tensor(
                     np.asarray(done, dtype=np.float32), device=device)
@@ -662,6 +713,25 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 obs_norm.update(next_obs)
                 obs_t = torch.as_tensor(obs_norm.normalize(next_obs),
                                         dtype=torch.float32, device=device)
+
+        # ── AMP: style reward (style group) + discriminator update ──
+        disc_metrics = {}
+        if amp_on:
+            from training.algorithms.amp import discriminator_loss
+            flat_tr = amp_tr_buf.reshape(n_steps * n_envs, 2 * amp_dim)
+            # Style reward from the CURRENT discriminator → last reward group.
+            rew_buf[..., -1] = disc.style_reward(flat_tr).reshape(n_steps, n_envs)
+            style_q.append(float(rew_buf[..., -1].mean()))
+            # Then update the discriminator (policy=fake, reference=real).
+            for _ in range(disc_updates):
+                pol_tr = flat_tr[torch.randint(0, flat_tr.shape[0],
+                                               (disc_batch,), device=device)]
+                ref_tr = amp_dataset.sample(disc_batch)
+                d_loss, disc_metrics = discriminator_loss(
+                    disc, pol_tr, ref_tr, grad_penalty_coef=grad_penalty)
+                disc_opt.zero_grad()
+                d_loss.backward()
+                disc_opt.step()
 
         # ── Per-group reward normalisation ──
         rew_norm_buf = torch.empty_like(rew_buf)
@@ -836,6 +906,11 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             for k, q in comp_queues.items():
                 if q:
                     metrics[f"rewards/{k}"] = float(np.mean(q))
+            if amp_on:
+                metrics["amp/style_reward"] = (
+                    float(np.mean(style_q)) if style_q else 0.0)
+                for k, v in disc_metrics.items():
+                    metrics[f"amp/{k}"] = v
 
             ev_str = " ".join(f"{n}={ev_per_group[g]:.2f}"
                               for g, n in enumerate(group_names))

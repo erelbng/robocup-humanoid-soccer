@@ -60,13 +60,16 @@ class StandupConfig:
     dt: float = 0.02
     sim_dt: float = 0.002
     gait_freq_hz: float = 1.5  # unused but keeps obs layout uniform
+
     spawn_height_min: float = 0.8  # m
     spawn_height_max: float = 1.5  # m
     settle_steps: int = 1500  # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
     settle_pool_rounds: int = 4  # pool_size = num_envs × rounds
     pool_max_upright: float = 0.7  # upright signal upper bound
     pool_max_height: float = 0.4  # trunk-z upper bound (m)
+
     joint_jitter_rad: float = 0.10
+
     assist_force_enabled: bool = True
     assist_force_max: float = 300.0
     assist_spring_shape: bool = True
@@ -76,12 +79,16 @@ class StandupConfig:
     assist_under_base_soft_d: float = 0.40
     assist_cobra_z_low: float = 0.15
     assist_cobra_z_high: float = 0.35
+
     reward_stage: str = "deploy"  # "discovery" | "deploy"
+
     reg_success_ramp: bool = True
     style_stage_gate: bool = True
     style_success_ref: float = 0.5
+
     use_multi_critic: bool = True  # standup-host-recipe: ON. HoST's multi-
     critic_group_weights: tuple = (1.0, 1.0, 1.0)
+
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
     pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
@@ -103,6 +110,7 @@ class StandupConfig:
     pose_mix_random_frac: float = 0.50
     pose_mix_bias_start: float = 0.80
     pose_mix_bias_env_steps: int = 15_000_000
+
     recovery_curriculum_enabled: bool = False
     recovery_start_stage: int = 0
     recovery_crouch_heights: tuple = (0.47, 0.38, 0.30)
@@ -166,7 +174,7 @@ class StandupConfig:
 
     reset_success_ema_on_level_up: bool = True
 
-    use_amp: bool = False
+    use_amp: bool = True
     amp_motion_file: str = "data/motions/k1_standup_amp.npz"
     amp_reward_coef: float = 0.5
     amp_task_reward_coef: float = 0.5

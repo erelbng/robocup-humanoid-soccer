@@ -496,6 +496,55 @@ def replay(sim: K1Sim, samples, speed=0.25):
                 time.sleep(0.7)
 
 
+# ─── dataset builder (reusable; called by main() AND train_skill auto-create) ──
+
+
+def generate_and_save(output_path: str = OUTPUT_PATH, variants: int = 25,
+                      types=("back", "belly"), seed: int = 0,
+                      return_samples: bool = False):
+    """Build the physics-grounded standup AMP dataset and save it to
+    `output_path` as a .npz of (M, 2*AMP_OBS_DIM) transitions. Headless and
+    GL-free (physics + FK only), so it is safe to call from training to
+    auto-generate a missing reference. Returns `transitions` (and, if
+    `return_samples`, also `(grid_samples, sim)` for optional rendering)."""
+    rng = np.random.default_rng(seed)
+    sim = K1Sim(XML_PATH)
+    print(f"[create_standup_amp] generating dataset → {output_path} "
+          f"(types={list(types)}, variants={variants}, AMP_OBS_DIM={AMP_OBS_DIM})")
+
+    all_transitions = []
+    grid_samples = []
+    for mt in types:
+        kept = 0
+        first_traj = None
+        for _ in range(variants):
+            traj = make_motion(sim, mt, rng)
+            # sanity filter: must finish reasonably upright + tall (a clean clip)
+            qf = traj[-1]
+            upright = 1.0 - 2.0 * (qf[4] ** 2 + qf[5] ** 2)
+            if not (qf[2] > 0.45 and upright > 0.9):
+                continue
+            all_transitions.append(trajectory_to_amp(sim, traj))
+            kept += 1
+            if first_traj is None:
+                first_traj = traj
+        print(f"[create_standup_amp] type '{mt}': kept {kept}/{variants} clips")
+        if first_traj is not None:
+            grid_samples.append((mt, first_traj))
+
+    if not all_transitions:
+        raise SystemExit("[create_standup_amp] no clips passed the sanity filter!")
+
+    transitions = np.concatenate(all_transitions, axis=0)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    np.savez(output_path, transitions=transitions)
+    print(f"[create_standup_amp] saved {transitions.shape} → {output_path}")
+
+    if return_samples:
+        return transitions, grid_samples, sim
+    return transitions
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 
@@ -516,37 +565,9 @@ def main():
                     help="also save an MP4 of one sample motion")
     args = ap.parse_args()
 
-    rng = np.random.default_rng(args.seed)
-    sim = K1Sim(XML_PATH)
-    print(f"[create_standup_amp] sim_dt={sim.sim_dt}  AMP_OBS_DIM={AMP_OBS_DIM}")
-
-    all_transitions = []
-    grid_samples = []
-    for mt in args.types:
-        kept = 0
-        first_traj = None
-        for _ in range(args.variants):
-            traj = make_motion(sim, mt, rng)
-            # sanity filter: must finish reasonably upright + tall (a clean clip)
-            qf = traj[-1]
-            upright = 1.0 - 2.0 * (qf[4] ** 2 + qf[5] ** 2)
-            if not (qf[2] > 0.45 and upright > 0.9):
-                continue
-            all_transitions.append(trajectory_to_amp(sim, traj))
-            kept += 1
-            if first_traj is None:
-                first_traj = traj
-        print(f"[create_standup_amp] type '{mt}': kept {kept}/{args.variants} clips")
-        if first_traj is not None:
-            grid_samples.append((mt, first_traj))
-
-    if not all_transitions:
-        raise SystemExit("[create_standup_amp] no clips passed the sanity filter!")
-
-    transitions = np.concatenate(all_transitions, axis=0)
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    np.savez(OUTPUT_PATH, transitions=transitions)
-    print(f"[create_standup_amp] saved {transitions.shape} → {OUTPUT_PATH}")
+    transitions, grid_samples, sim = generate_and_save(
+        output_path=OUTPUT_PATH, variants=args.variants,
+        types=tuple(args.types), seed=args.seed, return_samples=True)
 
     if not args.no_grid and grid_samples:
         save_keyframe_grid(sim, grid_samples, IMAGE_OUTPUT_PATH)
