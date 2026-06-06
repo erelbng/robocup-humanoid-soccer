@@ -159,22 +159,9 @@ class K1StandupEnv(SkillEnv):
         self._frame_success = np.zeros(self.num_envs, dtype=bool)
         self._success_streak = np.zeros(self.num_envs, dtype=np.int32)
         self._sustained_now = np.zeros(self.num_envs, dtype=bool)
-        # Latches True once sustained_now fires; stays True until the
-        # episode resets. Gates the post-success standing reward so the
-        # robot only earns it AFTER it has proven it can hit the hold
-        # window — preventing accidental "stood for a few frames then
-        # collapsed" trajectories from collecting the same reward.
         self._achieved_sustained = np.zeros(self.num_envs, dtype=bool)
-        # Per-env "started on the back" flag (supine, incl. back-lying random
-        # poses), set from the reset orientation. Gates the supine_anti_flip
-        # penalty so only back-starts are taxed for rolling face-down.
         self._start_supine = np.zeros(self.num_envs, dtype=bool)
-        # Base xy captured at reset — anchor for the "stand on the spot"
-        # (on_spot) horizontal-travel penalty.
         self._start_xy = np.zeros((self.num_envs, 2), dtype=np.float32)
-        # SHOULDER-wide standing target for the stand_pose reward: the default
-        # pose with the hip-roll joints abducted (Left += a, Right -= a). Arms
-        # and knees keep the default (arms at sides, slight knee bend).
         self._stand_target_pose = self._default_action.copy()
         _abd = float(self.cfg.stand_target_hip_abduction)
         _names = self.robot_cfg.joint_names
@@ -184,17 +171,9 @@ class K1StandupEnv(SkillEnv):
         self._prev_prev_action = np.zeros(
             (self.num_envs, self.act_dim), dtype=np.float32
         )
-        # Cumulative env-steps seen by the policy (sum over all parallel
-        # envs of every `step()` call). Drives the hold_steps curriculum.
         self._total_env_steps_seen: int = 0
-        # EMA of frame_success_rate — used to gate curriculum advancement.
-        # The pose curriculum only advances when the policy shows real
-        # performance, preventing time-only advancement while stuck.
         self._success_rate_ema: float = 0.0
         self._success_ema_alpha: float = 0.005  # ~200-step window
-        # Upright signal from the previous step — used by the progress
-        # reward term. Initialised to -1 (fully inverted) so the first
-        # step from any fallen pose produces a positive Δup credit.
         self._prev_upright = -np.ones(self.num_envs, dtype=np.float32)
         self.best_supine_metric = np.zeros(self.num_envs, dtype=np.float32)
 
@@ -204,23 +183,9 @@ class K1StandupEnv(SkillEnv):
         # ── Pose difficulty curriculum (L0–L3) ────────────────────────────
         self._pose_level: int = self.cfg.pose_curriculum_start_level
         self._pose_level_sustain_steps: int = 0
-        # Env-step count at which the CURRENT level started. All easing
-        # curricula (assist, hold_steps, upright/height thresholds, pose-mix
-        # bias) measure progress RELATIVE to this, not the global clock — so
-        # every level-up re-grants the assist bootstrap + loosened success
-        # criteria for the freshly-introduced (hardest) pose. Without this the
-        # global clock expires (horizons 25–150M) long before the hard poses
-        # arrive (performance-gated, ~180M+), leaving a brand-new pose facing
-        # the hardest criteria with zero assist → success ≈ 0 → gate stuck.
         self._level_start_env_steps: int = 0
-        # Named-pose pools built lazily alongside the settle pool.
-        # {pose_name: {"pos": (M,3), "quat": (M,4), "jpos": (M,22), "size": int}}
         self._named_pools: dict = {}
 
-        # ── Reverse-height get-up curriculum (R0..R_final) ────────────────
-        # Outer curriculum: start near standing (upright crouch) and move the
-        # start progressively more fallen. Stages 0..K-1 sample from crouch
-        # pools; the final stage K hands off to the fallen-pose L0-L3 curriculum.
         self._recovery_final_stage: int = len(self.cfg.recovery_crouch_heights)
         self._recovery_stage: int = (
             self.cfg.recovery_start_stage
@@ -228,10 +193,8 @@ class K1StandupEnv(SkillEnv):
             else self._recovery_final_stage
         )
         self._recovery_sustain_steps: int = 0
-        # Crouch start pools built lazily in _build_all_pools. {stage: pool}.
         self._crouch_pools: dict = {}
 
-        # Contact-link cache — populated lazily after scene.build().
         self._foot_links = None
         self._hand_links = None
         self._trunk_link_idx = None

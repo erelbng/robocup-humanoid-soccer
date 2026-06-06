@@ -147,7 +147,7 @@ class StandupConfig:
     stand_pose_dev_scale: float = 0.5  # sharper basin (was 1.0): pulls harder to
     stand_pose_success_ref: float = 0.5
 
-    stand_target_hip_abduction: float = 0.15
+    stand_target_hip_abduction: float = 0.0
     feet_under_base_plateau_d: float = 0.22
 
     post_success_still_jv_scale: float = 3.0  # joint kinetic-energy scale
