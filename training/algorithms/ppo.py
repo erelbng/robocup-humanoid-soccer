@@ -620,6 +620,9 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
     # AMP transitions (s_t, s_{t+1}) collected this rollout for the discriminator.
     amp_tr_buf = (torch.zeros(n_steps, n_envs, 2 * amp_dim, device=device)
                   if amp_on else None)
+    # Per-step env style gate (0 during discovery/curriculum → 1 at final stage);
+    # see the env's `_style_scale()` / `components["style_scale"]`.
+    style_scale_buf = torch.zeros(n_steps, device=device) if amp_on else None
 
     for iteration in range(num_iterations):
         if (video_supported and not video_recording
@@ -696,6 +699,8 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                 if "pose_curriculum_level" in comps:
                     pose_level_now = max(pose_level_now,
                                          int(comps["pose_curriculum_level"]))
+                if amp_on:
+                    style_scale_buf[step] = float(comps.get("style_scale", 1.0))
 
                 if video_recording:
                     frame = env.render_frame()
@@ -715,14 +720,27 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
                                         dtype=torch.float32, device=device)
 
         # ── AMP: style reward (style group) + discriminator update ──
+        # GATED by the env's two-stage `style_scale` (≈0 during discovery + the
+        # pose curriculum, ramping to 1 only at the final level). While the gate
+        # is ~0 the style group contributes nothing AND the discriminator is left
+        # untouched, so the policy learns to STAND from the task reward exactly as
+        # in plain multi-critic; the adversarial style reward then shapes the
+        # MOTION only once the robot can already get up. Applying style earlier
+        # just injects a noisy 4th advantage group that fights the task reward —
+        # the robot never learns to stand (and so never matches the reference).
         disc_metrics = {}
-        if amp_on:
+        style_active = bool(amp_on and float(style_scale_buf.mean()) > 1e-6)
+        if amp_on and not style_active:
+            rew_buf[..., -1] = 0.0
+            style_q.append(0.0)
+        elif style_active:
             from training.algorithms.amp import discriminator_loss
             flat_tr = amp_tr_buf.reshape(n_steps * n_envs, 2 * amp_dim)
-            # Style reward from the CURRENT discriminator → last reward group.
-            rew_buf[..., -1] = disc.style_reward(flat_tr).reshape(n_steps, n_envs)
+            style_r = disc.style_reward(flat_tr).reshape(n_steps, n_envs)
+            rew_buf[..., -1] = style_scale_buf.unsqueeze(-1) * style_r  # (T,1)*(T,N)
             style_q.append(float(rew_buf[..., -1].mean()))
-            # Then update the discriminator (policy=fake, reference=real).
+            # Update the discriminator (policy=fake, reference=real) only while
+            # style is active — no point training it on flailing stage-1 data.
             for _ in range(disc_updates):
                 pol_tr = flat_tr[torch.randint(0, flat_tr.shape[0],
                                                (disc_batch,), device=device)]
@@ -909,6 +927,8 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             if amp_on:
                 metrics["amp/style_reward"] = (
                     float(np.mean(style_q)) if style_q else 0.0)
+                metrics["amp/style_scale"] = float(style_scale_buf.mean())
+                metrics["amp/style_active"] = float(style_active)
                 for k, v in disc_metrics.items():
                     metrics[f"amp/{k}"] = v
 
