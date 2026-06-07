@@ -83,7 +83,7 @@ class StandupConfig:
     reward_stage: str = "deploy"  # "discovery" | "deploy"
 
     reg_success_ramp: bool = True
-    style_stage_gate: bool = True
+    style_stage_gate: bool = False
     style_success_ref: float = 0.5
 
     use_multi_critic: bool = True  # standup-host-recipe: ON. HoST's multi-
