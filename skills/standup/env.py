@@ -1397,10 +1397,14 @@ class K1StandupEnv(SkillEnv):
             jpos = _to_np(self.robot.get_dofs_position(self.dof_indices))
             jvel = _to_np(self.robot.get_dofs_velocity(self.dof_indices))
             
-            # Foot clearance: height relative to floor.
-            # Booster K1 foot thickness is ~0.02m.
+            # Foot clearance ABOVE a PLANTED foot, so the policy (Genesis) and the
+            # reference (MuJoCo) read ~0 when a foot is on the ground despite their
+            # different foot-link frame offsets — otherwise the discriminator gets
+            # a free constant-offset shortcut. Genesis foot_link stands at ~0.038m
+            # (cfg.amp_foot_z_offset); the MuJoCo reference subtracts its own ~0.02.
             foot_pos = self._read_foot_pos()
-            foot_clear = np.clip(foot_pos[:, :, 2] - 0.02, 0.0, 0.5)
+            foot_off = float(getattr(self.cfg, "amp_foot_z_offset", 0.0377))
+            foot_clear = np.clip(foot_pos[:, :, 2] - foot_off, 0.0, 0.5)
         except Exception:
             from training.algorithms.amp import AMP_OBS_DIM
             return np.zeros((self.num_envs, AMP_OBS_DIM), dtype=np.float32)

@@ -182,6 +182,23 @@ class StandupConfig:
     amp_disc_updates: int = 1
     amp_disc_batch: int = 4096
     amp_grad_penalty: float = 5.0
+    # WHEN the AMP style (motion-prior) reward is active, in the multi-critic path:
+    #   "curriculum" — gated by the env's two-stage style_scale (0 during the pose
+    #                  curriculum, on at the final level) → AMP only REFINES motion
+    #                  after the robot can already stand. Safe default.
+    #   "always"     — style active from step 0 at full strength → AMP GUIDES
+    #                  exploration toward the reference get-up the whole run.
+    #   "anneal"     — style gate decays 1.0 → amp_style_floor over
+    #                  amp_style_anneal_steps → strong early guidance that fades so
+    #                  the task reward takes over
+    amp_style_schedule: str = "anneal"
+    amp_style_anneal_steps: int = 50_000_000
+    amp_style_floor: float = 0.0
+    # Per-foot z (m) subtracted in amp_observation so a PLANTED foot reads ~0
+    # clearance, matching the MuJoCo reference (planted foot ≈0). Genesis foot_link
+    # stands at ~0.038 m; the old 0.02 left a constant ~0.018 m offset the
+    # discriminator could exploit as a free shortcut.
+    amp_foot_z_offset: float = 0.0377
 
     total_timesteps: int = 300_000_000  # two-stage run: ~L0-L3 curriculum
     learning_rate: float = 3e-4

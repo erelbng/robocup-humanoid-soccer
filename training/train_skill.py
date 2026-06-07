@@ -169,6 +169,9 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
             disc_updates=getattr(cfg, "amp_disc_updates", 1),
             disc_batch=getattr(cfg, "amp_disc_batch", 4096),
             grad_penalty=getattr(cfg, "amp_grad_penalty", 5.0),
+            style_schedule=getattr(cfg, "amp_style_schedule", "curriculum"),
+            style_anneal_steps=getattr(cfg, "amp_style_anneal_steps", 50_000_000),
+            style_floor=getattr(cfg, "amp_style_floor", 0.0),
         )
 
         # ── AMP + multi-critic (style as an EXTRA critic group) ──

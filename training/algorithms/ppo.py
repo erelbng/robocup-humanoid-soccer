@@ -578,6 +578,11 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
         disc_updates = int(akw.get("disc_updates", 1))
         disc_batch = int(akw.get("disc_batch", 4096))
         grad_penalty = float(akw.get("grad_penalty", 5.0))
+        # Style schedule: "curriculum" (env style_scale gate, stage-2 refine) |
+        # "always" (on from step 0) | "anneal" (decay 1→floor over N steps).
+        style_schedule = str(akw.get("style_schedule", "curriculum"))
+        style_anneal_steps = max(1.0, float(akw.get("style_anneal_steps", 50e6)))
+        style_floor = float(akw.get("style_floor", 0.0))
 
     ep_rewards = deque(maxlen=200)
     ep_lengths = deque(maxlen=200)
@@ -729,7 +734,21 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
         # just injects a noisy 4th advantage group that fights the task reward —
         # the robot never learns to stand (and so never matches the reference).
         disc_metrics = {}
-        style_active = bool(amp_on and float(style_scale_buf.mean()) > 1e-6)
+        gate_vec = None
+        if amp_on:
+            # Per-step style gate from the configured schedule.
+            if style_schedule == "always":
+                gate_vec = torch.ones_like(style_scale_buf)
+            elif style_schedule == "anneal":
+                g = max(style_floor,
+                        1.0 - float(total_steps) / style_anneal_steps)
+                gate_vec = torch.full_like(style_scale_buf, float(g))
+            else:  # "curriculum": follow the env's two-stage style_scale
+                gate_vec = style_scale_buf
+            style_active = bool(float(gate_vec.mean()) > 1e-6)
+        else:
+            style_active = False
+
         if amp_on and not style_active:
             rew_buf[..., -1] = 0.0
             style_q.append(0.0)
@@ -737,7 +756,7 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             from training.algorithms.amp import discriminator_loss
             flat_tr = amp_tr_buf.reshape(n_steps * n_envs, 2 * amp_dim)
             style_r = disc.style_reward(flat_tr).reshape(n_steps, n_envs)
-            rew_buf[..., -1] = style_scale_buf.unsqueeze(-1) * style_r  # (T,1)*(T,N)
+            rew_buf[..., -1] = gate_vec.unsqueeze(-1) * style_r  # (T,1)*(T,N)
             style_q.append(float(rew_buf[..., -1].mean()))
             # Update the discriminator (policy=fake, reference=real) only while
             # style is active — no point training it on flailing stage-1 data.
@@ -927,7 +946,9 @@ def train_ppo_multicritic_vec(env, policy, config, logger=None,
             if amp_on:
                 metrics["amp/style_reward"] = (
                     float(np.mean(style_q)) if style_q else 0.0)
-                metrics["amp/style_scale"] = float(style_scale_buf.mean())
+                metrics["amp/style_scale_env"] = float(style_scale_buf.mean())
+                metrics["amp/style_gate"] = (
+                    float(gate_vec.mean()) if gate_vec is not None else 0.0)
                 metrics["amp/style_active"] = float(style_active)
                 for k, v in disc_metrics.items():
                     metrics[f"amp/{k}"] = v
