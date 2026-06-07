@@ -11,7 +11,7 @@ class StandupRewardWeights:
     upright: float = 3.0
     height: float = 2.0
     upright_progress: float = 10.0
-    supine_situp_progress: float = 1
+    supine_situp_progress: float = 0
     explosive_rise: float = 0.0
     feet_tuck: float = 0.0
     arm_pose_dev: float = 0.2
@@ -26,10 +26,10 @@ class StandupRewardWeights:
     post_success_standing: float = 10.0
     foot_grounded_up: float = 5.0
     standing_tall: float = 5.0
-    stand_pose: float = 12.0
-    post_success_still: float = 8.0
-    on_spot: float = 6.0
-    supine_anti_flip: float = 3.0
+    stand_pose: float = 3.0
+    post_success_still: float = 3.0
+    on_spot: float = 2.0
+    supine_anti_flip: float = 0.5
     trunk_contact_force: float = 1.5
     knee_support: float = 0.0
 
@@ -191,7 +191,7 @@ class StandupConfig:
     #   "anneal"     — style gate decays 1.0 → amp_style_floor over
     #                  amp_style_anneal_steps → strong early guidance that fades so
     #                  the task reward takes over
-    amp_style_schedule: str = "anneal"
+    amp_style_schedule: str = "curriculum"
     amp_style_anneal_steps: int = 50_000_000
     amp_style_floor: float = 0.0
     # Per-foot z (m) subtracted in amp_observation so a PLANTED foot reads ~0
