@@ -20,6 +20,59 @@ from dataclasses import dataclass, field as dc_field
 from typing import Optional
 
 
+# ── PLY mesh helpers ──────────────────────────────────────────────────────────
+
+def _write_ply(path: str, vertices, faces) -> None:
+    """Write an ASCII PLY triangle mesh."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_index\nend_header\n")
+        for v in vertices:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for tri in faces:
+            f.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
+
+
+def _ring_mesh(inner_r: float, outer_r: float, n: int = 64):
+    """Flat annular ring (top face only, CCW winding → +Z normals)."""
+    verts, tris = [], []
+    for j in range(n):
+        a = 2 * math.pi * j / n
+        verts.append((inner_r * math.cos(a), inner_r * math.sin(a), 0.0))
+    for j in range(n):
+        a = 2 * math.pi * j / n
+        verts.append((outer_r * math.cos(a), outer_r * math.sin(a), 0.0))
+    for j in range(n):
+        i0, i1 = j, (j + 1) % n
+        o0, o1 = n + j, n + (j + 1) % n
+        tris.append((i0, o0, i1))
+        tris.append((i1, o0, o1))
+    return verts, tris
+
+
+def _arc_mesh(inner_r: float, outer_r: float, a0: float, a1: float, n: int = 16):
+    """Flat arc-band (top face only, CCW winding → +Z normals). Requires a0 < a1."""
+    if a0 > a1:
+        a0, a1 = a1, a0
+    verts, tris = [], []
+    for j in range(n + 1):
+        a = a0 + (a1 - a0) * j / n
+        verts.append((inner_r * math.cos(a), inner_r * math.sin(a), 0.0))
+    for j in range(n + 1):
+        a = a0 + (a1 - a0) * j / n
+        verts.append((outer_r * math.cos(a), outer_r * math.sin(a), 0.0))
+    for j in range(n):
+        i0, i1 = j, j + 1
+        o0, o1 = (n + 1) + j, (n + 1) + j + 1
+        tris.append((i0, o0, i1))
+        tris.append((i1, o0, o1))
+    return verts, tris
+
+
 @dataclass
 class FieldDimensions:
     """Parsed field dimensions from the RoboCup HSL JSON specification."""
@@ -539,6 +592,7 @@ def build_soccer_field(scene, physics_only: bool = False):
     """
     import genesis as gs
     import math
+    import os
 
     green = gs.surfaces.Default(color=(0.18, 0.45, 0.18, 1.0), roughness=0.9)
     white = gs.surfaces.Default(color=(0.95, 0.95, 0.95, 1.0), roughness=0.6)
@@ -599,22 +653,13 @@ def build_soccer_field(scene, physics_only: bool = False):
                     surface=white,
                 )
 
-        # Center circle (segments)
-        n_seg = 36
-        for i in range(n_seg):
-            a0 = 2 * math.pi * i / n_seg
-            a1 = 2 * math.pi * (i + 1) / n_seg
-            cx = ({ccr} * math.cos(a0) + {ccr} * math.cos(a1)) / 2
-            cy = ({ccr} * math.sin(a0) + {ccr} * math.sin(a1)) / 2
-            seg_len = 2 * {ccr} * math.sin(math.pi / n_seg)
-            angle = (a0 + a1) / 2
-            scene.add_entity(
-                gs.morphs.Box(size=(seg_len, {lw}, line_h),
-                              pos=(cx, cy, line_z),
-                              euler=(0, 0, angle),
-                              fixed=True, collision=False),
-                surface=white,
-            )
+        # Center circle (smooth ring mesh)
+        _d = os.path.dirname(os.path.abspath(__file__))
+        scene.add_entity(
+            gs.morphs.Mesh(file=os.path.join(_d, "meshes", "center_circle.ply"),
+                           pos=(0, 0, line_z), fixed=True, collision=False),
+            surface=white,
+        )
 
         # Penalty marks + center mark (thin discs)
         pmr = {self.f.penalty_mark_diameter / 2}
@@ -631,30 +676,14 @@ def build_soccer_field(scene, physics_only: bool = False):
                 surface=white,
             )
 
-        # Corner arcs (quarter circles at the 4 corners)
-        car = {self.f.corner_arc_radius}
-        n_carc = 8
-        for sx in [1, -1]:
-            for sy in [1, -1]:
-                a_start = math.atan2(-sy, 0)
-                a_end = a_start - sx * sy * math.pi / 2
-                for k in range(n_carc):
-                    t0 = a_start + (a_end - a_start) * k / n_carc
-                    t1 = a_start + (a_end - a_start) * (k + 1) / n_carc
-                    x0 = sx * {hl} + car * math.cos(t0)
-                    y0 = sy * {hw} + car * math.sin(t0)
-                    x1 = sx * {hl} + car * math.cos(t1)
-                    y1 = sy * {hw} + car * math.sin(t1)
-                    cxa, cya = (x0 + x1) / 2, (y0 + y1) / 2
-                    slen = math.hypot(x1 - x0, y1 - y0)
-                    ang = math.atan2(y1 - y0, x1 - x0)
-                    scene.add_entity(
-                        gs.morphs.Box(size=(slen, {lw}, line_h),
-                                      pos=(cxa, cya, line_z),
-                                      euler=(0, 0, ang),
-                                      fixed=True, collision=False),
-                        surface=white,
-                    )
+        # Corner arcs (smooth quarter-circle arc meshes)
+        for sx, sy, tag in [(1, 1, "pp"), (1, -1, "pn"), (-1, 1, "np"), (-1, -1, "nn")]:
+            scene.add_entity(
+                gs.morphs.Mesh(file=os.path.join(_d, "meshes", f"corner_arc_{{tag}}.ply"),
+                               pos=(sx * {hl}, sy * {hw}, line_z),
+                               fixed=True, collision=False),
+                surface=white,
+            )
 
     # ── Goals (collidable so the ball bounces off) ────────────────
     for sign in [1, -1]:
@@ -703,6 +732,26 @@ def generate_field_assets(json_path: str, output_dir: str):
     mujoco_gen = MuJoCoFieldGenerator(field)
     mujoco_path = os.path.join(output_dir, "field_robocup.xml")
     mujoco_gen.generate(mujoco_path, num_robots_per_team=0)
+
+    # PLY mesh files for smooth circle / arc markings
+    meshes_dir = os.path.join(output_dir, "meshes")
+    os.makedirs(meshes_dir, exist_ok=True)
+    lw2 = field.line_width / 2
+    verts, tris = _ring_mesh(field.center_circle_radius - lw2,
+                             field.center_circle_radius + lw2)
+    _write_ply(os.path.join(meshes_dir, "center_circle.ply"), verts, tris)
+    # Corner arc angles (CCW, a0 < a1): derived from original CW sweeps per corner
+    _corner_arc_angles = {
+        "pp": (-math.pi,      -math.pi / 2),   # corner (+hl, +hw)
+        "pn": ( math.pi / 2,  math.pi),         # corner (+hl, -hw)
+        "np": (-math.pi / 2,  0.0),             # corner (-hl, +hw)
+        "nn": ( 0.0,          math.pi / 2),     # corner (-hl, -hw)
+    }
+    for tag, (a0, a1) in _corner_arc_angles.items():
+        verts, tris = _arc_mesh(field.corner_arc_radius - lw2,
+                                field.corner_arc_radius + lw2, a0, a1)
+        _write_ply(os.path.join(meshes_dir, f"corner_arc_{tag}.ply"), verts, tris)
+    print(f"Field meshes written to {meshes_dir}")
 
     # Genesis builder code
     genesis_gen = GenesisFieldBuilder(field)
