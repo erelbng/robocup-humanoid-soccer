@@ -64,7 +64,7 @@ import mujoco  # noqa: E402
 
 from configs.config import K1RobotConfig  # noqa: E402
 from envs.standup import prone, side_left, side_right, supine  # noqa: E402
-from skills.common_obs import body_frame_velocity, projected_gravity  # noqa: E402
+from skills.common_obs import projected_gravity  # noqa: E402
 from training.algorithms.amp import AMP_OBS_DIM, build_amp_obs  # noqa: E402
 
 # ─── paths / constants ───────────────────────────────────────────────────────
@@ -137,13 +137,21 @@ def slerp(q0, q1, t):
 
 
 def quat_ang_vel(qc, qn, dt):
-    """Body-ish angular velocity from consecutive (w,x,y,z) quats (finite diff)."""
+    """BODY-frame angular velocity from consecutive (w,x,y,z) quats (finite diff).
+
+    Computes the vector part of conj(qc) ⊗ qn — the incremental rotation expressed
+    in qc's OWN (body) frame — to match Genesis `robot.get_ang()`, which already
+    returns body-frame ω and is what the policy feeds into build_amp_obs (see
+    skills/standup/env.amp_observation + common_obs note). The old version returned
+    the WORLD-frame delta qn ⊗ conj(qc) and the caller then applied a yaw-only
+    body_frame_velocity on top — so the reference matched neither the policy's
+    frame nor any consistent one. Now reference and policy agree exactly."""
     w0, x0, y0, z0 = qc.T
     w1, x1, y1, z1 = qn.T
     dw = w1 * w0 + x1 * x0 + y1 * y0 + z1 * z0
-    dx = x1 * w0 - w1 * x0 - y1 * z0 + z1 * y0
-    dy = y1 * w0 + w1 * y0 + x1 * z0 - z1 * x0
-    dz = z1 * w0 - w1 * z0 - x1 * y0 + y1 * x0
+    dx = w0 * x1 - x0 * w1 - y0 * z1 + z0 * y1
+    dy = w0 * y1 - y0 * w1 - z0 * x1 + x0 * z1
+    dz = w0 * z1 - z0 * w1 - x0 * y1 + y0 * x1
     s = np.sign(dw)
     s[s == 0] = 1.0
     return 2.0 * np.stack([dx, dy, dz], axis=1) * s[:, None] / dt
@@ -394,7 +402,9 @@ def trajectory_to_amp(sim: K1Sim, traj: np.ndarray) -> np.ndarray:
     amp = np.zeros((M, AMP_OBS_DIM), dtype=np.float32)
     for i in range(M):
         q = root_quat[i:i + 1].astype(np.float32)
-        ang_b = body_frame_velocity(q, ang_vel[i:i + 1].astype(np.float32))
+        # quat_ang_vel already returns BODY-frame ω (matching the policy's
+        # Genesis get_ang()); feed it straight through — no extra rotation.
+        ang_b = ang_vel[i:i + 1].astype(np.float32)
         amp[i] = build_amp_obs(
             root_pos[i, 2],
             projected_gravity(q),
