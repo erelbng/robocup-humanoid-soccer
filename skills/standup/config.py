@@ -31,7 +31,7 @@ class StandupRewardWeights:
     on_spot: float = 2.0
     supine_anti_flip: float = 0.5
     trunk_contact_force: float = 1.5
-    knee_support: float = 0.0
+    knee_support: float = 1.5
 
 
 _DISCOVERY_ZEROED_WEIGHTS = (
@@ -83,7 +83,7 @@ class StandupConfig:
     reward_stage: str = "deploy"  # "discovery" | "deploy"
 
     reg_success_ramp: bool = True
-    style_stage_gate: bool = False
+    style_stage_gate: bool = True
     style_success_ref: float = 0.5
 
     use_multi_critic: bool = True  # standup-host-recipe: ON. HoST's multi-

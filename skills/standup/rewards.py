@@ -317,7 +317,14 @@ def compute_standup_reward(
         if style_scale is not None
         else float(np.clip(success_ema / max(stand_pose_success_ref, 1e-6), 0.0, 1.0))
     )
-    stand_pose = (pose * pose_scale).astype(np.float32)
+    # stand_pose is gated by near_upright_gate INSIDE stand_pose_signal (it only
+    # fires when up ∈ [0.7, 0.95]), so it is inherently discovery-safe and does
+    # NOT need the style_scale stage gate. Decoupling it from style_scale lets
+    # the defined end-pose be shaped during every rise from the start of
+    # training, instead of only after the pose curriculum reaches its final
+    # level — which is why the policy used to land in a "funny" unshaped pose.
+    # (pose_scale is still used for on_spot / trunk_force below.)
+    stand_pose = pose.astype(np.float32)
 
     # Post-success STILLNESS
     still_score = np.exp(
