@@ -1,10 +1,10 @@
 """
 Project-wide configuration for RoboCup Humanoid Soccer RL Training.
 """
-
-import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+import os
+
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 # PROJECT_ROOT must point at the repo root, not this file's directory.
@@ -33,57 +33,30 @@ K1_MJCF = os.path.join(ROBOT_DIR, "K1", "K1_22dof.xml")
 
 # ─── Robot Config ────────────────────────────────────────────────────────────
 
-
 @dataclass
 class K1RobotConfig:
     """Booster K1 robot configuration."""
-
     name: str = "booster_k1"
     num_dofs: int = 22
     height: float = 0.95  # meters
-    mass: float = 20.0  # kg
+    mass: float = 20.0    # kg
 
     # Joint names in order (from booster_assets)
     joint_names: Tuple[str, ...] = (
-        "AAHead_yaw",
-        "Head_pitch",
-        "ALeft_Shoulder_Pitch",
-        "Left_Shoulder_Roll",
-        "Left_Elbow_Pitch",
-        "Left_Elbow_Yaw",
-        "ARight_Shoulder_Pitch",
-        "Right_Shoulder_Roll",
-        "Right_Elbow_Pitch",
-        "Right_Elbow_Yaw",
-        "Left_Hip_Pitch",
-        "Left_Hip_Roll",
-        "Left_Hip_Yaw",
-        "Left_Knee_Pitch",
-        "Left_Ankle_Pitch",
-        "Left_Ankle_Roll",
-        "Right_Hip_Pitch",
-        "Right_Hip_Roll",
-        "Right_Hip_Yaw",
-        "Right_Knee_Pitch",
-        "Right_Ankle_Pitch",
-        "Right_Ankle_Roll",
+        "AAHead_yaw", "Head_pitch",
+        "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll",
+        "Left_Elbow_Pitch", "Left_Elbow_Yaw",
+        "ARight_Shoulder_Pitch", "Right_Shoulder_Roll",
+        "Right_Elbow_Pitch", "Right_Elbow_Yaw",
+        "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
+        "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
+        "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
+        "Right_Knee_Pitch", "Right_Ankle_Pitch", "Right_Ankle_Roll",
     )
 
     # Leg joint indices (for locomotion-focused training)
-    leg_joint_indices: Tuple[int, ...] = (
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-        19,
-        20,
-        21,
-    )
+    leg_joint_indices: Tuple[int, ...] = (10, 11, 12, 13, 14, 15,
+                                           16, 17, 18, 19, 20, 21)
     arm_joint_indices: Tuple[int, ...] = (2, 3, 4, 5, 6, 7, 8, 9)
     head_joint_indices: Tuple[int, ...] = (0, 1)
 
@@ -101,35 +74,20 @@ class K1RobotConfig:
     # target, and the standup `arm_pose_dev` penalty all read from this
     # field.
     default_joint_pos: Tuple[float, ...] = (
-        0.0,
-        0.0,  # head: yaw, pitch
-        0.0,
-        -1.4,
-        0.0,
-        0.0,  # left arm:  shoulder pitch, roll(-π/2), elbow pitch, elbow yaw
-        0.0,
-        1.4,
-        0.0,
-        0.0,  # right arm: shoulder pitch, roll(+π/2), elbow pitch, elbow yaw
-        -0.2,
-        0.0,
-        0.0,  # left hip: pitch, roll, yaw
-        0.4,
-        -0.15,
-        0.0,  # left knee, ankle pitch, ankle roll
-        -0.2,
-        0.0,
-        0.0,  # right hip
-        0.4,
-        -0.15,
-        0.0,  # right knee, ankle pitch, ankle roll
+        0.0, 0.0,                  # head: yaw, pitch
+        0.0, -1.5708, 0.0, 0.0,    # left arm:  shoulder pitch, roll(-π/2), elbow pitch, elbow yaw
+        0.0,  1.5708, 0.0, 0.0,    # right arm: shoulder pitch, roll(+π/2), elbow pitch, elbow yaw
+        -0.2, 0.0, 0.0,            # left hip: pitch, roll, yaw
+        0.4, -0.25, 0.0,           # left knee, ankle pitch, ankle roll
+        -0.2, 0.0, 0.0,            # right hip
+        0.4, -0.25, 0.0,           # right knee, ankle pitch, ankle roll
     )
 
     # PD gains. T1 uses much higher gains on hip+knee (200/5) and lower
     # on ankles (50/1) since ankle joints can't physically push as hard.
     # We expose per-joint-group gains here; per-joint plumbing happens
     # in the skill env's _init_genesis() when it calls set_dofs_kp.
-    kp: float = 30.0  # legacy uniform fallback
+    kp: float = 30.0      # legacy uniform fallback
     kd: float = 1.0
     # Per-joint-group PD gains. LEG gains set to NaoHTWK's own K1 RL config
     # (github.com/NaoHTWK/htwk-gym envs/K1/Parameter_Walk.yaml) — the
@@ -141,16 +99,16 @@ class K1RobotConfig:
     # ankles have less mechanical authority. Arm/head kept as before (htwk-gym's
     # walk policy doesn't actuate them; Booster's B1 SDK example uses shoulder
     # ~40 / elbow ~20 / head ~5, so our 20/10 is in range).
-    kp_hip: float = 100.0
-    kp_knee: float = 100.0
+    kp_hip:   float = 100.0
+    kp_knee:  float = 100.0
     kp_ankle: float = 50.0
-    kp_arm: float = 20.0
-    kp_head: float = 10.0
-    kd_hip: float = 2.0
-    kd_knee: float = 2.0
+    kp_arm:   float = 20.0
+    kp_head:  float = 10.0
+    kd_hip:   float = 2.0
+    kd_knee:  float = 2.0
     kd_ankle: float = 1.0
-    kd_arm: float = 0.5
-    kd_head: float = 0.5
+    kd_arm:   float = 0.5
+    kd_head:  float = 0.5
 
     # Per-joint motor ARMATURE (reflected rotor inertia), kg·m² — from the K1
     # MJCF. CRITICAL for sim2sim/sim2real: the URDF has no <dynamics>, so
@@ -160,23 +118,21 @@ class K1RobotConfig:
     # cannot transfer (the MuJoCo joints feel far heavier). The skill env now
     # applies these via `set_dofs_armature` at scene build so Genesis joint
     # dynamics match MuJoCo.
-    armature_head: float = 0.002
-    armature_arm: float = 0.001
+    armature_head:      float = 0.002
+    armature_arm:       float = 0.001
     armature_hip_pitch: float = 0.0478125
-    armature_hip_roll: float = 0.0339552
-    armature_hip_yaw: float = 0.0282528
-    armature_knee: float = 0.095625
-    armature_ankle: float = 0.0565
-    armature_default: float = 0.01
+    armature_hip_roll:  float = 0.0339552
+    armature_hip_yaw:   float = 0.0282528
+    armature_knee:      float = 0.095625
+    armature_ankle:     float = 0.0565
+    armature_default:   float = 0.01
 
 
 # ─── Training Config ─────────────────────────────────────────────────────────
 
-
 @dataclass
 class RewardWeights:
     """Configurable reward weights for the multi-objective reward function."""
-
     # Phase 1: Single robot skills
     forward_velocity: float = 2.0
     tracking_ball: float = 1.5
@@ -203,17 +159,16 @@ class RewardWeights:
 
     def scale_aggressiveness(self, level: float):
         """Scale reward weights based on aggressiveness 0.0 - 1.0."""
-        self.forward_velocity *= 1.0 + 0.5 * level
-        self.kick_reward *= 1.0 + level
-        self.ball_to_goal *= 1.0 + 0.5 * level
-        self.defensive_coverage *= 1.0 - 0.5 * level
+        self.forward_velocity *= (1.0 + 0.5 * level)
+        self.kick_reward *= (1.0 + level)
+        self.ball_to_goal *= (1.0 + 0.5 * level)
+        self.defensive_coverage *= (1.0 - 0.5 * level)
         self.aggressiveness = level
 
 
 @dataclass
 class Phase1Config:
     """Single-robot dribble and shoot training config."""
-
     env_name: str = "K1SoccerDribbleShoot"
     num_envs: int = 4096
     max_episode_steps: int = 1000
@@ -246,12 +201,12 @@ class Phase1Config:
     # before any forward-motion stage exposes it to falls.
     use_curriculum: bool = True
     curriculum_stages: Tuple[str, ...] = (
-        "stand",  # learn to stand and balance
-        "standup",  # recover to upright from a fallen pose
-        "walk",  # walk toward ball at commanded velocity
-        "dribble",  # dribble ball forward (style-conditioned)
-        "shoot",  # shoot at goal
-        "full",  # combined skills
+        "stand",      # learn to stand and balance
+        "standup",    # recover to upright from a fallen pose
+        "walk",       # walk toward ball at commanded velocity
+        "dribble",    # dribble ball forward (style-conditioned)
+        "shoot",      # shoot at goal
+        "full",       # combined skills
     )
 
     # Style command (extra obs dims appended after the 78-dim base obs).
@@ -285,7 +240,6 @@ class Phase1Config:
 @dataclass
 class Phase2Config:
     """Multi-robot match training config (fine-tuning)."""
-
     env_name: str = "K1SoccerMatch"
     num_envs: int = 256  # fewer envs due to multi-agent complexity
     players_per_team: int = 4
@@ -317,15 +271,14 @@ class Phase2Config:
     use_game_controller: bool = True
     half_duration: float = 300.0  # 5 minutes per half (sim time)
 
-    reward: RewardWeights = field(
-        default_factory=lambda: RewardWeights(aggressiveness=0.3)
-    )
+    reward: RewardWeights = field(default_factory=lambda: RewardWeights(
+        aggressiveness=0.3
+    ))
 
 
 @dataclass
 class EvalConfig:
     """Evaluation configuration (MuJoCo)."""
-
     num_eval_episodes: int = 100
     record_video: bool = True
     video_fps: int = 30
@@ -335,7 +288,6 @@ class EvalConfig:
 @dataclass
 class WandbConfig:
     """Weights & Biases logging configuration."""
-
     project: str = "robocup-humanoid-soccer"
     entity: Optional[str] = None
     log_frequency: int = 10
@@ -349,7 +301,6 @@ class WandbConfig:
 @dataclass
 class ProjectConfig:
     """Top-level project configuration."""
-
     robot: K1RobotConfig = field(default_factory=K1RobotConfig)
     phase1: Phase1Config = field(default_factory=Phase1Config)
     phase2: Phase2Config = field(default_factory=Phase2Config)

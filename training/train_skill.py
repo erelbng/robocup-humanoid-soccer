@@ -107,38 +107,6 @@ def _ensure_field_builder():
         print(f"[train_skill] field regeneration failed: {e}")
 
 
-# ─── AMP reference dataset (auto-generate if missing) ──────────────────
-
-
-def _resolve_amp_dataset(env, cfg, device):
-    """Load the AMP reference dataset, AUTO-GENERATING it if missing.
-
-    For the standup skill a missing reference is built on the fly by the
-    physics-grounded generator (``scripts/create_standup_amp.generate_and_save``,
-    headless / GL-free) so ``use_amp=True`` works out of the box. Other skills
-    fall back to the synthetic parametric-walk dataset.
-    """
-    from training.algorithms.amp import load_motion_dataset
-    motion_file = getattr(cfg, "amp_motion_file", None)
-    if motion_file and os.path.exists(motion_file):
-        return load_motion_dataset(motion_file, device)
-
-    skill = getattr(env, "SKILL_NAME", "")
-    if skill == "standup":
-        target = motion_file or "data/motions/k1_standup_amp.npz"
-        print(f"[train_skill] AMP motion file '{motion_file}' missing — "
-              f"auto-generating standup reference → {target}")
-        from scripts.create_standup_amp import generate_and_save
-        generate_and_save(output_path=target)
-        return load_motion_dataset(target, device)
-
-    print(f"[train_skill] WARNING: amp_motion_file '{motion_file}' missing and "
-          f"no auto-generator for skill '{skill}'. Falling back to the "
-          f"parametric walk dataset.")
-    from training.algorithms.amp import parametric_walk_dataset
-    return parametric_walk_dataset(env._default_action, device)
-
-
 # ─── algorithm dispatch ────────────────────────────────────────────────
 
 
@@ -151,75 +119,13 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
     algo_kwargs = dict(algo_kwargs or {})
 
     if algorithm == "ppo":
-        use_amp = bool(getattr(cfg, "use_amp", False))
-        # Multi-critic (HoST) is used when the env decomposes its reward into
-        # ≥2 groups AND the config opts in. Other skills expose no groups, so
-        # they fall through to single-critic PPO.
+        # Multi-critic path (HoST): only when the env decomposes its reward
+        # into ≥2 groups AND the config opts in. The other skills expose no
+        # groups, so they transparently fall through to single-critic PPO.
         group_names = tuple(getattr(env, "CRITIC_GROUP_NAMES", ()))
         use_multi = bool(getattr(cfg, "use_multi_critic", False)) \
             and len(group_names) >= 2
 
-        # Resolve the AMP reference dataset once (shared by both AMP paths),
-        # auto-generating a missing standup motion (see _resolve_amp_dataset).
-        motion_dataset = _resolve_amp_dataset(env, cfg, device) if use_amp else None
-
-        amp_kwargs = dict(
-            style_weight=getattr(cfg, "amp_reward_coef", 0.5),
-            disc_lr=getattr(cfg, "amp_disc_lr", 6e-5),
-            disc_updates=getattr(cfg, "amp_disc_updates", 1),
-            disc_batch=getattr(cfg, "amp_disc_batch", 4096),
-            grad_penalty=getattr(cfg, "amp_grad_penalty", 5.0),
-            style_schedule=getattr(cfg, "amp_style_schedule", "curriculum"),
-            style_anneal_steps=getattr(cfg, "amp_style_anneal_steps", 50_000_000),
-            style_floor=getattr(cfg, "amp_style_floor", 0.0),
-        )
-
-        # ── AMP + multi-critic (style as an EXTRA critic group) ──
-        # Recommended for standup: keeps the HoST multi-critic recipe AND adds
-        # the adversarial style reward as its own critic head (n_critics = G+1).
-        if use_amp and use_multi:
-            policy = create_policy(env.obs_dim, env.act_dim,
-                                   n_critics=len(group_names) + 1)
-            if init_from:
-                load_checkpoint(init_from, policy)
-            elif resume:
-                load_checkpoint(resume, policy)
-            from training.algorithms.ppo import train_ppo_multicritic_vec
-            return train_ppo_multicritic_vec(
-                env, policy, cfg, logger,
-                phase=f"skill_{env.SKILL_NAME}",
-                curriculum_stage=None,
-                checkpoint_dir=checkpoint_dir,
-                group_weights=getattr(cfg, "critic_group_weights", None),
-                amp_dataset=motion_dataset,
-                amp_kwargs=amp_kwargs,
-                device=device,
-                **algo_kwargs,
-            )
-
-        # ── AMP only (single critic) ──
-        if use_amp:
-            from training.algorithms.amp import train_ppo_amp_vec
-            policy = create_policy(env.obs_dim, env.act_dim)
-            if init_from:
-                load_checkpoint(init_from, policy)
-            elif resume:
-                load_checkpoint(resume, policy)
-            return train_ppo_amp_vec(
-                env, policy, cfg, motion_dataset, logger,
-                phase=f"skill_{env.SKILL_NAME}",
-                checkpoint_dir=checkpoint_dir,
-                task_reward_coef=getattr(cfg, "amp_task_reward_coef", 0.5),
-                style_reward_coef=getattr(cfg, "amp_reward_coef", 0.5),
-                disc_lr=amp_kwargs["disc_lr"],
-                disc_updates_per_iter=amp_kwargs["disc_updates"],
-                disc_batch=amp_kwargs["disc_batch"],
-                grad_penalty_coef=amp_kwargs["grad_penalty"],
-                device=device,
-                **algo_kwargs,
-            )
-
-        # ── Multi-critic only ──
         if use_multi:
             policy = create_policy(env.obs_dim, env.act_dim,
                                    n_critics=len(group_names))

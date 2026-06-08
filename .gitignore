@@ -64,11 +64,9 @@ events.out.tfevents.*
 *.ckpt
 *.safetensors
 *.npz
-!data/motions/k1_standup_amp.npz
 *.npy
 *.replay
 *.buffer
-videos/
 
 # ─── Genesis simulator cache ───────────────────────────────────────
 # Genesis caches compiled kernels and decimated meshes per-machine.
