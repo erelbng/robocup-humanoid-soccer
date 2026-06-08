@@ -390,10 +390,15 @@ class SkillEnv(ABC):
             ),
         )
 
-        # Field (physics-only to keep replicated-body count down).
+        # Field. Visual markings (lines, circle, arcs, nets) are ON by default
+        # so training/replay videos look like a real pitch; set the env var
+        # RC_FIELD_PHYSICS_ONLY=1 to skip them and minimise the replicated-body
+        # count for max-throughput training. The carpet+goals are added either
+        # way (the carpet is the collidable ground the robot stands on).
+        physics_only = os.environ.get("RC_FIELD_PHYSICS_ONLY", "0") == "1"
         try:
             from models.field.field_genesis_builder import build_soccer_field
-            build_soccer_field(self.scene, physics_only=True)
+            build_soccer_field(self.scene, physics_only=physics_only)
         except Exception as e:
             print(f"[{self.SKILL_NAME}] field builder failed ({e}); "
                   "falling back to plain green plane")
