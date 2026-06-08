@@ -8,46 +8,54 @@ from dataclasses import dataclass, field
 
 @dataclass
 class StandupRewardWeights:
-    upright: float = 3.0
-    height: float = 2.0
-    upright_progress: float = 10.0
-    supine_situp_progress: float = 0
-    explosive_rise: float = 0.0
-    feet_tuck: float = 0.0
-    arm_pose_dev: float = 0.2
-    base_ang_vel_sway: float = 0.05
-    base_lin_vel_drift: float = 0.5
-    joint_vel_quiet: float = 0.0003
-    action_smoothness: float = 0.05
-    action_jerk: float = 0.05
-    time_penalty: float = 3.0
-    success_bonus: float = 400.0
-    success_persistence: float = 5.0
-    post_success_standing: float = 10.0
-    foot_grounded_up: float = 5.0
-    standing_tall: float = 5.0
-    stand_pose: float = 3.0
-    post_success_still: float = 3.0
-    on_spot: float = 2.0
-    supine_anti_flip: float = 0.5
-    trunk_contact_force: float = 1.5
-    knee_support: float = 1.5
+    """HoST-faithful reward weights (arXiv:2502.08378). Field names map 1:1 to
+    the four groups consumed by `compute_standup_reward`. Single-critic sums all
+    four; the optional multi-critic path additionally weights the GROUPS via
+    `StandupConfig.critic_group_weights` (HoST: [2.5, 0.1, 1, 1])."""
+
+    # task (bounded, saturating) — keep both at ~1; the GROUP weight scales task.
+    task_orientation: float = 1.0
+    task_rise: float = 1.0
+
+    # regularization (a whisper — these are summed as a small penalty)
+    regu_action_rate: float = 0.01
+    regu_action_jerk: float = 0.01
+    regu_dof_vel: float = 0.001
+
+    # style (height-gated motion shape)
+    style_feet_under_base: float = 1.0
+    style_ground_parallel: float = 1.0
+    style_feet_distance: float = 2.0
+    style_ang_vel: float = 0.5
+
+    # post-task (height-gated "hold a clean stand") + sparse success
+    post_orientation: float = 1.0
+    post_base_height: float = 1.0
+    post_stillness: float = 1.0
+    post_upper_pose: float = 1.0
+    success_persistence: float = 1.0
+    time_penalty: float = 1.0
+    success_bonus: float = 50.0
+    post_success_standing: float = 2.0
 
 
+# Discovery stage zeroes the regularizers + style so the policy can first FIND a
+# get-up (HumanUP two-stage). With the bounded task reward this is optional;
+# reward_stage defaults to "deploy" (full set) — discovery is kept for ablations.
 _DISCOVERY_ZEROED_WEIGHTS = (
-    "arm_pose_dev",
-    "base_ang_vel_sway",
-    "base_lin_vel_drift",
-    "joint_vel_quiet",
-    "action_smoothness",
-    "action_jerk",
+    "regu_action_rate",
+    "regu_action_jerk",
+    "regu_dof_vel",
+    "style_feet_under_base",
+    "style_ground_parallel",
+    "style_feet_distance",
+    "style_ang_vel",
 )
 
 
 def discovery_weights(base: StandupRewardWeights) -> StandupRewardWeights:
-    """Return a copy of `base` with all motion-regularizer weights zeroed
-    — the Stage-1 (discovery) reward set: upright + height + progress +
-    feet-grounded + standing-tall + speed/success terms ONLY."""
+    """Return a copy of `base` with regularizer + style weights zeroed — the
+    Stage-1 (discovery) reward set: task + post/success terms ONLY."""
     return dataclasses.replace(
         base, **{name: 0.0 for name in _DISCOVERY_ZEROED_WEIGHTS}
     )
@@ -60,6 +68,32 @@ class StandupConfig:
     dt: float = 0.02
     sim_dt: float = 0.002
     gait_freq_hz: float = 1.5  # unused but keeps obs layout uniform
+
+    # ── HoST action representation (arXiv:2502.08378) ────────────────────
+    # target = current_dof_pos + beta * action (incremental / relative-to-current)
+    # with beta annealed beta_start -> beta_min on success. This is the implicit
+    # motion-speed bound that makes the deployed motion smooth.
+    incremental_action: bool = True
+    action_clip: float = 1.0        # raw policy output clipped to +/- this before beta
+    beta_start: float = 1.0
+    beta_min: float = 0.25
+    beta_step: float = 0.02         # decrement per success-threshold crossing
+    beta_success_threshold: float = 0.5   # success EMA above which beta decays
+    expose_beta_in_obs: bool = True       # append beta scalar to the obs
+
+    # ── HoST reward kernel / stage params (K1-adapted; G1 uses 0.45/0.65) ──
+    rise_target: float = 0.45       # head/trunk rise above feet for "standing"
+    rise_margin: float = 0.45
+    orientation_threshold_kernel: float = 0.95
+    orientation_margin: float = 1.0
+    style_stage_rise: float = 0.30  # trunk-off-ground gate for style terms
+    post_stage_rise: float = 0.45   # near-standing gate for post terms
+    feet_distance_max: float = 0.45
+
+    # ── HoST pull-force gate ─────────────────────────────────────────────
+    # Fire the upward trunk force ONLY when the trunk is near-vertical
+    # (projected_gravity_z < this) and wean it together with beta.
+    pull_force_orient_gate: float = -0.8
 
     # Every reset pose is drawn from the four already-randomized named-pose
     # pools (supine/prone/side_left/side_right), each built by the
@@ -85,8 +119,11 @@ class StandupConfig:
     style_stage_gate: bool = True
     style_success_ref: float = 0.5
 
-    use_multi_critic: bool = True  # standup-host-recipe: ON. HoST's multi-
-    critic_group_weights: tuple = (1.0, 1.0, 1.0)
+    # Tier 1 = plain single-critic (recommended start). Flip to True for the
+    # optional Tier-2 multi-critic (already implemented & verified correct).
+    use_multi_critic: bool = False
+    critic_group_names: tuple = ("task", "regu", "style", "post")
+    critic_group_weights: tuple = (2.5, 0.1, 1.0, 1.0)  # HoST group weights
 
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
@@ -188,7 +225,7 @@ class StandupConfig:
 
     reset_success_ema_on_level_up: bool = True
 
-    use_amp: bool = True
+    use_amp: bool = False  # HoST uses NO AMP; get-up style comes from reward terms
     amp_motion_file: str = "data/motions/k1_standup_amp.npz"
     amp_reward_coef: float = 0.5
     amp_task_reward_coef: float = 0.5
@@ -219,11 +256,16 @@ class StandupConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    entropy_coef: float = 0.002  # Restored 0.005→0.002 (mergefixes): at 0.005
+    entropy_coef: float = 0.01  # HoST uses 0.01 (more exploration for get-up)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
     n_steps: int = 64
+
+    # HoST init_noise_std = 0.8 -> init_log_std = ln(0.8) ~= -0.22 (we default
+    # -0.5). Plumbed into create_policy via the OPTIONAL train_skill change in
+    # Appendix C; harmless if that change is not applied.
+    init_log_std: float = -0.22
 
     obs_dim: int = 0
     act_dim: int = 22

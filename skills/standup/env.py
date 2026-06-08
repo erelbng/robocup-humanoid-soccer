@@ -114,6 +114,8 @@ class K1StandupEnv(SkillEnv):
     # 8 when contact obs is enabled (fast sim training), 0 when stripped
     # for sim2real-deployable training.
     SKILL_OBS_ADDONS = 8
+    # HoST incremental action: target = current_dof_pos + beta*action.
+    INCREMENTAL_ACTION = True
     # Standup STARTS below this threshold — don't terminate on it.
     FALL_TERMINATE_Z = -1.0  # disable height termination
 
@@ -124,7 +126,14 @@ class K1StandupEnv(SkillEnv):
         # lfoot_contact, rfoot_contact, lhand_contact, rhand_contact].
         # 0 when `proprio_only` — policy sees only what the real robot
         # can measure.
-        self.SKILL_OBS_ADDONS = 0 if self.cfg.proprio_only else 8
+        # Contact addons (privileged, sim-only) + an optional deployable beta
+        # scalar. beta sits FIRST so the contact + DR tail stays contiguous for
+        # the sim2real student slice (see non_deployable_dim).
+        self._contact_addon_dim = 0 if self.cfg.proprio_only else 8
+        self._beta_obs_dim = 1 if getattr(self.cfg, "expose_beta_in_obs", False) else 0
+        self.SKILL_OBS_ADDONS = self._beta_obs_dim + self._contact_addon_dim
+        self.INCREMENTAL_ACTION = bool(getattr(self.cfg, "incremental_action", True))
+        self.ACTION_CLIP = float(getattr(self.cfg, "action_clip", 1.0))
         kwargs.setdefault("num_envs", self.cfg.num_envs)
         kwargs.setdefault("dt", self.cfg.dt)
         kwargs.setdefault("sim_dt", self.cfg.sim_dt)
@@ -154,6 +163,8 @@ class K1StandupEnv(SkillEnv):
         self._total_env_steps_seen: int = 0
         self._success_rate_ema: float = 0.0
         self._success_ema_alpha: float = 0.005  # ~200-step window
+        # HoST action-rescaler beta: 1.0 -> beta_min, decayed on success.
+        self._beta: float = float(getattr(self.cfg, "beta_start", 1.0))
         self._prev_upright = -np.ones(self.num_envs, dtype=np.float32)
         self.best_supine_metric = np.zeros(self.num_envs, dtype=np.float32)
 
@@ -265,8 +276,27 @@ class K1StandupEnv(SkillEnv):
         sense. They sit AFTER the base proprio and BEFORE the optional
         DR-privileged tail, but standup has no command/head_cmd so the
         two non-deployable blocks are contiguous at the tail of the obs
-        and a single trailing-slice removes both."""
-        return self.SKILL_OBS_ADDONS + self.privileged_dim
+        and a single trailing-slice removes both.
+
+        The optional beta scalar is DEPLOYABLE (the real robot knows its own
+        action rescaler) and is placed FIRST in the addons, so only the contact
+        addons + the DR tail are stripped here."""
+        return self._contact_addon_dim + self.privileged_dim
+
+    def _get_action_scale(self) -> float:
+        """HoST action-rescaler beta, coupled to competence: beta_start at zero
+        success, linearly to beta_min as the success EMA reaches
+        beta_success_threshold. Auto-recovers (beta rises) if competence drops —
+        matching HoST's per-env, success-gated decay. Returned as the per-step
+        action scale used by SkillEnv.step()'s incremental-action branch; also
+        cached in self._beta for the obs."""
+        c = self.cfg
+        frac = float(
+            np.clip(self._success_rate_ema / max(c.beta_success_threshold, 1e-6),
+                    0.0, 1.0)
+        )
+        self._beta = float(c.beta_start + (c.beta_min - c.beta_start) * frac)
+        return self._beta
 
     def _add_scene_extras(self, scene) -> None:
         return
@@ -964,12 +994,18 @@ class K1StandupEnv(SkillEnv):
         return out
 
     def _skill_obs_addons(self) -> np.ndarray:
-        # `proprio_only` → no contact obs; base class checks
-        # SKILL_OBS_ADDONS > 0 before calling this, so the empty-array
-        # return is a defensive fallback.
-        if self.SKILL_OBS_ADDONS == 0:
+        # Layout: [beta (1, optional, deployable)] ++ [contact (8, sim-only)].
+        # base class checks SKILL_OBS_ADDONS > 0 before calling this.
+        parts = []
+        if self._beta_obs_dim:
+            parts.append(
+                np.full((self.num_envs, 1), float(self._beta), dtype=np.float32)
+            )
+        if self._contact_addon_dim:
+            parts.append(self._read_contact_state())
+        if not parts:
             return np.zeros((self.num_envs, 0), dtype=np.float32)
-        return self._read_contact_state()
+        return np.concatenate(parts, axis=1)
 
     def _read_foot_pos(self) -> np.ndarray:
         """Return (N, 2, 3) world-frame position of left and right foot.
@@ -1162,38 +1198,26 @@ class K1StandupEnv(SkillEnv):
         return success_frac * time_frac
 
     def _assist_wrench(self):
+        """HoST vertical pull force: a constant upward force on the trunk that
+        fires ONLY when the trunk is already near-vertical
+        (projected_gravity_z < pull_force_orient_gate). It helps a kneeling /
+        crouching robot COMPLETE the rise and stay up — it does NOT hoist a
+        flat-lying robot. Magnitude weans on the same success curriculum as beta
+        (via `_current_assist_fraction`)."""
         zeros = np.zeros((self.num_envs, 3), dtype=np.float32)
         force = zeros.copy()
         torque = zeros.copy()
 
-        # ── upward assist force (decaying curriculum) ──────────────
         frac = self._current_assist_fraction()
         if frac > 0.0:
             try:
-                root_pos = _to_np(self.robot.get_pos())
-                z = root_pos[:, 2]
-                peak = self.cfg.assist_force_max
-                if self.cfg.assist_spring_shape:
-                    target = self.cfg.target_height
-                    deficit = np.clip((target - z) / max(target, 1e-6), 0.0, 1.0)
-                    fz = frac * peak * deficit
-                else:
-                    fz = np.full(self.num_envs, frac * peak, dtype=np.float32)
-                if self.cfg.assist_cobra_gate:
-                    foot_xy = self._read_foot_pos()[:, :, :2]  # (N, 2, 2)
-                    under_base_soft = feet_under_base_score(
-                        foot_xy,
-                        root_pos[:, :2],
-                        d_max=self.cfg.assist_under_base_soft_d,
-                    )
-                    z_low = self.cfg.assist_cobra_z_low
-                    z_high = self.cfg.assist_cobra_z_high
-                    trunk_lifted = np.clip(
-                        (z - z_low) / max(z_high - z_low, 1e-6), 0.0, 1.0
-                    )
-                    cobra_factor = 1.0 - trunk_lifted * (1.0 - under_base_soft)
-                    fz = fz * cobra_factor.astype(np.float32)
-                force[:, 2] = fz.astype(np.float32)
+                quat = _to_np(self.robot.get_quat())
+                g = projected_gravity(quat)
+                near_vertical = (g[:, 2] < self.cfg.pull_force_orient_gate)
+                fz = np.where(
+                    near_vertical, frac * self.cfg.assist_force_max, 0.0
+                ).astype(np.float32)
+                force[:, 2] = fz
                 self._last_assist_force_mean = float(np.mean(fz))
             except Exception:
                 self._last_assist_force_mean = 0.0
@@ -1290,17 +1314,6 @@ class K1StandupEnv(SkillEnv):
             under_base_max_d=self.cfg.success_under_base_max_d,
         )
 
-        g = projected_gravity(root_quat)
-
-        backness = np.clip(g[:, 0], 0.0, 1.0)
-        metric = 0.8 * (1.0 - backness) + 0.2 * np.clip(root_pos[:, 2] / 0.35, 0.0, 1.0)
-
-        prev_supine = self.best_supine_metric.copy()
-        self.best_supine_metric = np.maximum(
-            self.best_supine_metric,
-            metric,
-        )
-
         prev_streak = self._success_streak.copy()
         frame_now = success_frame_mask(
             root_quat,
@@ -1313,20 +1326,6 @@ class K1StandupEnv(SkillEnv):
         sustained_now = (new_streak == hold_steps) & (prev_streak < hold_steps)
         achieved_sustained = self._achieved_sustained | sustained_now
 
-        # Privileged contact-force reads for the anti-slam penalty + knee credit.
-        trunk_force, knee_force = self._read_contact_forces()
-
-        # ── Single-run TWO-STAGE gate ────────────────────────────────────────
-        # Stage 1 (discovery + L0-L3 curriculum): style_scale = 0, so all
-        # the motion-quality terms (reg group, on_spot, stand_pose, trunk-force)
-        # are OFF — the reward is the proven discovery set and the curriculum
-        # runs unhindered. Stage 2 ("stand still" / style): once the curriculum
-        # is COMPLETE (pose_level reached the final level), ramp style in by the
-        # (now L3) success EMA so it sculpts a smooth, motionless, shoulder-wide
-        # hold on an already-generalising policy. This replaces the old global-
-        # success gate that fired during L0 and stalled the curriculum there.
-        style_scale = self._style_scale()
-
         reward, _frame_success, components, group_rewards = compute_standup_reward(
             root_pos=root_pos,
             root_quat=root_quat,
@@ -1337,54 +1336,29 @@ class K1StandupEnv(SkillEnv):
             action=action,
             prev_action=self._last_action,
             prev_prev_action=self._prev_prev_action,
-            prev_upright=self._prev_upright,
-            prev_supine=prev_supine,
+            foot_z=foot_z,
+            foot_xy=foot_xy,
+            feet_ok=feet_ok,
             success_streak=new_streak,
             sustained_now=sustained_now,
             achieved_sustained=achieved_sustained,
             step_count=self.step_count,
-            foot_z=foot_z,
-            foot_xy=foot_xy,
-            feet_ok=feet_ok,
-            start_supine=self._start_supine,
-            weights=self._reward_weights,
             arm_joint_indices=self.robot_cfg.arm_joint_indices,
-            pose_joint_indices=(
-                tuple(self.robot_cfg.arm_joint_indices)
-                + tuple(self.robot_cfg.leg_joint_indices)
-            ),
             default_joint_pos=self._default_action,
             stand_target_pose=self._stand_target_pose,
-            stand_pose_dev_scale=self.cfg.stand_pose_dev_scale,
-            success_ema=self._success_rate_ema,
-            stand_pose_success_ref=self.cfg.stand_pose_success_ref,
-            start_xy=self._start_xy,
-            on_spot_tol=self.cfg.on_spot_tol,
-            post_success_still_jv_scale=self.cfg.post_success_still_jv_scale,
-            post_success_still_v_scale=self.cfg.post_success_still_v_scale,
-            feet_under_base_plateau_d=self.cfg.feet_under_base_plateau_d,
-            max_upright=self._max_upright,
-            progress_ratchet=self.cfg.progress_ratchet,
-            reg_success_ramp=self.cfg.reg_success_ramp,
-            style_scale=style_scale,
-            trunk_contact_force=trunk_force,
-            trunk_contact_force_thresh=self.cfg.trunk_contact_force_thresh,
-            trunk_contact_force_scale=self.cfg.trunk_contact_force_scale,
-            knee_contact_force=knee_force,
-            knee_contact_force_thresh=self.cfg.knee_contact_force_thresh,
-            knee_support_min_z=self.cfg.knee_support_min_z,
-            knee_support_max_z=self.cfg.knee_support_max_z,
+            weights=self._reward_weights,
+            rise_target=self.cfg.rise_target,
+            rise_margin=self.cfg.rise_margin,
+            orientation_threshold=self.cfg.orientation_threshold_kernel,
+            orientation_margin=self.cfg.orientation_margin,
+            style_stage_rise=self.cfg.style_stage_rise,
+            post_stage_rise=self.cfg.post_stage_rise,
             target_height=target_h,
             upright_threshold=upright_thresh,
+            feet_under_base_d=self.cfg.feet_under_base_soft_d,
+            feet_distance_max=self.cfg.feet_distance_max,
             hold_steps=hold_steps,
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
-            foot_grounded_max_z=self.cfg.foot_grounded_max_z,
-            trunk_up_min_z=self.cfg.trunk_up_min_z,
-            standing_tall_min_z=self.cfg.standing_tall_min_z,
-            standing_tall_max_z=self.cfg.standing_tall_max_z,
-            feet_under_base_soft_d=self.cfg.feet_under_base_soft_d,
-            explosive_rise_v_cap=self.cfg.explosive_rise_v_cap,
-            control_dt=self.dt,
         )
 
         components["hold_steps_current"] = float(hold_steps)
@@ -1392,10 +1366,8 @@ class K1StandupEnv(SkillEnv):
         components["target_height_current"] = float(target_h)
         components["assist_fraction"] = float(self._current_assist_fraction())
         components["assist_force_mean"] = float(self._last_assist_force_mean)
-        # Two-stage telemetry: stage 1 (curriculum/discovery) until style_scale
-        # lifts off 0 at curriculum completion, then stage 2 (style/stand-still).
-        components["style_scale"] = float(style_scale)
-        components["training_stage"] = 2.0 if style_scale > 0.0 else 1.0
+        # HoST action-rescaler beta (1.0 -> beta_min), coupled to competence.
+        components["beta"] = float(self._beta)
 
         # Update EMA of frame success rate — used to gate curriculum.
         current_success_rate = float(np.mean(frame_now))

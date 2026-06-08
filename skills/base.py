@@ -117,6 +117,15 @@ class SkillEnv(ABC):
     # Subclasses can tighten this for fine-grained skills.
     ACTION_DELTA_MAX: float = 0.5
 
+    # HoST incremental action (arXiv:2502.08378): when True, the PD target is
+    # `current_dof_pos + beta*action` (relative to the CURRENT joint position)
+    # instead of `default_pose + action`. `beta` is `_get_action_scale()`. The
+    # raw policy output is clipped to +/- ACTION_CLIP before the beta scale. This
+    # gives smooth integrated trajectories and, with a decaying beta, an implicit
+    # motion-speed bound. Default False keeps every other skill unchanged.
+    INCREMENTAL_ACTION: bool = False
+    ACTION_CLIP: float = 1.0
+
     # Episode-termination thresholds (override in subclasses if needed).
     FALL_TERMINATE_Z: float = 0.10   # trunk below this → done
     FALL_RECOVERY_Z: float = 0.30    # below this → "fallen" but maybe not done
@@ -633,13 +642,25 @@ class SkillEnv(ABC):
         # to all-zeros, which was the cause of the floor local optimum in
         # early standup training.
         scale = self._get_action_scale()
-        if scale != 1.0:
-            action = action * float(scale)
-        action = np.clip(action, -self.ACTION_DELTA_MAX, self.ACTION_DELTA_MAX)
-        targets = np.clip(
-            self._default_action[None, :] + action,
-            -math.pi, math.pi,
-        )
+        if self.INCREMENTAL_ACTION:
+            # HoST: target = current_dof_pos + beta * clipped_action. `action`
+            # is stored as the raw (clipped) policy output so the obs/last-action
+            # and the action-rate/jerk penalties operate on the policy signal.
+            action = np.clip(action, -self.ACTION_CLIP, self.ACTION_CLIP)
+            delta = action * float(scale)
+            try:
+                cur = _to_np(self.robot.get_dofs_position(self.dof_indices))
+            except Exception:
+                cur = np.tile(self._default_action, (self.num_envs, 1))
+            targets = np.clip(cur + delta, -math.pi, math.pi)
+        else:
+            if scale != 1.0:
+                action = action * float(scale)
+            action = np.clip(action, -self.ACTION_DELTA_MAX, self.ACTION_DELTA_MAX)
+            targets = np.clip(
+                self._default_action[None, :] + action,
+                -math.pi, math.pi,
+            )
 
         try:
             self.robot.control_dofs_position(targets, self.dof_indices)
