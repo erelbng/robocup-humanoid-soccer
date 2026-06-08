@@ -61,12 +61,11 @@ class StandupConfig:
     sim_dt: float = 0.002
     gait_freq_hz: float = 1.5  # unused but keeps obs layout uniform
 
-    spawn_height_min: float = 0.8  # m
-    spawn_height_max: float = 1.5  # m
-    settle_steps: int = 1500  # sim substeps = 3.0 s at 500 Hz. HUMANUP uses 10 s
-    settle_pool_rounds: int = 4  # pool_size = num_envs × rounds
-    pool_max_upright: float = 0.7  # upright signal upper bound
-    pool_max_height: float = 0.4  # trunk-z upper bound (m)
+    # Every reset pose is drawn from the four already-randomized named-pose
+    # pools (supine/prone/side_left/side_right), each built by the
+    # forced-settle + filter pipeline in _build_pose_pool. There is no
+    # separate "random" settle pool.
+    pool_max_upright: float = 0.7  # upright signal upper bound (fallen filter)
 
     joint_jitter_rad: float = 0.10
 
@@ -91,14 +90,30 @@ class StandupConfig:
 
     pose_curriculum_enabled: bool = True
     pose_curriculum_start_level: int = 0
-    pose_level_thresholds: tuple = (0.55, 0.55, 0.60)
+    # L0→L1 (prone solid before adding supine), L1→L2 (add side poses). The
+    # four named pools are each already heavily randomized, so L2 (terminal)
+    # draws equally from all four — no separate "random" fallen level.
+    pose_level_thresholds: tuple = (0.55, 0.55)
     supine_anti_flip_min_level: int = 1
     supine_anti_flip_max_level: int = 1
     pose_advance_sustain_steps: int = 1_000_000
     pose_pool_settle_steps: int = 1000  # physics substeps per round = 2.0 s at 500 Hz.
     pose_pool_side_settle_steps: int = 500  # 1.0 s at 500 Hz (was 250)
-    pose_pool_side_rounds: int = 6  # compensates for higher filter rejection rate
+    # After the pinned side settle, RELEASE the trunk pin and free-step this
+    # many substeps to verify the pose stays on its side (arm/leg-random side
+    # poses). A config that doesn't brace rolls out of class and is culled.
+    pose_pool_side_verify_steps: int = 300
+    # At-rest gate: reject side snapshots whose base angular velocity exceeds
+    # this (rad/s) after the unpinned verify — they're still mid-roll.
+    pose_pool_side_max_ang_vel: float = 0.5
+    pose_pool_side_rounds: int = 40  # compensates for higher filter rejection rate
     pose_pool_rounds: int = 2  # total snapshots = rounds × num_envs
+    # Prone/supine wide arm+leg random targets raise the rejection rate, so
+    # they build more rounds than pose_pool_rounds.
+    pose_pool_limb_random_rounds: int = 10
+    # Inset (rad) from each joint's hard URDF limit when sampling random arm/leg
+    # targets, so targets don't sit exactly at the mechanical stop.
+    pose_pool_arm_random_limit_margin: float = 0.10
     pose_pool_quat_noise_rad: float = 0.15
     pose_pool_joint_jitter_rad: float = 0.15
     pose_pool_max_height_margin: float = 0.30
@@ -107,7 +122,6 @@ class StandupConfig:
     pose_pool_side_stabilize_torque: float = 80.0
     pose_pool_orient_dot_min: float = 0.80
     pose_pool_penetration_eps: float = 0.02
-    pose_mix_random_frac: float = 0.50
     pose_mix_bias_start: float = 0.80
     pose_mix_bias_env_steps: int = 15_000_000
 
