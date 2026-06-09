@@ -614,54 +614,54 @@ def render_reward_breakdown(out_dir, H=1080, W=1920):
             [[data.xpos[b, :2] for b in idx["foot_bid"]]], dtype=np.float32
         )
         up = R.upright_signal(quat)
+        base_xy = data.qpos[:2][None].astype(np.float32)
+        # head/trunk rise above the mean foot height — the HoST task signal.
+        rise = (zc - foot_z.mean(axis=1)).astype(np.float32)
+        feet_ok = R.standing_on_feet_mask(
+            foot_z, foot_xy, base_xy,
+            foot_max_z=cfg.success_foot_max_z,
+            under_base_max_d=cfg.success_under_base_max_d,
+        )
+        # HoST 4-group reward, live signals (bounded tolerance() kernels):
         bars = [
             ("upright", float(up[0] * 0.5 + 0.5)),
-            ("height", float(R.height_signal(zc, cfg.target_height)[0])),
             (
-                "feet under base",
+                "orientation (task)",
+                float(
+                    R.tolerance(
+                        up, cfg.orientation_threshold_kernel, np.inf,
+                        margin=cfg.orientation_margin,
+                    )[0]
+                ),
+            ),
+            (
+                "rise (task)",
+                float(
+                    R.tolerance(
+                        rise, cfg.rise_target, np.inf, margin=cfg.rise_margin,
+                    )[0]
+                ),
+            ),
+            (
+                "feet under base (style)",
                 float(
                     R.feet_under_base_score(
                         foot_xy,
-                        data.qpos[:2][None].astype(np.float32),
+                        base_xy,
                         d_max=cfg.feet_under_base_soft_d,
                         plateau_d=cfg.feet_under_base_plateau_d,
                     )[0]
                 ),
             ),
+            ("on feet (gate)", float(feet_ok[0])),
             (
-                "foot grounded + up",
+                "success frame",
                 float(
-                    R.foot_grounded_up_signal(
-                        foot_z,
-                        zc,
-                        up,
-                        foot_max_z=cfg.foot_grounded_max_z,
-                        trunk_min_z=cfg.trunk_up_min_z,
-                    )[0]
-                ),
-            ),
-            (
-                "standing tall",
-                float(
-                    R.standing_tall_signal(
-                        foot_z,
-                        zc,
-                        up,
-                        foot_max_z=cfg.foot_grounded_max_z,
-                        trunk_min_z=cfg.standing_tall_min_z,
-                        trunk_max_z=cfg.standing_tall_max_z,
-                    )[0]
-                ),
-            ),
-            (
-                "stand pose (final)",
-                float(
-                    R.stand_pose_signal(
-                        jp,
-                        pose_idx,
-                        q1.astype(np.float32),
-                        up,
-                        dev_scale=cfg.stand_pose_dev_scale,
+                    R.success_frame_mask(
+                        quat, zc,
+                        target_h=cfg.target_height,
+                        upright_threshold=cfg.upright_threshold,
+                        feet_ok=feet_ok,
                     )[0]
                 ),
             ),

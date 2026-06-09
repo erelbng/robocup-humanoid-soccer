@@ -159,6 +159,10 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
         use_multi = bool(getattr(cfg, "use_multi_critic", False)) \
             and len(group_names) >= 2
 
+        # Initial actor exploration noise (HoST init_noise_std=0.8 → ln≈-0.22).
+        # Forwarded to PPOActorCritic(init_log_std=…) by create_policy(**kwargs).
+        init_log_std = float(getattr(cfg, "init_log_std", -0.5))
+
         # Resolve the AMP reference dataset once (shared by both AMP paths),
         # auto-generating a missing standup motion (see _resolve_amp_dataset).
         motion_dataset = _resolve_amp_dataset(env, cfg, device) if use_amp else None
@@ -179,7 +183,8 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
         # the adversarial style reward as its own critic head (n_critics = G+1).
         if use_amp and use_multi:
             policy = create_policy(env.obs_dim, env.act_dim,
-                                   n_critics=len(group_names) + 1)
+                                   n_critics=len(group_names) + 1,
+                                   init_log_std=init_log_std)
             if init_from:
                 load_checkpoint(init_from, policy)
             elif resume:
@@ -200,7 +205,8 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
         # ── AMP only (single critic) ──
         if use_amp:
             from training.algorithms.amp import train_ppo_amp_vec
-            policy = create_policy(env.obs_dim, env.act_dim)
+            policy = create_policy(env.obs_dim, env.act_dim,
+                                   init_log_std=init_log_std)
             if init_from:
                 load_checkpoint(init_from, policy)
             elif resume:
@@ -222,7 +228,8 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
         # ── Multi-critic only ──
         if use_multi:
             policy = create_policy(env.obs_dim, env.act_dim,
-                                   n_critics=len(group_names))
+                                   n_critics=len(group_names),
+                                   init_log_std=init_log_std)
             if init_from:
                 # Warm-start: actor weights load (names match); the
                 # per-group critics start fresh (names differ from the
@@ -242,7 +249,8 @@ def _train_with_algorithm(algorithm: str, env, cfg, logger, device,
                 **algo_kwargs,
             )
 
-        policy = create_policy(env.obs_dim, env.act_dim)
+        policy = create_policy(env.obs_dim, env.act_dim,
+                               init_log_std=init_log_std)
         if init_from:
             load_checkpoint(init_from, policy)
         elif resume:

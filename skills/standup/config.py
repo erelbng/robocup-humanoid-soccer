@@ -266,9 +266,15 @@ class StandupConfig:
     n_steps: int = 64
 
     # HoST init_noise_std = 0.8 -> init_log_std = ln(0.8) ~= -0.22 (we default
-    # -0.5). Plumbed into create_policy via the OPTIONAL train_skill change in
-    # Appendix C; harmless if that change is not applied.
+    # -0.5). Plumbed into create_policy via train_skill.
     init_log_std: float = -0.22
+
+    # HoST stacks num_actor_history = 6 obs frames. Default 1 = no stacking, so
+    # the first Tier-1 run is a clean single-frame baseline; raise to 6 to match
+    # HoST once Tier 1 is confirmed learning (changes obs_dim → fresh net, so a
+    # checkpoint trained at 1 won't load at 6). Single-mode training only (not
+    # teacher/student — see SkillEnv.OBS_HISTORY_LEN).
+    obs_history_len: int = 1
 
     obs_dim: int = 0
     act_dim: int = 22

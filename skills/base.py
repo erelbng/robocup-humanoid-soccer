@@ -126,6 +126,17 @@ class SkillEnv(ABC):
     INCREMENTAL_ACTION: bool = False
     ACTION_CLIP: float = 1.0
 
+    # HoST stacks the last `num_actor_history` observations (G1 uses 6) so the
+    # policy can infer velocity/contact trends the single frame hides. Default 1
+    # = no stacking (single frame), so every other skill is byte-for-byte
+    # unchanged. A subclass enables it by setting this > 1 (standup reads it from
+    # its config). The full single-frame obs vector is stacked oldest→newest and
+    # flattened, so `obs_dim` becomes `single_obs_dim * OBS_HISTORY_LEN`.
+    # NOTE: not compatible with teacher/student distillation yet (the privileged
+    # tail would be repeated per frame, breaking the leading-prefix student
+    # slice) — use single-mode training when OBS_HISTORY_LEN > 1.
+    OBS_HISTORY_LEN: int = 1
+
     # Episode-termination thresholds (override in subclasses if needed).
     FALL_TERMINATE_Z: float = 0.10   # trunk below this → done
     FALL_RECOVERY_Z: float = 0.30    # below this → "fallen" but maybe not done
@@ -204,10 +215,19 @@ class SkillEnv(ABC):
         self._dr_sample: Optional[DRSample] = None  # set at scene build
         self._push_scheduler: Optional[PushScheduler] = None
 
+        # Observation history ring buffer (N, K, single_obs_dim), lazily
+        # allocated on first obs read. K = OBS_HISTORY_LEN (1 = no stacking).
+        self._obs_history: Optional[np.ndarray] = None
+
     # ── shape properties ───────────────────────────────────────────────
 
     @property
-    def obs_dim(self) -> int:
+    def obs_history_len(self) -> int:
+        return max(1, int(getattr(self, "OBS_HISTORY_LEN", 1)))
+
+    @property
+    def single_obs_dim(self) -> int:
+        """Width of ONE observation frame (before history stacking)."""
         head_dim = (self.head_command_spec.dim
                     if self.head_command_spec is not None else 0)
         priv_dim = DRSample.PRIVILEGED_DIM if self.include_privileged else 0
@@ -216,6 +236,11 @@ class SkillEnv(ABC):
                 + self.SKILL_OBS_ADDONS
                 + head_dim
                 + priv_dim)
+
+    @property
+    def obs_dim(self) -> int:
+        """Width of the observation the policy sees: single frame × history."""
+        return self.single_obs_dim * self.obs_history_len
 
     @property
     def head_command_dim(self) -> int:
@@ -627,7 +652,11 @@ class SkillEnv(ABC):
         self._reset_robot_pose(envs_idx)
         self._reset_skill_state(envs_idx)
 
-        return self._get_obs()
+        # Refill the obs history of the just-reset envs with their fresh frame
+        # so the new episode never carries frames from the previous one.
+        single = self._get_single_obs()
+        self._refill_obs_history(single, envs_idx)
+        return self._stacked_obs()
 
     def step(self, action: np.ndarray
              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
@@ -692,10 +721,13 @@ class SkillEnv(ABC):
 
         self.step_count += 1
 
-        # Obs at the post-physics state. For envs about to reset this is the
-        # TERMINAL obs (returned in info for value bootstrapping); for the
-        # rest it is simply the next obs.
-        terminal_obs = self._get_obs()
+        # Obs at the post-physics state. Advance the history ring buffer once
+        # with this frame. For envs about to reset the stacked result is the
+        # TERMINAL obs (returned in info for value bootstrapping); for the rest
+        # it is simply the next obs.
+        single = self._get_single_obs()
+        self._push_obs_history(single)
+        terminal_obs = self._stacked_obs()
         reward, components = self._compute_skill_reward(action)
         done = self._check_skill_done()
         # Separate true termination from time-limit truncation: a timeout is
@@ -710,11 +742,11 @@ class SkillEnv(ABC):
 
         if done.any():
             didx = np.where(done)[0]
-            self.reset(envs_idx=didx)
+            self.reset(envs_idx=didx)  # refills history[didx] with fresh frame
             # Return the FRESH post-reset obs for the envs that reset, so the
             # next action is chosen from the actual new state rather than the
             # discarded terminal obs. Non-reset envs keep their obs unchanged.
-            fresh = self._get_obs()
+            fresh = self._stacked_obs()
             obs = terminal_obs.copy()
             obs[didx] = fresh[didx]
         else:
@@ -736,12 +768,14 @@ class SkillEnv(ABC):
 
     # ── obs assembly ───────────────────────────────────────────────────
 
-    def _get_obs(self) -> np.ndarray:
+    def _get_single_obs(self) -> np.ndarray:
+        """Build ONE observation frame (width = single_obs_dim)."""
         try:
             (root_pos, root_quat, root_lin_vel, root_ang_vel,
              jpos, jvel) = read_robot_state(self.robot, self.dof_indices)
         except Exception:
-            return np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
+            return np.zeros((self.num_envs, self.single_obs_dim),
+                            dtype=np.float32)
 
         # Apply Gaussian obs noise to raw sensor channels (DR). The
         # student needs to learn that the proprio readings are noisy
@@ -779,6 +813,43 @@ class SkillEnv(ABC):
         if self.include_privileged:
             parts.append(self.privileged_obs())
         return np.concatenate(parts, axis=1)
+
+    # ── observation history (HoST frame-stacking) ──────────────────────
+
+    def _ensure_obs_history(self, single: np.ndarray) -> None:
+        """Allocate the (N, K, D1) ring buffer on first use, filling every
+        slot with the current frame (so step 0 has no stale/zero history)."""
+        K = self.obs_history_len
+        D1 = single.shape[1]
+        if (self._obs_history is None
+                or self._obs_history.shape != (self.num_envs, K, D1)):
+            self._obs_history = np.repeat(single[:, None, :], K, axis=1)
+
+    def _push_obs_history(self, single: np.ndarray) -> None:
+        """Roll the ring buffer one frame: drop the oldest, append `single`."""
+        self._ensure_obs_history(single)
+        if self.obs_history_len > 1:
+            self._obs_history = np.roll(self._obs_history, shift=-1, axis=1)
+        self._obs_history[:, -1, :] = single
+
+    def _refill_obs_history(self, single: np.ndarray,
+                            envs_idx: np.ndarray) -> None:
+        """Reset the history of `envs_idx` to all-`single` (post-reset state),
+        so a fresh episode never sees frames from the previous one."""
+        self._ensure_obs_history(single)
+        self._obs_history[envs_idx] = np.repeat(
+            single[envs_idx][:, None, :], self.obs_history_len, axis=1)
+
+    def _stacked_obs(self) -> np.ndarray:
+        """Flatten the ring buffer oldest→newest into (N, K*D1)."""
+        return self._obs_history.reshape(self.num_envs, -1)
+
+    def _get_obs(self) -> np.ndarray:
+        """Current stacked observation (initialising history if needed). Does
+        NOT advance the ring buffer — `step()` advances it explicitly."""
+        single = self._get_single_obs()
+        self._ensure_obs_history(single)
+        return self._stacked_obs()
 
     # ── privileged obs (teacher only) ─────────────────────────────────
 

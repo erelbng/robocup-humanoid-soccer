@@ -134,6 +134,8 @@ class K1StandupEnv(SkillEnv):
         self.SKILL_OBS_ADDONS = self._beta_obs_dim + self._contact_addon_dim
         self.INCREMENTAL_ACTION = bool(getattr(self.cfg, "incremental_action", True))
         self.ACTION_CLIP = float(getattr(self.cfg, "action_clip", 1.0))
+        # HoST frame-stacking: stack the last K obs frames (K=1 → no stacking).
+        self.OBS_HISTORY_LEN = max(1, int(getattr(self.cfg, "obs_history_len", 1)))
         kwargs.setdefault("num_envs", self.cfg.num_envs)
         kwargs.setdefault("dt", self.cfg.dt)
         kwargs.setdefault("sim_dt", self.cfg.sim_dt)
