@@ -158,26 +158,20 @@ def compute_standup_reward(
     g = projected_gravity(root_quat)
 
     # ── task (bounded, saturating) ───────────────────────────────────────
-    task_orient = tolerance(
-        up, lo=orientation_threshold, margin=orientation_margin, value_at_margin=0.05
-    )
-    task_rise = tolerance(rise, lo=rise_target, margin=rise_margin, value_at_margin=0.1)
-    # The two task terms are GATED ON EACH OTHER so neither can be farmed alone:
-    #   • orientation only counts as the trunk rises off the floor — else the
-    #     policy sits upright on the floor (run 1: rise≈0, high orientation).
-    #   • rise only counts while the trunk is upright — else the policy lofts
-    #     its trunk UPSIDE-DOWN to farm height (run 2: upright_raw≈-0.55, pike).
-    # Each gate has a small floor so there is still a weak gradient toward the
-    # missing half while the assist force physically lifts the robot; full
-    # credit requires BOTH (= actually standing). `up` ∈ [-1, 1].
-    orient_rise_gate = (
-        0.2 + 0.8 * np.clip(rise / max(style_stage_rise, 1e-6), 0.0, 1.0)
-    ).astype(np.float32)
-    rise_orient_gate = (
-        0.1 + 0.9 * np.clip((up - 0.5) / 0.45, 0.0, 1.0)
-    ).astype(np.float32)
-    task_orient = (task_orient * orient_rise_gate).astype(np.float32)
-    task_rise = (task_rise * rise_orient_gate).astype(np.float32)
+    # Orientation: a BROAD, monotonic gradient from inverted (0) → upright (1),
+    # recoverable from ANY pose. The narrow tolerance() kernel gave ~zero
+    # gradient until near-upright, so run 2 got stuck high-and-INVERTED (no
+    # signal to flip over) and run 3 (symmetric hard gates) deadlocked with no
+    # task gradient anywhere. up ∈ [-1, 1]; squared for a sharper top.
+    orient = (((up + 1.0) * 0.5) ** 2).astype(np.float32)
+    rise_tol = tolerance(rise, lo=rise_target, margin=rise_margin, value_at_margin=0.1)
+    # rise pays only while upright (× the broad orient signal — smooth, never
+    # deadlocks) → no reward for lofting the trunk upside-down (run 2). But
+    # orientation is NOT rise-gated, so the policy is free to verticalize while
+    # still low; the assist force then lifts it and the now-active rise term
+    # rewards the height. Full task credit needs BOTH (= actually standing).
+    task_orient = orient
+    task_rise = (rise_tol * orient).astype(np.float32)
 
     # ── regularization (a whisper) ───────────────────────────────────────
     action_rate = np.sum((action - prev_action) ** 2, axis=1).astype(np.float32)
