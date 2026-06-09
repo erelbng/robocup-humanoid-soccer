@@ -116,7 +116,10 @@ class StandupConfig:
     assist_cobra_z_low: float = 0.15
     assist_cobra_z_high: float = 0.35
 
-    reward_stage: str = "deploy"  # "discovery" | "deploy"
+    # "discovery" | "deploy". Discovery FIRST (zeroes motion regularizers so the
+    # energetic get-up isn't penalised into a still low crouch — observed on
+    # run 5), then --init-from that checkpoint into a deploy run for smoothness.
+    reward_stage: str = "discovery"
 
     reg_success_ramp: bool = True
     style_stage_gate: bool = True

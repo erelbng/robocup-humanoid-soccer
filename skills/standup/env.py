@@ -207,15 +207,7 @@ class K1StandupEnv(SkillEnv):
         # Reward weights for the active stage. "discovery" zeroes the motion
         # regularizers so the policy can find ANY standup; "deploy" uses the
         # full set for a smooth, deployable motion.
-        if self.cfg.reward_stage == "discovery":
-            self._reward_weights = discovery_weights(self.cfg.rewards)
-            print(
-                "[standup] reward_stage=discovery — motion regularizers "
-                "zeroed (upright/height/progress/feet/speed only)"
-            )
-        else:
-            self._reward_weights = self.cfg.rewards
-            print("[standup] reward_stage=deploy — full reward weight set")
+        self.set_reward_stage(self.cfg.reward_stage)
 
         if self.cfg.assist_force_enabled:
             print(
@@ -1172,6 +1164,22 @@ class K1StandupEnv(SkillEnv):
         ):
             return 0.0
         return float(np.clip(self._success_rate_ema / ref, 0.0, 1.0))
+
+    def set_reward_stage(self, stage: str) -> None:
+        """Select the active reward weight set. 'discovery' zeroes the motion
+        regularizers + style group (find ANY standup, even jerky); 'deploy' uses
+        the full set for a smooth, deployable motion. Train discovery first, then
+        --init-from that checkpoint into a deploy run."""
+        self.cfg.reward_stage = stage
+        if stage == "discovery":
+            self._reward_weights = discovery_weights(self.cfg.rewards)
+            print(
+                "[standup] reward_stage=discovery — motion regularizers + style "
+                "zeroed (task + success only, so energetic get-up isn't penalised)"
+            )
+        else:
+            self._reward_weights = self.cfg.rewards
+            print("[standup] reward_stage=deploy — full reward weight set")
 
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.

@@ -321,6 +321,12 @@ def main():
                         help="Override the skill's default num_envs.")
     parser.add_argument("--total-timesteps", type=int, default=None,
                         help="Override the skill's default total_timesteps.")
+    parser.add_argument("--reward-stage", choices=["discovery", "deploy"],
+                        default=None,
+                        help="standup only: 'discovery' zeroes motion "
+                             "regularizers to find ANY get-up; 'deploy' uses the "
+                             "full smooth-motion set. Defaults to the config "
+                             "value. Train discovery, then --init-from into deploy.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -351,6 +357,10 @@ def main():
 
     if args.total_timesteps is not None:
         cfg.total_timesteps = int(args.total_timesteps)
+
+    # standup: override reward stage post-build (env picked weights in __init__).
+    if args.reward_stage is not None and hasattr(env, "set_reward_stage"):
+        env.set_reward_stage(args.reward_stage)
 
     np.random.seed(args.seed)
 
