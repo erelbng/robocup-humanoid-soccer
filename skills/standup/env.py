@@ -1255,9 +1255,18 @@ class K1StandupEnv(SkillEnv):
                 # re-gets the assist bootstrap + loosened hold/upright/height
                 # criteria + a fresh mix-bias toward itself.
                 self._level_start_env_steps = self._total_env_steps_seen
+                ema_before = self._success_rate_ema
+                if self.cfg.reset_success_ema_on_level_up:
+                    # Without this the EMA is still ≈ the advance threshold
+                    # (~0.55), so the assist recovers to only ~8% for the new
+                    # harder pose. Resetting to 0 makes the assist jump to full
+                    # and re-arms the style gate until the new pose is mastered.
+                    self._success_rate_ema = 0.0
                 print(
                     f"[standup] pose curriculum: L{old} → L{self._pose_level} "
-                    f"(EMA={self._success_rate_ema:.3f}); easing curricula reset"
+                    f"(EMA={ema_before:.3f}→"
+                    f"{'0.0' if self.cfg.reset_success_ema_on_level_up else f'{ema_before:.3f}'})"
+                    "; easing curricula + assist reset"
                 )
         else:
             # EMA fell below threshold — reset sustain counter (no regression).

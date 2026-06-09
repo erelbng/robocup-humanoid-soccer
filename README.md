@@ -89,6 +89,22 @@ chmod +x scripts/run.sh
 
 Creates `.venv/`, installs everything from `pyproject.toml` (editable mode), downloads the K1 robot assets, and generates the field models. All subsequent commands auto-activate the venv.
 
+### 1b. Standup prerequisites (before training)
+
+**AMP reference motion.** Standup training uses an AMP style reference at
+`data/motions/k1_standup_amp.npz` (`StandupConfig.amp_motion_file`). Generate
+it once before your first standup run (or let training auto-generate it if the
+file is missing):
+
+```bash
+.venv/bin/python scripts/create_standup_amp.py --no-viewer
+
+first train it to discovery then to deploy
+
+```bash
+# Stage 1 — discovery (reward_stage="discovery" in config.py)
+./scripts/run.sh train-skill standup --device gpu --vec-num-envs 2048 --wandb
+
 ### 2. Train the skills (Phase 1)
 
 Each skill lives in its own process — Genesis re-allocates its GPU memory per skill, so you never hit the cross-stage OOM that a monolithic curriculum runs into.
