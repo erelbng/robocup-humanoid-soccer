@@ -161,6 +161,16 @@ def compute_standup_reward(
     task_orient = tolerance(
         up, lo=orientation_threshold, margin=orientation_margin, value_at_margin=0.05
     )
+    # Orientation credit is GATED on the trunk actually rising off the floor.
+    # Without this, the policy farms a "sit upright on the floor" pose (rise≈0,
+    # high orientation) for near-full task reward without ever standing — the
+    # exact local optimum observed on the first real run. A 0.2 floor keeps a
+    # weak verticalize-gradient while the assist force lifts the robot; full
+    # orientation credit only once rise reaches `style_stage_rise`.
+    orient_rise_gate = (
+        0.2 + 0.8 * np.clip(rise / max(style_stage_rise, 1e-6), 0.0, 1.0)
+    ).astype(np.float32)
+    task_orient = (task_orient * orient_rise_gate).astype(np.float32)
     task_rise = tolerance(rise, lo=rise_target, margin=rise_margin, value_at_margin=0.1)
 
     # ── regularization (a whisper) ───────────────────────────────────────

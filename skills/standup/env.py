@@ -219,9 +219,9 @@ class K1StandupEnv(SkillEnv):
 
         if self.cfg.assist_force_enabled:
             print(
-                f"[standup] assist-force curriculum ON: up to "
-                f"{self.cfg.assist_force_max:.0f} N, decaying over "
-                f"{self.cfg.assist_curriculum_env_steps:,} env-steps"
+                f"[standup] assist-force ON: up to {self.cfg.assist_force_max:.0f} N, "
+                f"spring-shaped on height deficit, success-coupled wean "
+                f"(target success EMA {self.cfg.assist_success_target})"
             )
 
         self.cfg.obs_dim = self.obs_dim
@@ -1176,36 +1176,38 @@ class K1StandupEnv(SkillEnv):
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.
 
-        PERFORMANCE-COUPLED: the assist fades as the policy gets better,
-        tied directly to the success EMA —
+        PURELY PERFORMANCE-COUPLED: the assist fades only as the policy gets
+        better, tied to the success EMA —
             success_frac = clip(1 - success_ema / assist_success_target, 0, 1)
-        so it's full at zero competence and ~0 once success reaches the
-        target. This auto-couples the assist to the pose curriculum: a
-        level-up introduces a harder pose, the success EMA drops, and the
-        assist rises back to help.
+        so it's full at zero competence and ~0 once success reaches the target.
+        This auto-couples the assist to the pose curriculum: a level-up
+        introduces a harder pose, the success EMA drops, and the assist rises
+        back to help.
 
-        A multiplicative TIME-DECAY backstop (1.0 → 0.0 over
-        `assist_curriculum_env_steps`) guarantees weaning even if the policy
-        plateaus below the target and would otherwise lean forever. It runs
-        on the PER-LEVEL clock (see `_curriculum_progress`), so it resets to
-        ~1.0 on every level-up — the assist can fully recover for each new
-        pose instead of being stuck at 0 from an expired global clock."""
+        NOTE: the old multiplicative TIME-DECAY backstop was REMOVED. On the
+        first real run it weaned the support to ~0 by step ~100M while success
+        was still 0 (the per-level clock never reset because the policy never
+        leveled up), so the bootstrap force HoST relies on vanished before the
+        robot ever stood. Success-coupling alone already guarantees weaning
+        (success_frac → 0 as competence → target); there is nothing to "lean
+        on forever" because leaning never produces success."""
         if not self.cfg.assist_force_enabled:
             return 0.0
         target = max(self.cfg.assist_success_target, 1e-6)
         success_frac = float(np.clip(1.0 - self._success_rate_ema / target, 0.0, 1.0))
-        time_frac = float(
-            1.0 - self._curriculum_progress(self.cfg.assist_curriculum_env_steps)
-        )
-        return success_frac * time_frac
+        return success_frac
 
     def _assist_wrench(self):
-        """HoST vertical pull force: a constant upward force on the trunk that
-        fires ONLY when the trunk is already near-vertical
-        (projected_gravity_z < pull_force_orient_gate). It helps a kneeling /
-        crouching robot COMPLETE the rise and stay up — it does NOT hoist a
-        flat-lying robot. Magnitude weans on the same success curriculum as beta
-        (via `_current_assist_fraction`)."""
+        """HoST vertical pull force: an upward support force on the trunk,
+        spring-shaped on the HEIGHT DEFICIT — strongest when the robot is flat
+        on the ground and tapering to zero as the trunk reaches target_height.
+
+        Unlike the old near-vertical orientation gate (which only fired once the
+        trunk was already up, so it could never hoist a flat robot and instead
+        helped freeze a 'sit upright on the floor' local optimum), this lifts a
+        fallen robot off the ground REGARDLESS of orientation — the bootstrap
+        HoST's force is meant to provide. Magnitude weans on the success
+        curriculum (via `_current_assist_fraction`)."""
         zeros = np.zeros((self.num_envs, 3), dtype=np.float32)
         force = zeros.copy()
         torque = zeros.copy()
@@ -1213,12 +1215,11 @@ class K1StandupEnv(SkillEnv):
         frac = self._current_assist_fraction()
         if frac > 0.0:
             try:
-                quat = _to_np(self.robot.get_quat())
-                g = projected_gravity(quat)
-                near_vertical = (g[:, 2] < self.cfg.pull_force_orient_gate)
-                fz = np.where(
-                    near_vertical, frac * self.cfg.assist_force_max, 0.0
-                ).astype(np.float32)
+                z = _to_np(self.robot.get_pos())[:, 2]
+                target = max(self.cfg.target_height, 1e-3)
+                # 1.0 when flat on the floor → 0.0 once the trunk reaches target.
+                deficit = np.clip((target - z) / target, 0.0, 1.0)
+                fz = (frac * self.cfg.assist_force_max * deficit).astype(np.float32)
                 force[:, 2] = fz
                 self._last_assist_force_mean = float(np.mean(fz))
             except Exception:
