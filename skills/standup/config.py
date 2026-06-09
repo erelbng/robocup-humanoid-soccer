@@ -104,7 +104,10 @@ class StandupConfig:
     joint_jitter_rad: float = 0.10
 
     assist_force_enabled: bool = True
-    assist_force_max: float = 300.0
+    # HoST rule for porting to a new robot: pull force ≈ 60% of body weight.
+    # K1 ≈ 19.67 kg → 192.9 N weight → 60% ≈ 116 N. (Single trunk link, so no
+    # ×2 virtual-torso doubling like G1's URDF.) Was 300 N ≈ 155% body weight.
+    assist_force_max: float = 120.0
     assist_spring_shape: bool = True
     assist_success_target: float = 0.60
     assist_curriculum_env_steps: int = 150_000_000
