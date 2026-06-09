@@ -158,20 +158,30 @@ def compute_standup_reward(
     g = projected_gravity(root_quat)
 
     # ── task (bounded, saturating) ───────────────────────────────────────
-    # Orientation: a BROAD, monotonic gradient from inverted (0) → upright (1),
-    # recoverable from ANY pose. The narrow tolerance() kernel gave ~zero
-    # gradient until near-upright, so run 2 got stuck high-and-INVERTED (no
-    # signal to flip over) and run 3 (symmetric hard gates) deadlocked with no
-    # task gradient anywhere. up ∈ [-1, 1]; squared for a sharper top.
+    # Both task terms use BROAD gradients that give signal across the WHOLE
+    # fallen→standing range. Narrow tolerance() kernels are flat in the tail
+    # (≈no gradient far from the goal): orientation's flat tail froze runs 2/3,
+    # and rise's flat tail froze run 4 at an upright SIT (z≈0.13, rise<0) —
+    # verticalized but with nothing pulling it to actually rise.
+    #
+    # orient: monotonic inverted(0)→upright(1).  rise_signal: clipped-linear
+    # ramp 0→1 over [≈floor, rise_target] so the gradient is constant (never
+    # vanishes) until it saturates at the target — bounded, can't be overshot.
     orient = (((up + 1.0) * 0.5) ** 2).astype(np.float32)
-    rise_tol = tolerance(rise, lo=rise_target, margin=rise_margin, value_at_margin=0.1)
-    # rise pays only while upright (× the broad orient signal — smooth, never
-    # deadlocks) → no reward for lofting the trunk upside-down (run 2). But
-    # orientation is NOT rise-gated, so the policy is free to verticalize while
-    # still low; the assist force then lifts it and the now-active rise term
-    # rewards the height. Full task credit needs BOTH (= actually standing).
-    task_orient = orient
-    task_rise = (rise_tol * orient).astype(np.float32)
+    rise_signal = np.clip(
+        (rise + 0.15) / (rise_target + 0.15), 0.0, 1.0
+    ).astype(np.float32)
+    # Anti-farm coupling (deadlock-free now that BOTH signals are broad):
+    #  • orientation gated on rise (0.2 floor) → can't sit upright on the floor
+    #    for full orientation credit (run 1 / run 4).
+    #  • rise gated on orientation (× orient)  → can't loft the trunk upside-down
+    #    for height credit (run 2).
+    # Full credit needs BOTH = standing.
+    orient_rise_gate = (
+        0.2 + 0.8 * np.clip(rise / max(style_stage_rise, 1e-6), 0.0, 1.0)
+    ).astype(np.float32)
+    task_orient = (orient * orient_rise_gate).astype(np.float32)
+    task_rise = (rise_signal * orient).astype(np.float32)
 
     # ── regularization (a whisper) ───────────────────────────────────────
     action_rate = np.sum((action - prev_action) ** 2, axis=1).astype(np.float32)
