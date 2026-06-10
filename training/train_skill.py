@@ -327,6 +327,12 @@ def main():
                              "regularizers to find ANY get-up; 'deploy' uses the "
                              "full smooth-motion set. Defaults to the config "
                              "value. Train discovery, then --init-from into deploy.")
+    parser.add_argument("--init-success-ema", type=float, default=None,
+                        help="standup only: seed the competence EMA (β/assist "
+                             "coupling). When --init-from a competent policy, the "
+                             "EMA otherwise resets to 0 → β jumps to 1.0 and "
+                             "breaks the loaded policy. Auto-seeded on --init-from "
+                             "unless set here (use 0 to force a cold β).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -362,6 +368,23 @@ def main():
     if args.reward_stage is not None and hasattr(env, "set_reward_stage"):
         env.set_reward_stage(args.reward_stage)
 
+    # standup: β (HoST action-rescaler) and the assist force are coupled to a
+    # success EMA that resets to 0 on a fresh env. Warm-starting a competent
+    # policy (deploy ← discovery) with EMA=0 re-inflates β to 1.0, so the loaded
+    # actions — calibrated for the annealed β≈0.25 — produce ~4× the joint
+    # motion and the policy collapses (observed: deploy run stood 0% despite a
+    # competent init). Seed the EMA so β starts annealed + assist off; it decays
+    # back within ~200 steps if the checkpoint turns out not to be competent.
+    if hasattr(env, "_success_rate_ema"):
+        ema_seed = args.init_success_ema
+        if ema_seed is None and args.init_from is not None:
+            ema_seed = float(max(getattr(cfg, "assist_success_target", 0.6),
+                                 getattr(cfg, "beta_success_threshold", 0.5)))
+        if ema_seed is not None:
+            env._success_rate_ema = float(ema_seed)
+            print(f"[train_skill] warm-start success EMA = {ema_seed:.2f} "
+                  f"→ β starts annealed, assist off")
+
     np.random.seed(args.seed)
 
     project = ProjectConfig()
@@ -391,6 +414,13 @@ def main():
     # Per-skill checkpoint sub-directory keeps `skill_walk_step123.pt`
     # and `skill_standup_step123.pt` from overlapping.
     ckpt_dir = os.path.join(str(CHECKPOINTS_DIR), f"skill_{args.skill}")
+    # standup runs two stages from step 0 with identical step-numbered
+    # filenames, so a deploy run would OVERWRITE the discovery checkpoints it
+    # was launched from (this happened once and destroyed the good policy).
+    # Isolate stages in their own sub-dirs.
+    stage = getattr(cfg, "reward_stage", None)
+    if args.skill == "standup" and stage in ("discovery", "deploy"):
+        ckpt_dir = os.path.join(str(CHECKPOINTS_DIR), f"skill_{args.skill}_{stage}")
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     # Forward algorithm-specific kwargs from the device preset (replay
