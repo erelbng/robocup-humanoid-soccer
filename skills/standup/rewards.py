@@ -147,6 +147,7 @@ def compute_standup_reward(
     feet_distance_max: float = 0.45,
     hold_steps: int = 30,
     time_to_stand_tau_steps: float = 60.0,
+    reg_scale: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, dict, dict]:
     """Returns (reward[N], frame_success[N] bool, components, group_rewards)."""
     w = weights
@@ -230,14 +231,20 @@ def compute_standup_reward(
     post_success = (achieved_sustained & frame_success).astype(np.float32)
 
     # ── group assembly ───────────────────────────────────────────────────
+    # `reg_scale` (0→1) ramps the motion-shaping terms (regu + style) in
+    # gradually at the start of a DEPLOY run, so turning the full smoothing set
+    # on at once doesn't knock a freshly warm-started policy off the standing
+    # manifold (observed: deploy success 0.51→0 before recovering). task + the
+    # success/hold terms stay at full strength so the get-up incentive never
+    # weakens.
     r_task = (w.task_orientation * task_orient + w.task_rise * task_rise).astype(np.float32)
-    r_regu = -(
+    r_regu = -reg_scale * (
         w.regu_action_rate * action_rate
         + w.regu_action_jerk * action_jerk
         + w.regu_dof_vel * dof_vel
     ).astype(np.float32)
     r_style = (
-        gate_style
+        reg_scale * gate_style
         * (
             w.style_feet_under_base * fub
             + w.style_ground_parallel * ground_parallel

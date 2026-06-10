@@ -1140,6 +1140,20 @@ class K1StandupEnv(SkillEnv):
             + (c.upright_threshold - c.upright_threshold_start) * p
         )
 
+    def _current_reg_scale(self) -> float:
+        """Global 0→1 ramp for the motion-shaping (regu + style) reward terms.
+
+        Deploy starts gentle (≈discovery, regu off) and tightens the smoothing
+        over `regu_ramp_env_steps` so the full set turning on at once doesn't
+        knock the warm-started policy off the standing manifold. Uses the GLOBAL
+        env-step clock (not the per-level one), so it ramps once over the run.
+        In discovery the regu/style weights are zero anyway, so this is a no-op
+        there."""
+        horizon = int(getattr(self.cfg, "regu_ramp_env_steps", 0) or 0)
+        if horizon <= 0:
+            return 1.0
+        return float(min(self._total_env_steps_seen / horizon, 1.0))
+
     def _current_target_height(self) -> float:
         c = self.cfg
         p = self._curriculum_progress(c.threshold_curriculum_env_steps)
@@ -1370,8 +1384,10 @@ class K1StandupEnv(SkillEnv):
             feet_distance_max=self.cfg.feet_distance_max,
             hold_steps=hold_steps,
             time_to_stand_tau_steps=self.cfg.time_to_stand_tau_steps,
+            reg_scale=self._current_reg_scale(),
         )
 
+        components["reg_scale"] = float(self._current_reg_scale())
         components["hold_steps_current"] = float(hold_steps)
         components["upright_threshold_current"] = float(upright_thresh)
         components["target_height_current"] = float(target_h)

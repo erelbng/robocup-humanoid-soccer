@@ -121,6 +121,12 @@ class StandupConfig:
     # run 5), then --init-from that checkpoint into a deploy run for smoothness.
     reward_stage: str = "discovery"
 
+    # Deploy: ramp the motion-shaping terms (regu + style) in over this many
+    # GLOBAL env-steps so the full smoothing set doesn't knock the warm-started
+    # policy off the stand at once (deploy success dropped 0.51→0 without it).
+    # No-op in discovery (those weights are zero there).
+    regu_ramp_env_steps: int = 50_000_000
+
     reg_success_ramp: bool = True
     style_stage_gate: bool = True
     style_success_ref: float = 0.5
