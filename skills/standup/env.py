@@ -1193,7 +1193,13 @@ class K1StandupEnv(SkillEnv):
             )
         else:
             self._reward_weights = self.cfg.rewards
-            print("[standup] reward_stage=deploy — full reward weight set")
+            # Deploy refines a known get-up → drop exploration so the actor
+            # log_std can fall off its max clamp and HOLD a precise stand.
+            ent = getattr(self.cfg, "entropy_coef_deploy", None)
+            if ent is not None:
+                self.cfg.entropy_coef = float(ent)
+            print(f"[standup] reward_stage=deploy — full reward weights, "
+                  f"entropy_coef={self.cfg.entropy_coef}")
 
     def _current_assist_fraction(self) -> float:
         """Fraction (1.0 → 0.0) of the peak assist force currently applied.

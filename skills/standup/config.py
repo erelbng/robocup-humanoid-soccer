@@ -269,6 +269,13 @@ class StandupConfig:
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     entropy_coef: float = 0.01  # HoST uses 0.01 (more exploration for get-up)
+    # Deploy uses MUCH less exploration: discovery's 0.01 pins the actor log_std
+    # at its max clamp (per-dim std≈1.0) the whole run, so the policy can never
+    # reduce action noise to HOLD a precise stand (sustained_rate ≈0) and the
+    # β-amplified noise destabilises the deploy warm-start. Deploy refines a
+    # known motion, so it wants precision, not exploration. Applied when
+    # reward_stage=deploy (see env.set_reward_stage).
+    entropy_coef_deploy: float = 0.001
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 5
