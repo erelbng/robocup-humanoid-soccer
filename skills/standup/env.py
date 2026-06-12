@@ -283,8 +283,17 @@ class K1StandupEnv(SkillEnv):
         beta_success_threshold. Auto-recovers (beta rises) if competence drops —
         matching HoST's per-env, success-gated decay. Returned as the per-step
         action scale used by SkillEnv.step()'s incremental-action branch; also
-        cached in self._beta for the obs."""
+        cached in self._beta for the obs.
+
+        DEPLOY: β is PINNED at beta_min. β-annealing is discovery scaffolding —
+        a warm-started competent policy is calibrated for β≈beta_min, so letting
+        β re-inflate when the success EMA transiently dips amplifies the (max-)
+        std action noise and collapses the policy. The deploy failures were this
+        feedback loop, not the reward shaping."""
         c = self.cfg
+        if getattr(self, "_deploy_mode", False):
+            self._beta = float(c.beta_min)
+            return self._beta
         frac = float(
             np.clip(self._success_rate_ema / max(c.beta_success_threshold, 1e-6),
                     0.0, 1.0)
@@ -1185,6 +1194,10 @@ class K1StandupEnv(SkillEnv):
         the full set for a smooth, deployable motion. Train discovery first, then
         --init-from that checkpoint into a deploy run."""
         self.cfg.reward_stage = stage
+        # Deploy refines a competent policy under STABLE conditions: β pinned at
+        # beta_min, assist off (both are discovery-only scaffolding). See
+        # _get_action_scale / _current_assist_fraction.
+        self._deploy_mode = (stage == "deploy")
         if stage == "discovery":
             self._reward_weights = discovery_weights(self.cfg.rewards)
             print(
@@ -1220,6 +1233,11 @@ class K1StandupEnv(SkillEnv):
         (success_frac → 0 as competence → target); there is nothing to "lean
         on forever" because leaning never produces success."""
         if not self.cfg.assist_force_enabled:
+            return 0.0
+        # DEPLOY: assist is OFF — it's discovery scaffolding the competent policy
+        # no longer needs, and re-engaging it on a transient success dip helps
+        # drive the warm-start collapse (same feedback loop as β).
+        if getattr(self, "_deploy_mode", False):
             return 0.0
         target = max(self.cfg.assist_success_target, 1e-6)
         success_frac = float(np.clip(1.0 - self._success_rate_ema / target, 0.0, 1.0))
